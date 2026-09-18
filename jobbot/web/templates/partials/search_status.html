@@ -1,0 +1,33 @@
+{% if error %}
+<div class="notice error">{{ error }}</div>
+{% else %}
+{% if oob %}
+<input type="hidden" id="active-search-id" name="search_id" value="{{ search_id }}" hx-swap-oob="true">
+<div id="job-list" hx-swap-oob="innerHTML"><p class="muted empty">Searching “{{ search['query'] }}”…</p></div>
+{% endif %}
+{% set st = search['status'] %}
+<div class="search-status st-{{ st }}"
+     {% if st == 'running' %}hx-get="/search/{{ search_id }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  {% set empty = st == 'done' and not search['found'] %}
+  <div class="row">
+    <span class="status st-{{ 'error' if empty else st }}">{{ 'no results' if empty else st }}</span>
+    {% if st == 'running' %}<span class="spinner" aria-hidden="true"></span>{% endif %}
+    <span class="muted">“{{ search['query'] }}” · {{ search['found'] or 0 }} matched · {{ search['new'] or 0 }} new</span>
+  </div>
+  {% if search['warning'] %}<p class="notice warn">Incomplete results — {{ search['warning'] }}</p>{% endif %}
+  {% if empty %}
+  {# "found 0" is ambiguous on its own — the note the search logged says whether nothing existed or
+     a scraper was blocked, so lift it out of the log where it is easy to miss. #}
+  {% set note = (search['log'] or '').split('note: ')[-1].splitlines()[0] if 'note: ' in (search['log'] or '') else '' %}
+  <p class="notice warn">Nothing matched this search.{% if note %} {{ note }}{% endif %}</p>
+  {% endif %}
+  {% set log = (search['log'] or '').strip() %}
+  {% if log %}
+  <pre class="log">{{ log.splitlines()[-12:]|join('\n') }}</pre>
+  {% endif %}
+  {% if st in ('done', 'error') and not restored %}
+  <div hx-get="/jobs?min_score=3&search_id={{ search_id }}" hx-trigger="load"
+       hx-target="#job-list" hx-swap="innerHTML" hx-include=".filter"></div>
+  {% endif %}
+</div>
+{% endif %}

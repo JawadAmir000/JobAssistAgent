@@ -1,0 +1,62 @@
+# Copy this file to facts.yaml and fill it in with YOUR OWN true facts.
+# facts.yaml is gitignored — it holds personal data and never belongs in the repo.
+#
+# Every form field and screening answer is drawn from here.
+# Never put anything here that isn't true — work-authorisation answers come from this file only.
+identity:
+  first_name: Jane
+  last_name: Doe
+  full_name: Jane Doe
+  email: you@example.com
+  phone: "+10000000000"   # keep the quotes: unquoted, YAML eats the leading "+"
+  location: "City, Country"
+  country: Country
+  linkedin: https://www.linkedin.com/in/your-handle   # the www host — some validators reject the bare one
+  github: https://github.com/your-handle
+  portfolio: https://example.com
+
+work:
+  current_title: Your Title
+  current_company: Your Company
+  years_experience: 0
+  years_llm_experience: 0
+  seniority: senior
+  notice_period: "None"   # e.g. "None" if available immediately
+  open_to_relocation: true    # always yes — relocation questions never stop a run
+  open_to_remote: true
+
+authorization:
+  # Keep these truthful. The resolver answers visa / work-auth questions from here and nowhere else.
+  requires_sponsorship: true
+  authorized_countries: [Country]   # countries you can work in without sponsorship
+  citizenship: Country
+
+preferences:
+  job_source: LinkedIn               # "how did you hear about us" — answered from here, never asked
+  willing_to_travel: true            # regular client-site travel
+  salary_currency: USD
+  salary_min: ""                    # leave blank to answer "negotiable"
+  start_date: Immediately
+  work_types: [remote, hybrid, onsite]
+
+skills:
+  - Python
+  - TypeScript
+  - AWS
+
+target_roles:
+  - Forward Deployed Engineer
+  - Applied AI Engineer
+  - AI Engineer
+
+summary: >
+  Two or three sentences in your own words. This is pasted verbatim into "tell us about yourself"
+  boxes and used as grounding for cover letters, so write it the way you would say it.
+
+eeo:
+  # Legal self-identification questions. They come only from here — never guessed, never auto-declined.
+  # A blank value means the run stops and asks you.
+  gender: ""
+  disability_status: ""
+  veteran_status: ""
+  race_ethnicity: ""

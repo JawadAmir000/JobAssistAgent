@@ -1,0 +1,42 @@
+<section class="panel">
+  <form id="search-form" class="search-form" hx-post="/search" hx-target="#search-status" hx-swap="innerHTML">
+    <input type="hidden" id="active-search-id" name="search_id" value="{{ active_search_id }}">
+    <label class="grow">Title
+      <input type="text" name="title" value="{{ form_title }}" placeholder="Forward Deployed Engineer" required>
+    </label>
+    <label class="grow">Locations
+      <input type="text" name="locations" value="{{ form_locations }}">
+    </label>
+    <label>Posted within
+      <select name="hours_old">
+        {% for val, label in hours_choices %}
+        <option value="{{ val }}" {{ 'selected' if val == form_hours }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <fieldset class="sources">
+      <label><input type="checkbox" name="src_ats" value="1" checked> ATS boards</label>
+      <label><input type="checkbox" name="src_jobspy" value="1" checked> JobSpy</label>
+    </fieldset>
+    <button type="submit" class="primary">Search</button>
+  </form>
+  <div id="search-status">{% if active_search %}{% set search = active_search %}{% set search_id = active_search_id %}{% set restored = true %}{% set oob = false %}{% include "partials/search_status.html" %}{% endif %}</div>
+</section>
+
+<section class="panel">
+  <div class="row between">
+    <h2>Jobs</h2>
+    {# These controls filter only within the active search snapshot. #}
+    <form class="filter" hx-get="/jobs" hx-target="#job-list"
+          hx-include="#active-search-id"
+          hx-trigger="change, keyup changed delay:400ms from:input[name=q]">
+      <input type="search" name="q" placeholder="filter company or title">
+      <label class="check"><input type="checkbox" name="low" value="1"> show low scores</label>
+    </form>
+  </div>
+  {# Locations and Posted-within define the next search; this panel remains the exact active snapshot. #}
+  <div id="job-list"{% if active_search %} hx-get="/jobs?min_score=3" hx-swap="innerHTML"
+       hx-trigger="load" hx-include="#active-search-id, .filter"{% endif %}>
+    <p class="muted empty">{% if active_search %}Loading…{% else %}Run a search above to see its jobs.{% endif %}</p>
+  </div>
+</section>

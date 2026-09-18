@@ -1,0 +1,132 @@
+# Seed list of company job boards polled by the ATS-board source.
+# ats: greenhouse | lever | ashby   slug: the board token in the public API URL.
+# verified: false marks slugs that are a best guess. A board that 404s is skipped and logged;
+# prune or fix entries as you see them in the search log.
+companies:
+  # --- AI labs / AI-native ---
+  - {name: Anthropic, ats: greenhouse, slug: anthropic, verified: true}
+  - {name: OpenAI, ats: ashby, slug: openai, verified: true}
+  - {name: Cohere, ats: ashby, slug: cohere, verified: false}
+  - {name: Scale AI, ats: greenhouse, slug: scaleai, verified: true}
+  - {name: Mistral AI, ats: lever, slug: mistral, verified: true}
+  - {name: Perplexity, ats: ashby, slug: perplexity, verified: false}
+  - {name: Glean, ats: greenhouse, slug: gleanwork, verified: true}
+  - {name: Harvey, ats: ashby, slug: harvey, verified: true}
+  - {name: Sierra, ats: ashby, slug: sierra, verified: true}
+  - {name: Decagon, ats: ashby, slug: decagon, verified: false}
+  - {name: Cresta, ats: ashby, slug: cresta, verified: false}
+  - {name: Writer, ats: ashby, slug: writer, verified: false}
+  - {name: Vercel, ats: greenhouse, slug: vercel, verified: true}
+  - {name: Replit, ats: ashby, slug: replit, verified: true}
+  - {name: Anysphere (Cursor), ats: ashby, slug: cursor, verified: true}
+  - {name: ElevenLabs, ats: ashby, slug: elevenlabs, verified: true}
+  - {name: Hebbia, ats: ashby, slug: hebbia, verified: false}
+  - {name: Abridge, ats: ashby, slug: abridge, verified: false}
+  - {name: Kong, ats: ashby, slug: kong, verified: false}
+  - {name: Databricks, ats: greenhouse, slug: databricks, verified: true}
+  - {name: Snowflake, ats: ashby, slug: Snowflake, verified: false}
+  - {name: Weights & Biases, ats: lever, slug: wandb, verified: true}
+  - {name: LangChain, ats: ashby, slug: langchain, verified: true}
+  - {name: Pinecone, ats: greenhouse, slug: hypercube, verified: true}
+  - {name: Together AI, ats: ashby, slug: together-ai, verified: false}
+  - {name: Fireworks AI, ats: ashby, slug: fireworks-ai, verified: false}
+  - {name: Modal, ats: ashby, slug: modal, verified: true}
+  - {name: Anyscale, ats: ashby, slug: anyscale, verified: false}
+  - {name: Palantir, ats: lever, slug: palantir, verified: true}
+  - {name: Contextual AI, ats: ashby, slug: contextual-ai, verified: false}
+  - {name: Cognition, ats: ashby, slug: cognition, verified: false}
+  - {name: Adept, ats: ashby, slug: adept, verified: false}
+  - {name: Character.AI, ats: greenhouse, slug: characterai, verified: false}
+  - {name: Hugging Face, ats: greenhouse, slug: huggingface, verified: false}
+  - {name: Groq, ats: ashby, slug: groq, verified: false}
+  - {name: Cerebras, ats: greenhouse, slug: cerebras, verified: true}
+  - {name: Runway, ats: greenhouse, slug: runwayml, verified: true}
+  - {name: Synthesia, ats: greenhouse, slug: synthesia, verified: false}
+  - {name: Deepgram, ats: ashby, slug: deepgram, verified: false}
+  - {name: AssemblyAI, ats: greenhouse, slug: assemblyai, verified: false}
+  - {name: Unstructured, ats: ashby, slug: unstructured, verified: false}
+  - {name: Glean (Lever mirror), ats: lever, slug: glean, verified: false}
+  - {name: Adept (Lever mirror), ats: lever, slug: adept, verified: false}
+  - {name: Vapi, ats: ashby, slug: vapi, verified: false}
+  - {name: Retell AI, ats: ashby, slug: retellai, verified: false}
+  - {name: Braintrust, ats: ashby, slug: braintrustdata, verified: false}
+  - {name: Arize AI, ats: ashby, slug: arize, verified: false}
+  - {name: Galileo, ats: ashby, slug: galileo, verified: false}
+  - {name: Glide, ats: ashby, slug: glide, verified: false}
+  - {name: Cursor (Lever mirror), ats: lever, slug: anysphere, verified: false}
+
+  # --- Dev tools / data infra ---
+  - {name: Retool, ats: greenhouse, slug: retool, verified: true}
+  - {name: Airtable, ats: greenhouse, slug: airtable, verified: true}
+  - {name: Notion, ats: greenhouse, slug: notion, verified: true}
+  - {name: Figma, ats: greenhouse, slug: figma, verified: true}
+  - {name: Ramp, ats: ashby, slug: ramp, verified: true}
+  - {name: Brex, ats: greenhouse, slug: brex, verified: true}
+  - {name: Stripe, ats: greenhouse, slug: stripe, verified: true}
+  - {name: Datadog, ats: greenhouse, slug: datadog, verified: true}
+  - {name: Cloudflare, ats: greenhouse, slug: cloudflare, verified: true}
+  - {name: Twilio, ats: greenhouse, slug: twilio, verified: true}
+  - {name: HashiCorp, ats: greenhouse, slug: hashicorp, verified: true}
+  - {name: Elastic, ats: greenhouse, slug: elastic, verified: true}
+  - {name: Confluent, ats: greenhouse, slug: confluent, verified: true}
+  - {name: dbt Labs, ats: greenhouse, slug: dbtlabsinc, verified: true}
+  - {name: Hex, ats: ashby, slug: hex, verified: false}
+  - {name: Sourcegraph, ats: greenhouse, slug: sourcegraph91, verified: true}
+  - {name: Vanta, ats: greenhouse, slug: vanta, verified: true}
+  - {name: Rippling, ats: greenhouse, slug: rippling, verified: true}
+  - {name: Deel, ats: ashby, slug: deel, verified: true}
+  - {name: Remote, ats: greenhouse, slug: remotecom, verified: true}
+  - {name: Samsara, ats: greenhouse, slug: samsara, verified: true}
+  - {name: Verkada, ats: greenhouse, slug: verkada, verified: true}
+  - {name: Anduril, ats: greenhouse, slug: andurilindustries, verified: true}
+  - {name: PostHog, ats: ashby, slug: posthog, verified: true}
+  - {name: Supabase, ats: ashby, slug: supabase, verified: true}
+  - {name: Linear, ats: ashby, slug: linear, verified: true}
+  - {name: Temporal, ats: greenhouse, slug: temporaltechnologies, verified: true}
+  - {name: Grafana Labs, ats: greenhouse, slug: grafanalabs, verified: true}
+  - {name: MongoDB, ats: greenhouse, slug: mongodb, verified: true}
+  - {name: Cockroach Labs, ats: greenhouse, slug: cockroachlabs, verified: true}
+  - {name: ClickHouse, ats: greenhouse, slug: clickhouse, verified: true}
+  - {name: Neon, ats: ashby, slug: neon, verified: false}
+  - {name: Airbyte, ats: greenhouse, slug: airbyte, verified: true}
+  - {name: Fivetran, ats: greenhouse, slug: fivetran, verified: true}
+  - {name: Zapier, ats: greenhouse, slug: zapier, verified: true}
+  - {name: Webflow, ats: greenhouse, slug: webflow, verified: true}
+  - {name: Chainguard, ats: greenhouse, slug: chainguard, verified: true}
+  - {name: Cribl, ats: greenhouse, slug: cribl, verified: true}
+  - {name: Sentry, ats: greenhouse, slug: sentry, verified: true}
+  - {name: Netlify, ats: greenhouse, slug: netlify, verified: true}
+  - {name: Plaid, ats: lever, slug: plaid, verified: true}
+  - {name: Nuro, ats: lever, slug: nuro, verified: true}
+
+  # --- Canada / Australia / UK / APAC ---
+  - {name: Shopify, ats: lever, slug: shopify, verified: false}
+  - {name: Wealthsimple, ats: lever, slug: wealthsimple, verified: true}
+  - {name: Ada, ats: lever, slug: ada, verified: true}
+  - {name: Clio, ats: lever, slug: clio, verified: true}
+  - {name: Faire, ats: ashby, slug: faire, verified: false}
+  - {name: 1Password, ats: lever, slug: 1password, verified: true}
+  - {name: Hootsuite, ats: lever, slug: hootsuite, verified: true}
+  - {name: Cohere (Lever mirror), ats: lever, slug: cohere, verified: false}
+  - {name: Canva, ats: lever, slug: canva, verified: true}
+  - {name: Atlassian, ats: lever, slug: atlassian, verified: true}
+  - {name: Xero, ats: lever, slug: xero, verified: true}
+  - {name: Culture Amp, ats: lever, slug: cultureamp, verified: true}
+  - {name: SafetyCulture, ats: lever, slug: safetyculture, verified: true}
+  - {name: Employment Hero, ats: lever, slug: employmenthero, verified: false}
+  - {name: Airwallex, ats: lever, slug: airwallex, verified: true}
+  - {name: Deputy, ats: lever, slug: deputy, verified: false}
+  - {name: Linktree, ats: lever, slug: linktree, verified: false}
+  - {name: Rokt, ats: greenhouse, slug: rokt, verified: false}
+  - {name: Immutable, ats: lever, slug: immutable, verified: false}
+  - {name: Leonardo.Ai, ats: lever, slug: leonardoai, verified: false}
+  - {name: Grammarly, ats: greenhouse, slug: grammarly, verified: true}
+  - {name: Monzo, ats: greenhouse, slug: monzo, verified: true}
+  - {name: Revolut, ats: greenhouse, slug: revolut, verified: false}
+  - {name: Wise, ats: greenhouse, slug: transferwise, verified: true}
+  - {name: Synthesia (Ashby mirror), ats: ashby, slug: synthesia, verified: false}
+  - {name: PolyAI, ats: greenhouse, slug: polyai, verified: false}
+  - {name: Eleven Labs (Greenhouse mirror), ats: greenhouse, slug: elevenlabs, verified: false}
+  - {name: Grab, ats: greenhouse, slug: grab, verified: false}
+  - {name: Carousell, ats: lever, slug: carousell, verified: false}
+  - {name: Careem, ats: greenhouse, slug: careem, verified: false}

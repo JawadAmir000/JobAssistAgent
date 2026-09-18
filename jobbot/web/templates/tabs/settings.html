@@ -1,0 +1,86 @@
+{% if msg %}<div class="notice ok">{{ msg }}</div>{% endif %}
+{% if err %}<div class="notice error">{{ err }}</div>{% endif %}
+
+<section class="panel">
+  <h2>General</h2>
+  <form class="form" hx-post="/settings" hx-target="#main" hx-swap="innerHTML" hx-encoding="multipart/form-data">
+    <label>LLM provider
+      <select name="provider">
+        {% for p in providers %}
+        <option value="{{ p.name }}" {{ 'selected' if p.name == settings.provider }}>{{ p.name }} — {{ 'ready' if p.ok else p.message }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <ul class="provider-list">
+      {% for p in providers %}
+      <li><span class="dot {{ 'on' if p.ok else 'off' }}"></span><strong>{{ p.name }}</strong>
+        <span class="muted">{{ p.message }}{% if p.default_model %} · default model {{ p.default_model }}{% endif %}</span></li>
+      {% endfor %}
+    </ul>
+    <label>Model <span class="muted">(blank = provider default)</span>
+      <input type="text" name="model" value="{{ settings.model }}">
+    </label>
+    <label>Search locations <span class="muted">(comma separated)</span>
+      <input type="text" name="locations" value="{{ settings.locations }}">
+    </label>
+    <label>Posted within
+      <select name="hours_old">
+        {% for val, label in hours_choices %}
+        <option value="{{ val }}" {{ 'selected' if val == settings.hours_old }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" name="headless" value="1" {{ 'checked' if settings.headless }}> Run browser headless</label>
+    <label>CV <span class="muted" id="cv-status">{% if settings.cv_path %}current: {{ settings.cv_path.rsplit('/', 1)[-1] }}{% else %}none uploaded{% endif %}</span>
+      <input type="file" name="cv" accept=".pdf,.doc,.docx" id="cv-input"
+             oninput="if (this.files.length) document.getElementById('cv-status').textContent = 'selected: ' + this.files[0].name + ' — click Save settings to upload'">
+    </label>
+    <label>…or paste the full path to your CV <span class="muted">use this if the file picker above does nothing (in Finder: right-click the file, hold ⌥, “Copy as Pathname”)</span>
+      <input type="text" name="cv_path" placeholder="/Users/you/Desktop/cv.pdf" spellcheck="false">
+    </label>
+    <button type="submit" class="btn primary">Save settings</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Secrets</h2>
+  <p class="muted">Stored in the macOS keychain, never in a file. Do not put these in <code>facts.yaml</code>:
+    that file is read into the model's prompts, so anything credential-shaped found there is moved here
+    automatically and stripped from the file.</p>
+  <p class="muted"><strong>JOBBOT_MAIL_PASSWORD</strong> lets jobbot read the one-time codes Greenhouse emails
+    before it will accept a submission, so those applications finish without stopping to ask you. Use a Gmail
+    <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">App Password</a>
+    (16 letters), not your account password. It reads {{ settings.mail_user or 'the address in facts.yaml' }}.</p>
+  {% if mail_state %}
+  <p><span class="badge {{ 'ok' if mail_state[0] == 'ok' else 'warn' }}">mailbox {{ mail_state[0] }}</span>
+     <span class="muted">{{ mail_state[1] }}</span></p>
+  {% endif %}
+  {% for name, (state, note) in secrets.items() %}
+  <form class="form inline" hx-post="/settings/secret" hx-target="#main" hx-swap="innerHTML">
+    <input type="hidden" name="name" value="{{ name }}">
+    <label>{{ name }} <span class="badge {{ 'ok' if state.startswith('set') else 'warn' }}">{{ state }}</span>
+      <input type="password" name="value" autocomplete="off" placeholder="paste to update">
+    </label>
+    <button type="submit" class="btn">Save</button>
+    {% if note %}<p class="muted">{{ note }}</p>{% endif %}
+  </form>
+  {% endfor %}
+</section>
+
+<section class="panel">
+  <h2>facts.yaml</h2>
+  <p class="muted">Only true facts. Form fields and screening answers are drawn from here.</p>
+  <form class="form" hx-post="/settings/facts" hx-target="#main" hx-swap="innerHTML">
+    <textarea name="facts" rows="18" spellcheck="false">{{ facts_text }}</textarea>
+    <button type="submit" class="btn">Save facts.yaml</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>answers.json</h2>
+  <p class="muted">Remembered screening answers (normalised question → answer).</p>
+  <form class="form" hx-post="/settings/answers" hx-target="#main" hx-swap="innerHTML">
+    <textarea name="answers" rows="12" spellcheck="false">{{ answers_text }}</textarea>
+    <button type="submit" class="btn">Save answers.json</button>
+  </form>
+</section>

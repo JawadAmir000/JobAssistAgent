@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jobbot</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">jobbot</div>
+  <div id="cost-meter" class="meter" hx-get="/cost" hx-trigger="every 10s" hx-swap="innerHTML">
+    {% include "partials/cost_meter.html" %}
+  </div>
+</header>
+<nav class="tabs" hx-target="#main" hx-swap="innerHTML" hx-push-url="true">
+  <a href="/" hx-get="/" class="{{ 'active' if tab == 'jobs' }}">Jobs</a>
+  <a href="/applications" hx-get="/applications" class="{{ 'active' if tab == 'applications' }}">Applications</a>
+  <a href="/settings" hx-get="/settings" class="{{ 'active' if tab == 'settings' }}">Settings</a>
+  <a href="/companies" hx-get="/companies" class="{{ 'active' if tab == 'companies' }}">Companies</a>
+</nav>
+<main id="main" class="main">
+  {% include tab_template %}
+</main>
+<script>
+  // keep the active tab highlighted after an HTMX tab swap
+  document.body.addEventListener('htmx:afterOnLoad', function (e) {
+    var path = e.detail.pathInfo && e.detail.pathInfo.requestPath;
+    if (!path || e.detail.target.id !== 'main') return;
+    document.querySelectorAll('nav.tabs a').forEach(function (a) {
+      a.classList.toggle('active', a.getAttribute('href') === path.split('?')[0]);
+    });
+  });
+</script>
+</body>
+</html>

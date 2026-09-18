@@ -1,0 +1,37 @@
+{% if msg %}<div class="notice ok">{{ msg }}</div>{% endif %}
+{% if err %}<div class="notice error">{{ err }}</div>{% endif %}
+
+<section class="panel">
+  <h2>Add company</h2>
+  <form class="form row-form" hx-post="/companies" hx-target="#main" hx-swap="innerHTML">
+    <label class="grow">Name <input type="text" name="name" required placeholder="Acme"></label>
+    <label>ATS
+      <select name="ats">{% for a in ats_choices %}<option value="{{ a }}">{{ a }}</option>{% endfor %}</select>
+    </label>
+    <label class="grow">Board slug <input type="text" name="slug" placeholder="acme (from the careers URL)"></label>
+    <button type="submit" class="btn primary">Add</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Companies <span class="muted">({{ companies|length }})</span></h2>
+  {% if not companies %}
+  <p class="muted empty">No companies tracked yet.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Name</th><th>ATS</th><th>Slug</th><th>Verified</th></tr></thead>
+    <tbody>
+    {% for c in companies %}
+      <tr>
+        <td>{{ c.name }}</td>
+        <td><span class="badge ats ats-{{ c.ats }}">{{ c.ats }}</span></td>
+        <td class="muted">{{ c.slug }}</td>
+        <td class="muted">{{ "yes" if c.verified else "no" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>

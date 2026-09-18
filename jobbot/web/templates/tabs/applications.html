@@ -1,0 +1,39 @@
+{% if live %}
+<section class="panel">
+  <h2>Needs you / running</h2>
+  {% for ctx in live %}
+    {% with a = ctx['a'], job = ctx['job'], options = ctx['options'], cost_text = ctx['cost_text'], screenshot_name = ctx['screenshot_name'] %}
+      <div class="live-app">
+        <p class="muted">{{ a['company'] if a['company'] is defined else '' }}{{ job['company'] if job else '' }} — {{ job['title'] if job else '' }}</p>
+        {% include "partials/application_card.html" %}
+      </div>
+    {% endwith %}
+  {% endfor %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Applications</h2>
+  {% if not apps %}
+  <p class="muted empty">No applications yet.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Date</th><th>Company</th><th>Title</th><th>ATS</th><th>Status</th><th>Cost</th><th></th></tr></thead>
+    <tbody>
+    {% for a in apps %}
+      <tr>
+        <td>{{ a['started_at']|date }}</td>
+        <td>{{ a['company'] }}</td>
+        <td>{{ a['title'] }}</td>
+        <td><span class="badge ats ats-{{ a['ats'] }}">{{ a['ats'] }}</span></td>
+        <td><span class="status st-{{ a['status'] }}" title="{{ a['reason'] }}">{{ a['status'].replace('_', ' ') }}</span></td>
+        <td class="muted">{{ costs[a['job_id']] }}</td>
+        <td><a href="{{ a['url'] }}" target="_blank" rel="noopener">link</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>

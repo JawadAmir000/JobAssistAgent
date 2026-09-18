@@ -1,0 +1,32 @@
+<article class="card job" id="job-{{ job['id'] }}">
+  <div class="card-head">
+    <div>
+      <div class="company">{{ job['company'] }}</div>
+      <h3 class="title">{{ job['title'] }}</h3>
+      <div class="meta">
+        {% if job['location'] %}<span>{{ job['location'] }}</span>{% endif %}
+        {% if job['remote'] %}<span class="badge">remote</span>{% endif %}
+        <span class="badge ats ats-{{ job['ats'] }}">{{ job['ats'] }}</span>
+        <span class="badge source">{{ 'ATS board' if job['source'] == 'ats_board' else job['source'] }}</span>
+        {% if job['posted_at'] %}<span class="muted">posted {{ job['posted_at']|date }}</span>{% endif %}
+      </div>
+    </div>
+    {% if job['score'] %}
+    <span class="score s{{ job['score'] }}" title="{{ job['score_reason'] }}">{{ job['score'] }}</span>
+    {% else %}
+    <span class="score unscored" title="not scored yet">–</span>
+    {% endif %}
+  </div>
+  {% if job['score_reason'] %}<p class="reason">{{ job['score_reason'] }}</p>{% endif %}
+  <div class="actions" id="job-actions-{{ job['id'] }}">
+    <a class="btn" href="{{ job['url'] }}" target="_blank" rel="noopener">Open</a>
+    {% if job['app_status'] %}
+      <span class="status st-{{ job['app_status'] }}"
+            hx-get="/application/{{ job['app_id'] }}/card" hx-target="[id='job-actions-{{ job['id'] }}']" hx-swap="innerHTML"
+            hx-trigger="click" role="button" title="show application">{{ job['app_status'].replace('_', ' ') }}</span>
+    {% else %}
+      <button class="btn primary" hx-post="/apply/{{ job['id'] }}" hx-target="[id='job-actions-{{ job['id'] }}']" hx-swap="innerHTML">Apply</button>
+    {% endif %}
+    <button class="btn quiet" hx-post="/jobs/{{ job['id'] }}/hide" hx-target="[id='job-{{ job['id'] }}']" hx-swap="outerHTML" title="hide this job">Hide</button>
+  </div>
+</article>

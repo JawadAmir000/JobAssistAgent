@@ -1,0 +1,24 @@
+{% set scope %}{% if not locations %}any location{% else %}{{ locations|join(', ') }}{% endif %}{% if hours_label %} · {{ hours_label|lower }}{% endif %}{% endset %}
+{% if search and search['status'] == 'running' %}
+<p class="muted empty">Searching “{{ search['query'] }}” in {{ scope }}… Results appear when it finishes.</p>
+{% elif search and search['status'] == 'error' %}
+<p class="notice error">Search failed for “{{ search['query'] }}”. No previous results are being shown. Check the search log and run it again.</p>
+{% elif search and total == 0 and search['found'] > 0 %}
+<p class="muted empty">All {{ search['found'] }} jobs from this search are hidden.</p>
+{% elif search and total == 0 and search['warning'] %}
+<p class="notice warn">Nothing came back, and sources failed or were rate-limited, so these results are incomplete: {{ search['warning'] }}. Run the search again.</p>
+{% elif search and total == 0 %}
+<p class="muted empty">“{{ search['query'] }}” matched nothing in {{ scope }}. Widen the locations or date window and search again.</p>
+{% elif search and shown == 0 %}
+<p class="muted empty">{% if q %}No jobs from this search match “{{ q }}”.{% else %}All {{ total }} jobs from this search score below {{ min_score }}. Select “show low scores” to see them.{% endif %}</p>
+{% elif not search %}
+<p class="muted empty">Run a search above to see its jobs.</p>
+{% else %}
+{% if search and search['warning'] %}<p class="notice warn">Incomplete results — {{ search['warning'] }}</p>{% endif %}
+<p class="muted count">Showing {{ shown }} of {{ total }} · “{{ search['query'] }}” · {{ scope }}{% if search['found'] > total %} · {{ search['found'] - total }} hidden{% endif %}</p>
+<div class="cards">
+  {% for job in jobs %}
+  {% include "partials/job_card.html" %}
+  {% endfor %}
+</div>
+{% endif %}
