@@ -15,6 +15,10 @@ dependencies = [
     "anthropic>=0.40",
     "keyring>=25.0",
     "rapidfuzz>=3.9",
+    # CV text extraction (config.load_cv_text). It was only ever present as a transitive dependency, and
+    # the import sits inside a bare except, so on a clean install every screening answer quietly lost its
+    # CV grounding instead of failing.
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

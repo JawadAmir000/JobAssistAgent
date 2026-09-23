@@ -28,12 +28,13 @@ Then in **Settings**:
 ## Usage
 
 - **Jobs** tab → search. ATS boards (Greenhouse/Lever/Ashby from `companies.yaml`) + JobSpy (Indeed/LinkedIn/Google) run in parallel; results are deduped and rule-scored 1–5.
-- Click **Apply**. A Chromium window opens and fills the form. If a question isn't cached, the card asks you inline; your answer is saved to `answers.json` and never asked again. The browser window belongs to the thread that opened it and stays open while it waits for you, so answering continues the same half-filled form rather than starting over.
+- Click **Apply**. A Chromium window opens and fills the form. If a question isn't cached, the card asks you inline; your answer is saved to `answers.json`, tagged as yours, and never asked again. The browser window belongs to the thread that opened it and stays open while it waits for you, so answering continues the same half-filled form rather than starting over.
 - **Applications** tab: everything submitted, with cost.
 - **Companies** tab: add boards. Entries with `verified: false` are slug guesses — prune the ones that 404 in the search log.
 - A failed run keeps its browser window open. Fix whatever went wrong in it and press **Retry**: the adapter
   re-runs on that same half-filled form instead of starting over, and anything you typed by hand is learned
-  into `answers.json` so the next application does not ask.
+  into `answers.json` so the next application does not ask. A control still showing what the page put in it
+  is not learned — an untouched country dropdown is not you saying you are Afghan.
 
 ## Which ATSs are automated
 
@@ -41,7 +42,8 @@ Greenhouse, Lever, Ashby and Workday have adapters of their own. Zoho Recruit, W
 Teamtailor, JazzHR, BambooHR, SmartRecruiters, PageUp, iCIMS and SuccessFactors share one generic adapter
 that finds fields by their visible label, and any unrecognised career site is attempted with it too. It
 presses the Apply / "I'm interested" / "Postuler" control in whichever frame holds it (never "Apply with
-LinkedIn" or "Postuler via Indeed"), opens an embedded form as the page when the form lives in an iframe,
+LinkedIn" or "Postuler via Indeed"), follows application forms opened in a new tab, waits through delayed
+single-page-app rendering, opens an embedded form as the page when the form lives in an iframe,
 fills a page, presses Submit if there is one and Next otherwise, and repeats until the site confirms — so a
 SmartRecruiters or iCIMS wizard is walked page by page. Labels in French, German, Spanish, Portuguese,
 Italian and Dutch ("Prénom", "Courriel", "Vorname") are filled from `facts.yaml` like their English
@@ -89,14 +91,15 @@ jobbot/
   web/           FastAPI + HTMX UI
 facts.example.yaml  template — copy to facts.yaml and fill in
 facts.yaml       truths about you (forms are filled from this; gitignored)
-answers.json     learned screening answers (gitignored)
+answers.json     learned screening answers, with where each came from (gitignored)
 data/jobbot.log  runner log (rotated); the thread name shows which application a line belongs to
 companies.yaml   company → ATS → slug
 ```
 
 CLI: `jobbot discover "Forward Deployed Engineer"` runs a search without the UI.
 
-Tests: `pytest -q` (offline, 213 tests).
+Tests: `pytest -q` (441 tests). All offline; the DOM ones skip themselves where Playwright or its
+browser is not installed.
 
 ## Not automated on purpose
 
@@ -114,6 +117,22 @@ a `.txt`). They are checked for stock phrasing and rewritten once if they read l
 **Nothing is declined on your behalf.** Gender, race, veteran and disability questions are asked, never
 auto-answered with "prefer not to say" — that is still a choice, and it is yours. Answer once; it is cached
 and never asked again.
+
+**Every remembered answer records where it came from** — you, `facts.yaml`, a value you typed into the
+browser window, or the model — and that decides what it is allowed to settle later. Visa, citizenship,
+EEO and contact-detail questions are answered from `facts.yaml` or by you and from nothing else, so an
+answer picked up on one employer's form can never be replayed onto another country's. A model answer is
+the weakest thing in the file and is dropped as soon as `facts.yaml` can answer the same question, which
+is what makes editing `facts.yaml` take effect. **Settings → Remembered answers** lists the lot: what
+jobbot will reuse, what it has set aside and why, and a review list for anything whose origin it cannot
+vouch for. Keep, set aside or delete each one.
+
+**Number fields** (`Notice period (in week)`, `Salary Expectations (day rate/annual)`) take a number and
+nothing else — a browser silently drops the letters out of a word typed into one, leaves a field that reads
+back as empty, and then refuses the submit with "Please enter a number." So an answer that names a number is
+converted (a notice period of `None` is 0 weeks, "3 weeks" is 3, "$120,000" is 120000) and an answer that
+names none — "Negotiable" for a salary — stops and asks you for the figure. It is cached like any other
+answer, so it is asked once.
 
 **Emailed verification codes** (Greenhouse now requires one before it will accept a submission): set an app
 password in **Settings → Secrets → `JOBBOT_MAIL_PASSWORD`** (Gmail: <https://myaccount.google.com/apppasswords>)

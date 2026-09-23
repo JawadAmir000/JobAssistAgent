@@ -1,15 +1,24 @@
 """Cached-answer resolver for screening questions.
 
 Order of resolution in Resolver.answer():
-    (0) the application-source question ("how did you hear about us") -> preferences.job_source, always
-    (a) exact cache hit on the normalised question
-    (b) fuzzy cache hit (rapidfuzz token_set_ratio >= FUZZY_THRESHOLD)
-    (c) built-in rules from facts.yaml (identity, work, authorization, preferences ...)
-    (d) map rule answers onto the option list when options are given
-    (e) LLM fallback (only if llm_enabled and the question is not "protected")
+    (0)   the application-source question ("how did you hear about us") -> preferences.job_source, always
+    (0.5) protected questions, in _protected_answer, BEFORE the cache is consulted:
+            work authorisation and EEO from facts.yaml, then the candidate's own answer to this exact
+            wording; a salary or day rate the other way round. Nothing else may settle one, and there is
+            no fall-through — a protected question is answered from what it is entitled to or it stops.
+    (a)   exact cache hit on the normalised question
+    (b)   fuzzy cache hit (rapidfuzz token_set_ratio >= FUZZY_THRESHOLD)
+    (c)   built-in rules from facts.yaml (identity, work, authorization, preferences ...)
+    (d)   map rule answers onto the option list when options are given
+    (e)   LLM fallback (only if llm_enabled and the question is not "protected")
     otherwise -> NeedsHuman
 
-Every successful answer is written back to answers.json via config.save_answers.
+(0.5) is above the cache on purpose. It used to sit below it, and a value scraped off a dropdown nobody
+had touched therefore answered a real EEO question, while a plain Yes/No "right to work in Australia"
+was served from an entry learned on another continent.
+
+Every successful answer is written back to answers.json through jobbot.answers, with a source saying
+where it came from: what may not be guessed may not be replayed either.
 """
 from __future__ import annotations
 
@@ -21,17 +30,22 @@ from typing import Any
 
 from rapidfuzz import fuzz
 
+from jobbot import answers as store
 from jobbot import config
+from jobbot.answers import (TRUST, AnswerRecord, is_facts_only, is_reusable_protected, kw_regex,
+                            normalize_question)
 from jobbot.apply.base import NeedsHuman
+
+# normalize_question is re-exported: it is this module's vocabulary as far as every caller is concerned,
+# and jobbot.answers owns it only because the store has to key on the same thing.
+__all__ = ["Resolver", "normalize_question", "is_agreeable", "is_one_time_secret", "is_source_question",
+           "as_number"]
 
 log = logging.getLogger(__name__)
 
 FUZZY_THRESHOLD = 92
 FUZZY_SORT_THRESHOLD = 90
 
-_TRAILERS = re.compile(r"(\s*\*+\s*|\s*\(\s*required\s*\)\s*|\s*\(\s*optional\s*\)\s*|\s*required\s*$|\s*optional\s*$)+$", re.I)
-_PUNCT = re.compile(r"[^\w\s]")
-_WS = re.compile(r"\s+")
 
 # Decline-to-answer options, matched on shape rather than a fixed list of phrasings: the literal-substring
 # version missed "I do not want to answer" — the wording of the federal disability form (CC-305) and so of
@@ -43,6 +57,8 @@ _DECLINE_RE = re.compile(
     r"|\bnot\s+to\s+(?:answer|say|disclose|self|identify|specify|state)\b",
     re.I)
 
+_RESIDENCY_STATUS_RE = re.compile(r"\bresidenc(?:y|e)\s+status\b|\bresident\s+status\b"
+                                  r"|\bstatus\s+of\s+residenc")
 _AUTH_QUESTION_RE = re.compile(r"\bsponsor|\bauthori[sz]|\bwork permit\b|\bright to work\b|\beligible to work\b|\blegally\b|\bvisa\b"
                                r"|\bwork(?:ing)?\s+rights?\b|\bimmigration\s+status\b|\bpermitted\s+to\s+work\b")
 # The same subject asked as an open question ("What are your working rights in Australia?"). The answer is
@@ -53,6 +69,23 @@ _AUTH_OPEN_QUESTION_RE = re.compile(
     r"\bwork(?:ing)?\s+rights?\b|\bright\s+to\s+work\b|\bwork\s+authori[sz]ation\b|\bauthori[sz]ation\s+to\s+work\b"
     r"|\bvisa\b|\bsponsor|\bwork\s+permit\b|\bimmigration\s+status\b|\beligib\w*\s+to\s+work\b")
 _YES_NO_SHAPE_RE = re.compile(r"^\s*(?:do|does|did|are|is|will|would|can|could|have|has|were|should|may|must)\s+(?:you|u|i)\b")
+# ...unless the same box then asks for the facts behind the answer. Application 113 (Fusion5, JobAdder)
+# asked "Are you a Permanent Resident or Citizen of Australia or New Zealand? If you are on a Visa please
+# provide details and applicable expiry dates, or if you require sponsorship." — one text box, yes/no in
+# shape only. The sponsorship rule answered the bare "Yes" it means as "yes, I need sponsorship", and on
+# the page that reads as a claim to Australian or New Zealand citizenship, which is false. A question that
+# asks for details is answered with the facts, not with a word.
+_ASKS_FOR_DETAIL_RE = re.compile(
+    r"\bplease\s+(?:provide|specify|state|explain|describe|elaborate|detail|list|give|advise|confirm|note)\b"
+    r"|\b(?:provide|specify|state|explain|describe|list|give|include)\b[^.?]{0,40}"
+    r"\b(?:details?|specifics?|dates?|status|type|information|reason|which|what|why)\b"
+    r"|\bif\s+(?:yes|so|not|no)\b[^.?]{0,40}\b(?:please|provide|specify|explain|state|describe|which|what)\b")
+
+# A question asking what was studied. The same list as the one the suggestion-box filler in common.py
+# matches on, so a board that offers a dropdown and a board that offers a typeahead reach the same answer.
+_FIELD_OF_STUDY_KEY_RE = re.compile(
+    r"field of (?:study|degree)|discipline|\bmajor\b|course of study|area of study|subject of study"
+    r"|specialis|specializ|concentration")
 
 _YES_WORDS = {"yes", "y", "true"}
 
@@ -248,35 +281,6 @@ _GENERIC_SUBJECT = re.compile(
     r"|\bdo you have\b")
 
 
-def normalize_question(q: str) -> str:
-    """lowercase, strip trailing '*' / '(required)' / '(optional)', strip punctuation, collapse whitespace."""
-    s = (q or "").strip()
-    s = _TRAILERS.sub("", s)
-    s = s.lower()
-    s = _PUNCT.sub(" ", s)
-    s = _WS.sub(" ", s).strip()
-    return s
-
-
-@lru_cache(maxsize=8)
-def _kw_regex(words: frozenset[str] | tuple[str, ...]) -> re.Pattern:
-    """Keyword matcher anchored on word starts.
-
-    Plain substring matching mis-fires: 'age ' matched inside 'stor*age* ' and routed a question about data
-    architectures to the protected-question path. Keywords are prefixes by design ('authoriz' must catch
-    'authorized'/'authorization'), so anchor the start only — except entries written with a trailing space,
-    which mean whole-word ('age', not 'agenda').
-    """
-    parts = []
-    for w in sorted(words):
-        stripped = w.strip()
-        if not stripped:
-            continue
-        tail = r"\b" if w != stripped else ""
-        parts.append(r"\b" + re.escape(stripped) + tail)
-    return re.compile("|".join(parts), re.I)
-
-
 # Replies that are really "I don't know" wearing a suit. None of these belong on an application: when the
 # model produces one, ask the user instead and cache what they say.
 _NON_ANSWER_RE = re.compile(
@@ -295,6 +299,38 @@ _CHATTY_RE = re.compile(
     r"|please\s+(?:provide|clarify|specify|share)\b|which\s+(?:question|field|answer)\b"
     r"|(?:as\s+an?\s+ai|i\s+am\s+an?\s+ai)\b|here\s+(?:is|are)\s+(?:my|the)\s+answer)", re.I)
 _ASKS_BACK_RE = re.compile(r"\?\s*$|\b(?:clarify|specify|provide)\b[^.]*\?", re.I)
+
+
+# ---------- numbers ----------
+# Some boxes are <input type=number>, and an answer that reads perfectly well in prose cannot go in one:
+# facts.yaml gives the notice period as "None" and the salary rule gives "Negotiable". The first names a
+# number (no notice is zero weeks) and is converted; the second names none and is asked for, because a
+# figure the candidate never chose must not be invented onto a real application.
+_NUMBER_IN_TEXT_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+_ZERO_WORDS_RE = re.compile(
+    r"^(?:none|nil|n/?a|no|zero|nothing|no\s+notice|immediate(?:ly)?|asap|now|"
+    r"available\s+(?:now|immediately)|ready\s+to\s+start)\b", re.I)
+# Questions where "none" is a refusal to name a figure rather than the figure zero. Offering to work for
+# nothing is not what "salary: negotiable" means.
+_FIGURE_QUESTION_RE = re.compile(r"salary|compensation|\bpay\b|\brate\b|wage|remuneration|package|\bctc\b", re.I)
+NUMBER_MAX_CHARS = 40   # past this it is a sentence that happens to contain a digit, not an answer
+
+
+def as_number(text: str, key: str = "") -> str | None:
+    """`text` as the plain number a number box will take, or None when it names no number honestly.
+
+    "6" -> "6", "3 weeks" -> "3", "$120,000" -> "120000", "None" (notice period) -> "0",
+    "Negotiable" -> None, and a paragraph that merely contains a digit -> None.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > NUMBER_MAX_CHARS:
+        return None
+    m = _NUMBER_IN_TEXT_RE.search(t)
+    if m:
+        return m.group(0).replace(",", "").lstrip("+")
+    if _ZERO_WORDS_RE.match(t) and not _FIGURE_QUESTION_RE.search(key):
+        return "0"
+    return None
 
 
 def _is_non_answer(text: str) -> bool:
@@ -327,31 +363,28 @@ def _yes_no_option(options: list[str], want_yes: bool) -> str | None:
 class Resolver:
     """Answers screening questions from cache, facts, and (optionally) the LLM."""
 
-    # Questions whose answers must NEVER be guessed by the LLM. On a miss they go to NeedsHuman.
-    PROTECTED_KEYWORDS: frozenset[str] = frozenset({
-        "authoriz", "authoris", "visa", "sponsor", "citizen", "clearance", "salary", "compensation",
-        "work permit", "right to work", "legally", "immigration", "eligible to work", "working rights",
-        "work rights",
-        # EEO. "pronoun" is whole-word (the trailing space): as a prefix it also matched "pronounce", so
-        # "How do you pronounce your name?" was treated as a protected EEO question and stopped the run.
-        "gender", "pronoun ", "pronouns ", "race", "ethnic", "veteran", "disabilit", "sexual orientation", "lgbt",
-        "hispanic", "latino", "military", "religion", "date of birth", "age ",
-    })
+    # Questions whose answers must NEVER be guessed by the LLM. On a miss they go to NeedsHuman. The sets
+    # live in jobbot.answers because the store has to make the same judgement when it triages a record:
+    # what may not be guessed may not be replayed out of the cache either.
+    #   FACTS_ONLY        scoped to a country or a law, so a remembered answer is worse than none
+    #   REUSABLE_PROTECTED  a figure only the candidate sets, but the same one at every employer
+    PROTECTED_KEYWORDS: frozenset[str] = store.PROTECTED_KEYWORDS
+    FACTS_ONLY_KEYWORDS: frozenset[str] = store.FACTS_ONLY_KEYWORDS
+    REUSABLE_PROTECTED_KEYWORDS: frozenset[str] = store.REUSABLE_PROTECTED_KEYWORDS
+    EEO_KEYWORDS: tuple[str, ...] = store.EEO_KEYWORDS
+    NEVER_GUESS: tuple[str, ...] = store.NEVER_GUESS
 
-    EEO_KEYWORDS: tuple[str, ...] = (
-        "gender", "pronoun ", "pronouns ", "race", "ethnic", "veteran", "disabilit", "sexual orientation",
-        "lgbt", "hispanic", "latino", "religion", "transgender", "military status", "date of birth",
-    )
-
-    # Personal details that must come from facts/cache or the user — an LLM guessing a phone number or an
-    # address puts a fabricated contact detail on a real application.
-    NEVER_GUESS: tuple[str, ...] = ("phone", "mobile", "telephone", "contact number", "email", "e mail",
-                                    "date of birth", "postal", "postcode", "zip code", "street address",
-                                    "national id", "passport", "social security", "ssn")
-
-    def __init__(self, facts: dict, answers: dict, job: dict, llm_enabled: bool = False, cv_text: str = ""):
+    def __init__(self, facts: dict, answers: dict, job: dict, llm_enabled: bool = False, cv_text: str = "",
+                 records: dict[str, AnswerRecord] | None = None):
         self.facts = facts or {}
         self.answers: dict[str, str] = dict(answers or {})
+        # The same answers with their provenance. `answers` stays a plain {question: answer} map because
+        # that is what every caller and every fuzzy scan wants; `records` is what decides whether a given
+        # entry is allowed to settle a given question. A bare map with no records is the candidate
+        # asserting something — a test fixture or the Settings box — so it is trusted as their own answer.
+        self.records: dict[str, AnswerRecord] = dict(records or {})
+        for _k, _v in self.answers.items():
+            self.records.setdefault(_k, AnswerRecord(key=_k, answer=_v, source="human"))
         self.job = job or {}
         self.llm_enabled = llm_enabled
         self.cv_text = cv_text or ""
@@ -359,7 +392,7 @@ class Resolver:
 
     @classmethod
     def is_never_guess(cls, question: str) -> bool:
-        return bool(_kw_regex(cls.NEVER_GUESS).search(normalize_question(question)))
+        return bool(kw_regex(cls.NEVER_GUESS).search(normalize_question(question)))
 
     # ---------- facts helpers ----------
     def fact(self, key: str, default: Any = "") -> Any:
@@ -383,8 +416,15 @@ class Resolver:
         return bool(_SOURCE_QUESTION_RE.search(key)) or _looks_like_source_options(options or [])
 
     # ---------- cache ----------
-    def learn(self, question: str, answer: str) -> None:
+    def learn(self, question: str, answer: str, *, source: str = "human", kind: str = "",
+              options: list[str] | None = None, scope: str = "", confidence: str = "provisional",
+              reusable: bool = True) -> None:
         """Store a (question -> answer) pair in the answers cache and persist it.
+
+        `source` is what makes the entry worth anything later. It defaults to "human" because the call that
+        matters most — the candidate answering a pause in the web UI — comes in through runner with no
+        keyword at all. Everything jobbot worked out for itself says so: "rule" from facts.yaml, "llm" from
+        the model, "typed" for a value harvested off the form.
 
         A one-time code is kept for this run only: the adapter has to read it back after the pause, but it is
         spent the moment it is used, so writing it to answers.json would poison every later application.
@@ -392,12 +432,26 @@ class Resolver:
         key = normalize_question(question)
         if not key or answer is None:
             return
-        self.answers[key] = str(answer)
+        if store.is_placeholder(str(answer)):
+            # Not an answer, whoever supplied it. Kept out of memory as well as off the disk: a run that
+            # accepted one would select the list's own prompt on the form, and the board refuses that.
+            log.info("not learning %r for %r: that is the list's prompt, not an answer", str(answer), question)
+            return
+        rec = AnswerRecord(key=key, answer=str(answer), source=source, confidence=confidence, kind=kind,
+                           options=[str(o) for o in (options or [])], scope=scope, reusable=reusable,
+                           question=str(question), job_id=str(self.job.get("id", "") or ""),
+                           company=str(self.job.get("company", "") or ""),
+                           ats=str(self.job.get("ats", "") or ""))
+        self.answers[key] = rec.answer
+        self.records[key] = rec
         if is_one_time_secret(key):
             log.info("not caching a one-time code for %r", question)
             return
         try:
-            config.save_answers(self.answers)
+            # Merged onto what is on disk, never written over it. This resolver holds the cache as it was
+            # when its run started, and two applications run at once: saving its own map whole dropped
+            # every answer the other run had learned since.
+            config.save_answer_records({key: rec})
         except Exception as e:  # pragma: no cover - disk issues shouldn't break an application run
             log.warning("could not save answers cache: %s", e)
 
@@ -406,34 +460,75 @@ class Resolver:
         key = normalize_question(question)
         return bool(key) and self._cache_lookup(key) is not None
 
-    def _cache_lookup(self, key: str) -> str | None:
-        if key in self.answers:
-            return self.answers[key]
+    @staticmethod
+    def _eligible(rec: AnswerRecord | None, min_trust: int) -> bool:
+        """Whether this record may be replayed at all.
+
+        Quarantined and rejected records stay in the file so the candidate can look at them, but they are
+        not answers: a value scraped off an untouched dropdown is exactly what must never reach a form
+        again. `reusable` is False for a field that belonged to one row of a repeating section.
+        """
+        return bool(rec) and rec.usable and rec.reusable and rec.trust >= min_trust
+
+    def _cache_lookup(self, key: str, *, min_trust: int = 0, exact_only: bool = False) -> AnswerRecord | None:
+        rec = self.records.get(key)
+        if self._eligible(rec, min_trust):
+            return rec
+        if exact_only:
+            return None
         best, best_score = None, 0
-        for k, v in self.answers.items():
+        for k, r in self.records.items():
+            if not self._eligible(r, min_trust):
+                continue
             s = fuzz.token_set_ratio(key, k)
             # token_set_ratio scores a strict subset at 100 ("years of experience" vs "years of experience with X"),
             # so also require the sorted-token similarity to be high.
-            if s >= FUZZY_THRESHOLD and fuzz.token_sort_ratio(key, k) >= FUZZY_SORT_THRESHOLD and s > best_score:
-                best, best_score = v, s
+            if s < FUZZY_THRESHOLD or fuzz.token_sort_ratio(key, k) < FUZZY_SORT_THRESHOLD:
+                continue
+            # Equally close wordings are separated by what they are worth, not by dict order.
+            if s > best_score or (s == best_score and best is not None and self._rank(r) > self._rank(best)):
+                best, best_score = r, s
         return best
+
+    @staticmethod
+    def _rank(rec: AnswerRecord) -> tuple:
+        return (rec.trust, rec.confidence == "confirmed", rec.learned_at)
 
     # ---------- protected / EEO ----------
     @classmethod
     def is_protected(cls, question: str) -> bool:
-        return bool(_kw_regex(cls.PROTECTED_KEYWORDS).search(normalize_question(question)))
+        return bool(kw_regex(cls.PROTECTED_KEYWORDS).search(normalize_question(question)))
 
     @classmethod
     def is_eeo(cls, question: str) -> bool:
-        return bool(_kw_regex(cls.EEO_KEYWORDS).search(normalize_question(question)))
+        return bool(kw_regex(cls.EEO_KEYWORDS).search(normalize_question(question)))
 
     # ---------- public ----------
     def answer(self, question: str, options: list[str] | None = None, kind: str = "text") -> str:
         """Answer one form question. Remembers what it answered, so an "if yes, explain" that follows can see
         whether its condition was met."""
         ans = self._answer(question, options, kind)
+        if kind == "number":
+            ans = self._numeric(question, ans)
         self.previous_answer = ans
         return ans
+
+    def _numeric(self, question: str, ans: str) -> str:
+        """`ans` as a number for a number box, or a pause so the user can give one.
+
+        Everything upstream answers in prose because that is what most forms want. A number box is the one
+        control that cannot take prose at all — the browser keeps the stray "e" out of "Negotiable" and then
+        refuses the submit — so the conversion happens here, once, wherever the answer came from.
+        """
+        if not ans:
+            return ""
+        num = as_number(ans, normalize_question(question))
+        if num is None:
+            log.info("%r wants a number and %r is not one; asking", question, ans[:60])
+            raise NeedsHuman(f"Needs a number: {question}", question=question, options=[], kind="number")
+        if num != ans:
+            log.info("numeric field %r: answering %r as %r", question, ans[:60], num)
+        return num
 
     def _answer(self, question: str, options: list[str] | None = None, kind: str = "text") -> str:
         options = [str(o) for o in (options or []) if str(o).strip()]
@@ -447,8 +542,9 @@ class Resolver:
             raise NeedsHuman(f"Needs the code: {question}", question=question, options=options, kind=kind)
 
         # A conditional follow-up whose condition was not met: leave it blank rather than answering a
-        # question the form never actually asked. Only for free text — a conditional dropdown does not exist.
-        if kind in ("text", "textarea") and not options:
+        # question the form never actually asked. Only for free text and number boxes ("If yes, how many
+        # years?") — a conditional dropdown does not exist.
+        if kind in ("text", "textarea", "number") and not options:
             m = _CONDITIONAL_FOLLOWUP_RE.search(key)
             if m and not _condition_met(m.group("trigger"), self.previous_answer):
                 log.info("leaving %r blank: its 'if %s' condition was not met (previous answer %r)",
@@ -463,7 +559,7 @@ class Resolver:
             if options:
                 pick = _pick_source_option(options, src)
                 if pick is not None:
-                    self.learn(question, pick)
+                    self.learn(question, pick, source="rule", kind=kind, options=options)
                     return pick
                 # Nothing on this list is true. Ask — never let the model pick one, which is how a form
                 # asking where you heard about the job came to say YouTube: the options were Facebook,
@@ -472,8 +568,108 @@ class Resolver:
                 raise NeedsHuman(f"Needs your answer: {question}", question=question, options=options,
                                  kind=kind)
             else:
-                self.learn(question, src)
+                self.learn(question, src, source="rule", kind=kind)
                 return src
+
+        # (0.5) Protected questions, decided before the cache is even consulted. This ordering is the whole
+        # point: the EEO gate used to sit below the cache, so an "ethnicity" scraped off an untouched
+        # dropdown answered a real EEO question, and a plain Yes/No "right to work in Australia" was served
+        # from an entry learned on a different continent. What may not be guessed may not be replayed.
+        protected = self._protected_answer(key, question, options, kind)
+        if protected is not None:
+            return protected
+
+        # (a)+(b) cache. A cached placeholder is ignored rather than replayed, so a bad answer from an earlier
+        # run self-heals into a real question instead of being pasted onto every future application.
+        rec = self._cache_lookup(key)
+        cached = rec.answer if rec is not None else None
+        if cached is not None and (_is_non_answer(cached) or store.is_placeholder(cached)):
+            # Including a list's prompt learned before learn() refused to store one: answers.json is the
+            # user's file and is not rewritten behind their back, so the bad entries already in it heal
+            # here, by being ignored and asked again.
+            cached = None
+        # A cached answer the control cannot hold is no answer here, whatever it was worth on the form it
+        # was learned from: "Negotiable" is a good answer to a salary box and nothing at all to a salary
+        # number box. Ignored rather than replayed, so the run asks once and heals the cache instead of
+        # bouncing off the same field on every retry.
+        if cached is not None and kind == "number" and as_number(cached, key) is None:
+            log.info("ignoring the cached %r for %r: the field takes only a number", cached[:40], question)
+            cached = None
+        # An answer the model wrote once must not outrank the facts file for ever. When a rule can decide
+        # this question and disagrees, the rule wins and the cache heals: otherwise editing facts.yaml has
+        # no visible effect, which is how a stale guess survives every later application.
+        if cached is not None and rec is not None and rec.trust <= TRUST["llm"]:
+            rule = self._rule_answer(key, question)
+            if rule is not None and rule != cached:
+                log.info("facts now answer %r as %r; dropping the cached %r (%s)",
+                         question, rule, cached[:40], rec.source)
+                cached = None
+        if cached is not None:
+            mapped = self._map_answer(key, cached, options)
+            if mapped is not None:
+                return mapped
+            if not options:
+                return cached
+
+        # (c) rules
+        rule = self._rule_answer(key, question)
+        if rule is not None:
+            # (d) map to options
+            mapped = self._map_answer(key, rule, options)
+            if mapped is not None:
+                self.learn(question, mapped, source="rule", kind=kind, options=options)
+                return mapped
+            if not options:
+                self.learn(question, rule, source="rule", kind=kind)
+                return rule
+            # rule produced a value that isn't among the offered options
+            if self.is_protected(question):
+                raise NeedsHuman(f"Could not map answer {rule!r} to the options for: {question}",
+                                 question=question, options=options, kind=kind)
+
+        # (e) LLM fallback. Work authorisation and EEO stay facts-only: those answers are legal declarations
+        # and a wrong one is a false statement on a real application, not a style slip. _protected_answer
+        # has already settled or stopped those above; this stays as the backstop, so that widening a keyword
+        # set can never quietly open one of them to the model.
+        if self.is_protected(question) or self.is_never_guess(question):
+            raise NeedsHuman(f"Needs your answer (protected question): {question}",
+                             question=question, options=options, kind=kind)
+        if self.llm_enabled:
+            llm = self._llm_answer(question, options)
+            if llm is not None:
+                self.learn(question, llm, source="llm", kind=kind, options=options)
+                return llm
+        raise NeedsHuman(f"Needs your answer: {question}", question=question, options=options, kind=kind)
+
+    # ---------- protected questions, decided before the cache ----------
+    def _protected_answer(self, key: str, question: str, options: list[str], kind: str) -> str | None:
+        """The answer a protected question is allowed to have, or None when the question is not protected.
+
+        This never falls through to the generic cache, the model, or NeedsHuman's caller: a protected
+        question either gets an answer it is entitled to or it stops the run. The two classes are not the
+        same thing, and the difference is where the answer may come from:
+
+          FACTS_ONLY          scoped to a country or a law (visa, citizenship, EEO, a contact detail).
+                              facts.yaml decides; a remembered answer is only allowed if the candidate
+                              themselves gave it, and then only on the very same wording.
+          REUSABLE_PROTECTED  a figure only the candidate sets but which does not change with the employer
+                              (salary, day rate). Their own answer first, then the facts file — that way
+                              round because the salary rule ends in a "Negotiable" fallback, which is a
+                              default and not something they ever said.
+        """
+        facts_only = is_facts_only(key)
+        if not facts_only and not is_reusable_protected(key):
+            return None
+        stopped = f"Needs your answer (protected question): {question}"
+
+        if not facts_only:
+            picked = self._remembered_protected(key, options, kind, min_trust=TRUST["typed"])
+            if picked is not None:
+                return picked
+            picked = self._rule_for_protected(key, question, options, kind)
+            if picked is not None:
+                return picked
+            raise NeedsHuman(stopped, question=question, options=options, kind=kind)
 
         # Work authorisation depends on where the job is, so an answer cached at one employer is wrong at
         # the next: "Yes, I am currently authorized to work; I will need sponsorship in future" was learned
@@ -483,64 +679,69 @@ class Resolver:
             if picked is not None:
                 return picked
             if (not options and kind in ("text", "textarea") and _AUTH_OPEN_QUESTION_RE.search(key)
-                    and not _YES_NO_SHAPE_RE.match(key)):
+                    and not (_YES_NO_SHAPE_RE.match(key) and not _ASKS_FOR_DETAIL_RE.search(key))):
                 stated = self._authorization_statement(key)
                 if stated:
                     log.info("answering %r from the authorization facts: %r", question, stated)
                     return stated
-
-        # (a)+(b) cache. A cached placeholder is ignored rather than replayed, so a bad answer from an earlier
-        # run self-heals into a real question instead of being pasted onto every future application.
-        cached = self._cache_lookup(key)
-        if cached is not None and _is_non_answer(cached):
-            cached = None
-        if cached is not None:
-            mapped = self._map_to_options(cached, options)
-            if mapped is not None:
-                return mapped
-            if not options:
-                return cached
+            # A plain Yes/No pair, which _authorization_answer declines because the rules already know the
+            # answer. It used to fall through to the cache from here, and that is how a "No" learned about
+            # Australia came to answer the same question about anywhere else. Ask the facts instead.
+            picked = self._rule_for_protected(key, question, options, kind)
+            if picked is not None:
+                return picked
 
         # EEO: answered only from the eeo block in facts.yaml, which the candidate filled in themselves.
         # Never guessed by the model, and never auto-declined — picking "I prefer not to answer" would still
         # be deciding for them. A value they have not given means the run stops and asks.
-        if self.is_eeo(question):
+        elif self.is_eeo(question):
+            stopped = f"Your answer needed: {question}"
             stated = self._eeo_answer(key)
             if stated:
                 mapped = self._map_eeo_to_options(key, stated, options) if options else stated
                 if mapped is not None:
-                    self.learn(question, mapped)
+                    self.learn(question, mapped, source="rule", kind=kind, options=options)
                     return mapped
                 log.info("EEO answer %r does not match any option for %r; asking", stated, question)
-            raise NeedsHuman(f"Your answer needed: {question}", question=question, options=options, kind=kind)
 
-        # (c) rules
+        else:
+            # Everything else the keywords catch: a contact detail, a date of birth, a clearance. These
+            # match incidentally more often than the two blocks above — "Verification code from the email"
+            # contains "email" — so what the candidate actually said about this exact question comes first,
+            # before a rule derived from a keyword answers a different question entirely.
+            picked = self._remembered_protected(key, options, kind, min_trust=TRUST["human"], exact_only=True)
+            if picked is None:
+                picked = self._rule_for_protected(key, question, options, kind)
+            if picked is not None:
+                return picked
+
+        # Their own answer to this very question, as a last resort before stopping. Exact wording only and
+        # nothing below a human answer: it is behind the facts rather than in front of them because a visa
+        # answer learned at one employer is a false statement at the next, but it is still ahead of giving
+        # up when the facts file simply has nothing to say.
+        picked = self._remembered_protected(key, options, kind, min_trust=TRUST["human"], exact_only=True)
+        if picked is not None:
+            return picked
+        raise NeedsHuman(stopped, question=question, options=options, kind=kind)
+
+    def _rule_for_protected(self, key: str, question: str, options: list[str], kind: str) -> str | None:
         rule = self._rule_answer(key, question)
-        if rule is not None:
-            # (d) map to options
-            mapped = self._map_to_options(rule, options)
-            if mapped is not None:
-                self.learn(question, mapped)
-                return mapped
-            if not options:
-                self.learn(question, rule)
-                return rule
-            # rule produced a value that isn't among the offered options
-            if self.is_protected(question):
-                raise NeedsHuman(f"Could not map answer {rule!r} to the options for: {question}",
-                                 question=question, options=options, kind=kind)
+        if rule is None:
+            return None
+        mapped = self._map_answer(key, rule, options) if options else rule
+        if mapped is None:
+            return None
+        self.learn(question, mapped, source="rule", kind=kind, options=options)
+        return mapped
 
-        # (e) LLM fallback. Work authorisation and EEO stay facts-only: those answers are legal declarations
-        # and a wrong one is a false statement on a real application, not a style slip.
-        if self.is_protected(question) or self.is_never_guess(question):
-            raise NeedsHuman(f"Needs your answer (protected question): {question}",
-                             question=question, options=options, kind=kind)
-        if self.llm_enabled:
-            llm = self._llm_answer(question, options)
-            if llm is not None:
-                self.learn(question, llm)
-                return llm
-        raise NeedsHuman(f"Needs your answer: {question}", question=question, options=options, kind=kind)
+    def _remembered_protected(self, key: str, options: list[str], kind: str, *, min_trust: int,
+                              exact_only: bool = False) -> str | None:
+        rec = self._cache_lookup(key, min_trust=min_trust, exact_only=exact_only)
+        if rec is None or _is_non_answer(rec.answer):
+            return None
+        if kind == "number" and as_number(rec.answer, key) is None:
+            return None
+        return self._map_answer(key, rec.answer, options) if options else rec.answer
 
     # ---------- work authorisation, from facts only ----------
     def _authorization_answer(self, key: str, options: list[str]) -> str | None:
@@ -587,7 +788,7 @@ class Resolver:
         best, best_score = scored[0][1], scored[0][0]
         if best_score <= 0 or (len(scored) > 1 and scored[1][0] == best_score):
             return None       # nothing on the list clearly states the truth: ask
-        self.learn(key, best)
+        self.learn(key, best, source="rule", options=options)
         return best
 
     def _authorization_statement(self, key: str) -> str | None:
@@ -731,8 +932,42 @@ class Resolver:
         return ""
 
     # ---------- option mapping ----------
+    def _alternatives_for(self, key: str) -> list[str]:
+        """Other wordings of an answer that facts.yaml has already said are acceptable.
+
+        Only the field of study has them, and only because a degree subject is the one fact whose exact
+        wording differs from board to board: the certificate says "Computer Science & Engineering" and a
+        board's list offers "Computer Science". Naming the substitutes in facts.yaml keeps the decision the
+        candidate's rather than a fuzzy match's.
+        """
+        if not _FIELD_OF_STUDY_KEY_RE.search(key or ""):
+            return []
+        alts = self.fact("education.field_of_study_alternatives", []) or []
+        return [str(a).strip() for a in alts if str(a).strip()]
+
+    def _map_answer(self, key: str, value: str, options: list[str]) -> str | None:
+        """`value` on this form's option list, falling back to the wordings facts.yaml allows instead.
+
+        Without this a truthful answer that the employer's list does not word the same way stopped the run:
+        "Could not map answer 'Computer Science & Engineering' to the options" paused an application whose
+        list offered "Computer Science" — which facts.yaml had already named as acceptable, and which the
+        suggestion-box path was already using.
+        """
+        mapped = self._map_to_options(value, options)
+        if mapped is not None:
+            return mapped
+        for alt in self._alternatives_for(key):
+            mapped = self._map_to_options(alt, options)
+            if mapped is not None:
+                log.info("%r is not on this form's list; taking %r, which facts.yaml allows instead",
+                         value, mapped)
+                return mapped
+        return None
+
     @staticmethod
     def _map_to_options(value: str, options: list[str]) -> str | None:
+        # The list's own prompt is not something an answer may map onto, however exactly it matches.
+        options = store.real_options(options)
         if not options:
             return None
         v = str(value).strip()
@@ -868,6 +1103,11 @@ class Resolver:
             return None if v is None else ("Yes" if bool(v) else "No")
 
         # --- location ---
+        # "Residency status" is not a place. The "reside" prefix below catches it, and answering it with a
+        # home address puts "Dhaka, Bangladesh" in a box asking whether the candidate may live and work in
+        # the country — a different question, and a false answer to it. "Country of residence" is untouched.
+        if _RESIDENCY_STATUS_RE.search(key):
+            return None
         if has("country"):
             return f("identity.country") or None
         if has("city", " location", "where are you based", "where do you live", "where are you located", "reside"):
@@ -882,6 +1122,25 @@ class Resolver:
             return self._years_for(key) or None
         if has("notice"):
             return f("work.notice_period") or None
+
+        # --- education ---
+        # Order matters here and is not alphabetical. "Field of Degree" and "Degree discipline" both carry
+        # the word "degree" while asking what was studied, so the subject rule has to be tested before the
+        # qualification rule or both land on "Bachelor's Degree". Likewise "graduate school" is a school.
+        #
+        # These come from facts.yaml alone (see answers.EDUCATION_KEYWORDS). The model used to answer them
+        # from the CV and the cache used to remember whatever a form's own list was resting on, which is
+        # how "Accounting" became the stored field of study on 2026-09-20 and was then offered to every
+        # employer after it, and how a Degree box came to hold "Computer Science & Engineering" — the
+        # subject, in the box asking for the qualification.
+        if has("field of study", "field of degree", "discipline", "major", "course of study",
+               "subject of study", "area of study", "specialisation", "specialization", "concentration"):
+            return f("education.field_of_study") or None
+        if has("school", "university", "college", "institution", "alma mater", "educational establishment"):
+            return f("education.school") or None
+        if has("degree", "qualification", "education level", "level of education", "highest education",
+               "highest level"):
+            return f("education.degree") or None
 
         # --- preferences ---
         if has("salary", "compensation", "pay expectation", "expected pay", "rate expectation"):
@@ -988,5 +1247,5 @@ class Resolver:
             # Writing "N/A" or "I don't know" onto a real application is worse than pausing.
             return None
         if options:
-            return self._map_to_options(reply, options)
+            return self._map_answer(normalize_question(question), reply, options)
         return reply

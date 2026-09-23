@@ -76,9 +76,83 @@
   </form>
 </section>
 
+{% macro answer_action(row, action, label) %}
+<form hx-post="/settings/answers/review" hx-target="#main" hx-swap="innerHTML" style="display:inline">
+  <input type="hidden" name="key" value="{{ row.key }}">
+  <input type="hidden" name="action" value="{{ action }}">
+  <button type="submit" class="btn">{{ label }}</button>
+</form>
+{% endmacro %}
+
+{% if answer_review %}
+<section class="panel">
+  <h2>Answers to review ({{ answer_review|length }})</h2>
+  <p class="muted">These came from the old answers file, so where each one was picked up from is unknown.
+    Keep the ones you stand behind; set aside anything you did not answer yourself.</p>
+  <table class="table">
+    <tr><th>Question</th><th>Answer</th><th>Status</th><th></th></tr>
+    {% for row in answer_review %}
+    <tr>
+      <td>{{ row.question }}</td>
+      <td>{{ row.answer }}</td>
+      <td>{% if row.confidence == 'quarantined' %}<span class="badge warn" title="{{ row.note }}">set aside</span>
+          {% else %}<span class="badge">in use</span>{% endif %}</td>
+      <td>{{ answer_action(row, 'keep', 'Keep') }}
+        {% if row.confidence != 'quarantined' %}{{ answer_action(row, 'quarantine', 'Set aside') }}{% endif %}
+        {{ answer_action(row, 'delete', 'Delete') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Remembered answers ({{ answer_rows|length }})</h2>
+  <p class="muted">What jobbot will reuse without asking you. <strong>you</strong> is an answer you gave;
+    <strong>facts</strong> comes from facts.yaml; <strong>form</strong> is a value you typed into the browser
+    window; <strong>model</strong> was written by the LLM and is the first thing facts.yaml overrules.</p>
+  <table class="table">
+    <tr><th>Question</th><th>Answer</th><th>From</th><th>Learned</th><th></th></tr>
+    {% for row in answer_rows %}
+    <tr>
+      <td>{{ row.question }}</td>
+      <td>{{ row.answer }}</td>
+      <td><span class="badge {{ 'ok' if row.source in ('human', 'facts') else 'warn' if row.source == 'llm' else '' }}">
+        {{ {'human': 'you', 'typed': 'form', 'llm': 'model', 'rule': 'facts', 'facts': 'facts'}.get(row.source, row.source) }}</span>
+        {% if row.confidence == 'confirmed' %}<span class="badge ok">confirmed</span>{% endif %}</td>
+      <td class="muted">{{ row.learned_at }}</td>
+      <td>{{ answer_action(row, 'quarantine', 'Set aside') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+
+{% if answer_quarantined %}
+<section class="panel">
+  <h2>Set aside ({{ answer_quarantined|length }})</h2>
+  <p class="muted">Kept so you can look at them, never put on a form. Most are dropdowns nobody chose and
+    declarations that must come from facts.yaml instead.</p>
+  <table class="table">
+    <tr><th>Question</th><th>Answer</th><th>Why</th><th></th></tr>
+    {% for row in answer_quarantined %}
+    <tr>
+      <td>{{ row.question }}</td>
+      <td>{{ row.answer }}</td>
+      <td class="muted">{{ row.note }}</td>
+      <td>{{ answer_action(row, 'restore', 'Restore') }}{{ answer_action(row, 'delete', 'Delete') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form hx-post="/settings/answers/purge" hx-target="#main" hx-swap="innerHTML">
+    <button type="submit" class="btn">Delete all set-aside answers</button>
+  </form>
+</section>
+{% endif %}
+
 <section class="panel">
   <h2>answers.json</h2>
-  <p class="muted">Remembered screening answers (normalised question → answer).</p>
+  <p class="muted">The same answers as plain text (normalised question → answer). Edit one here and it
+    becomes your own confirmed answer; the file itself also records where each one came from.</p>
   <form class="form" hx-post="/settings/answers" hx-target="#main" hx-swap="innerHTML">
     <textarea name="answers" rows="12" spellcheck="false">{{ answers_text }}</textarea>
     <button type="submit" class="btn">Save answers.json</button>

@@ -16,3 +16,5 @@ data/*.out
 .claude/settings.local.json
 facts.yaml
 answers.json
+# the pre-provenance copy written once when the store was upgraded; same contents, same secrecy
+answers.v1.backup.json

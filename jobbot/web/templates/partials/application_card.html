@@ -29,10 +29,16 @@
       </form>
     {% else %}
       <p class="muted">Finish the step in the browser window, then continue.</p>
-      <form hx-post="/application/{{ a['id'] }}/answer" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">
-        <input type="hidden" name="answer" value="">
-        <button type="submit" class="btn primary">Continue</button>
-      </form>
+      <div class="actions">
+        <form hx-post="/application/{{ a['id'] }}/answer" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">
+          <input type="hidden" name="answer" value="">
+          <button type="submit" class="btn primary">Continue</button>
+        </form>
+        {# The other honest answer to a pause: you finished it yourself in the window, or jobbot sent it and
+           could not read the confirmation. Without this the only way to say so was to leave the card
+           parked for ever. #}
+        <button class="btn" hx-post="/application/{{ a['id'] }}/mark-applied" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Mark applied</button>
+      </div>
     {% endif %}
 
   {% elif st == 'submitted' %}
@@ -44,8 +50,12 @@
   {% elif st == 'failed' %}
     <p class="reason">{{ a['reason'] or 'Failed.' }}</p>
     {% if screenshot_name %}<a href="/screenshots/{{ screenshot_name }}" target="_blank">screenshot</a>{% endif %}
-    <button class="btn" hx-post="/application/{{ a['id'] }}/retry" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Retry</button>
-    <p class="muted">The browser window stays open — fix anything in it first, then Retry. What you fill in is remembered.</p>
+    <div class="actions">
+      <button class="btn" hx-post="/application/{{ a['id'] }}/retry" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Retry</button>
+      <button class="btn" hx-post="/application/{{ a['id'] }}/mark-applied" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Mark applied</button>
+    </div>
+    <p class="muted">The browser window stays open — fix anything in it first, then Retry. What you fill in is
+      remembered. If you finished it yourself in the window, Mark applied instead.</p>
 
   {% elif st == 'manual' %}
     <p class="reason">{{ a['reason'] or 'No adapter for this ATS.' }}</p>

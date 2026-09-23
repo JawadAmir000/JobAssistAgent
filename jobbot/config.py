@@ -7,12 +7,13 @@ Contract (do not change signatures without updating all callers):
     get_secret(name) -> str | None            # keyring, falls back to env var of same name
     set_secret(name, value) -> None
     load_facts() -> dict                      # facts.yaml
-    load_answers() -> dict[str, str]          # answers.json  (normalised question -> answer)
-    save_answers(d) -> None
+    load_answers() -> dict[str, str]          # answers.json, flat view (normalised question -> answer)
+    save_answers(d) -> None                   # a flat map the candidate asserted; replaces the store
+    load_answer_records() -> dict[str, AnswerRecord]
+    save_answer_records(records) -> None      # merge onto disk, keeping provenance
 """
 from __future__ import annotations
 
-import json
 import re
 import os
 from pathlib import Path
@@ -215,14 +216,30 @@ def set_fact(key: str, value: str) -> bool:
     return False
 
 
+def load_answer_records() -> dict[str, "answers.AnswerRecord"]:
+    """The answer memory with its provenance. jobbot.answers owns the format; this is the way in."""
+    from jobbot import answers
+    return answers.load()
+
+
+def save_answer_records(records: dict[str, "answers.AnswerRecord"]) -> None:
+    """Merge records onto what is on disk. What a run learns must not drop what a parallel run learned."""
+    from jobbot import answers
+    answers.save_merged(records)
+
+
 def load_answers() -> dict[str, str]:
-    if not ANSWERS_PATH.exists():
-        return {}
-    return json.loads(ANSWERS_PATH.read_text() or "{}")
+    """The flat {question: answer} view, for callers that only want the text. Quarantined and rejected
+    records are not in it: they are remembered, but they are not answers."""
+    from jobbot import answers
+    return answers.text_view(answers.load())
 
 
 def save_answers(d: dict[str, str]) -> None:
-    ANSWERS_PATH.write_text(json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True))
+    """Replace the store from a flat map. Everything in `d` is taken as the candidate's own answer, which is
+    what it is: this is the Settings box and the test fixtures, not anything jobbot inferred."""
+    from jobbot import answers
+    answers.save(answers.from_mapping(d, default_source="human"))
 
 
 CV_TEXT_MAX = 12000

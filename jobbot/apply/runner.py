@@ -27,8 +27,9 @@ import queue
 import re
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
+from jobbot import answers as store
 from jobbot import config, db
 from jobbot.apply import common
 from jobbot.apply.base import AlreadyApplied, ApplyContext, ApplyError, NeedsHuman, get_adapter_for
@@ -40,6 +41,9 @@ _LIVE: dict[int, dict[str, Any]] = {}
 # Guards check-then-act sequences on _LIVE only (claiming a pause, evicting an entry, publishing a new one).
 # Never held across a Playwright call, a thread join or a DB write.
 _LOCK = threading.Lock()
+# Held only around importlib.reload, so two applications starting at once cannot interleave re-imports of
+# the same modules. Never taken with _LOCK: the reload does not touch _LIVE.
+_RELOAD_LOCK = threading.Lock()
 
 PARK_POLL_S = 5.0     # how often a parked owner re-checks that its _LIVE entry still exists
 EVICT_JOIN_S = 10.0   # how long _evict waits for a foreign owner thread to close its own browser
@@ -74,7 +78,8 @@ def _fact_values(facts: dict) -> set[str]:
     return out
 
 
-def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str], app_id: int = 0):
+def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str], app_id: int = 0,
+              window_touched: Callable[[], bool] = lambda: False):
     """Build the ctx.seen callback: report a filled control, and learn it when the user filled it.
 
     A control that was already filled counts as the last answer given, so the conditional follow-up after it
@@ -82,16 +87,42 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
 
     It is also the only record of an answer the user typed into the window by hand: jobbot was never asked
     the question, but the answer is sitting in the field. Cache it, so the next application does not stop to
-    ask something already answered once. Three things are deliberately not learned: anything jobbot itself
-    answered on this form (`answered_here` — its own LLM text would be replayed at the next employer),
-    anything the cache already covers, and any value that is simply a fact from facts.yaml (name, email,
-    phone), which needs no cache entry and only invites a fuzzy mis-hit later.
+    ask something already answered once.
+
+    What is deliberately not learned, because none of it is the candidate answering anything:
+      - a control still showing what the markup put in it (`default`/`placeholder`). This is the big one:
+        an untouched country list resting on its first option taught the cache that this candidate's
+        citizenship is Afghanistan, and a pre-ticked consent box taught it "Notification: Yes".
+      - a value that is a placeholder in its own right ("Attach", "Select one", "-").
+      - a field belonging to one row of a repeating section — an employer, a degree, a language. The answer
+        is about that row, not about the candidate, so replaying it fills the next form with the wrong job.
+      - a value that just echoes its own label.
+      - anything jobbot itself answered on this form (`answered_here` — its own LLM text would be replayed
+        at the next employer), anything the cache already covers, and any value that is simply a fact from
+        facts.yaml (name, email, phone), which needs no cache entry and only invites a fuzzy mis-hit later.
     """
-    def seen(value: str, label: str = "") -> None:
+    learned_facts: dict[str, str] = {}      # identity fact -> the label that already rewrote it here
+
+    def seen(value: str, label: str = "", *, kind: str = "", options: list | None = None,
+             default: bool = False, placeholder: bool = False) -> None:
         if not value:
             return
         resolver.previous_answer = str(value)
         if not label:
+            return
+        if default or placeholder:
+            log.debug("not learning %r: the form put %r there, not the user", label, str(value)[:40])
+            return
+        # A value that is nothing but punctuation ("-", "--", "n/a") normalises to the empty string, which
+        # is the clearest possible sign that nobody answered anything.
+        if not normalize_question(str(value)):
+            return
+        if normalize_question(str(value)) in store.PLACEHOLDER_VALUES:
+            return
+        if normalize_question(label) in store.ROW_FIELD_LABELS:
+            log.debug("not learning %r: it belongs to one row, not to the candidate", label)
+            return
+        if normalize_question(str(value)) == normalize_question(label):
             return
         if str(value).strip().lower() in fact_values:
             return
@@ -102,17 +133,83 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
         # facts.yaml and never looks at the cache, so a correction left in the cache would be replaced by
         # the rejected value on the very next form. Write it where it is read from instead.
         key = _identity_fact_key(label)
-        if key and config.set_fact(key, str(value).strip()):
-            log.info("app %s: %r corrected in the window -> facts.yaml %s = %r",
-                     app_id, label, key, str(value)[:80])
-            resolver.facts = config.load_facts()
-            fact_values.add(str(value).strip().lower())
-            return
+        if key:
+            if not window_touched():
+                # Nobody has been near this window yet. On the first pass of a freshly opened form every
+                # filled control was filled by the page — a tenant's own default, or an ATS profile echoing
+                # a previous application — and none of it is the candidate correcting anything. The window
+                # is only handed to the user when the run parks, so until it has parked once, "already
+                # filled" cannot mean "filled by hand".
+                #
+                # Every corruption of facts.yaml so far came through here on an untouched window: "🇧🇩 +880"
+                # into identity.location (122), "+880" into identity.phone (129) and into identity.country
+                # (131), and — with those three all guarded by value — "United Arab Emirates" into
+                # identity.country (136), read off the Oracle tenant's own default country. Guarding the
+                # shape of the value only ever catches the last kind of wrong value; this catches the
+                # reason they are all wrong. The answers cache is left alone: a bad entry there spoils one
+                # question, and this file is what every adapter fills from.
+                log.info("app %s: not writing %r to facts.yaml %s from %r: nobody has touched this window "
+                         "yet, so the form put it there", app_id, str(value)[:60], key, label)
+                return
+            why = _not_a_correction(key, label, str(value).strip(),
+                                    resolver.fact_str(key), learned_facts)
+            if why:
+                log.info("app %s: not writing %r to facts.yaml %s from %r: %s",
+                         app_id, str(value)[:60], key, label, why)
+                return
+            if config.set_fact(key, str(value).strip()):
+                log.info("app %s: %r corrected in the window -> facts.yaml %s = %r",
+                         app_id, label, key, str(value)[:80])
+                resolver.facts = config.load_facts()
+                fact_values.add(str(value).strip().lower())
+                learned_facts[key] = label
+                return
         if resolver.knows(label):
             return
-        log.info("app %s: learning %r from the form -> %r", app_id, label, str(value)[:60])
-        resolver.learn(label, str(value))
+        log.info("app %s: learning %r from the form -> %r (typed)", app_id, label, str(value)[:60])
+        resolver.learn(label, str(value), source="typed", kind=kind, options=list(options or []))
     return seen
+
+
+def _not_a_correction(key: str, label: str, value: str, held: str, learned: dict[str, str]) -> str:
+    """Why `value` in an identity field is the form's own doing rather than the candidate's — '' when it
+    may be theirs and is safe to write to facts.yaml.
+
+    Needed because this one learn-back is unlike every other: the answers cache is per-question and a bad
+    entry there spoils one question, but facts.yaml is the source every adapter fills from, so a wrong
+    value written here silently replaces a true fact for every application afterwards, and nothing
+    downstream has anything left to compare it against. Two went this way in one evening --
+
+      - application 122 read "🇧🇩 +880" out of a box labelled "Country dialing code" and stored it as
+        identity.location, because "Country" falls past the anchored country rule into the location one;
+      - application 129 read "+880" out of Oracle's phone widget -- the prefix the widget seeds itself,
+        with no number behind it -- and stored it as identity.phone, so every application after it filled
+        "+880" as the phone number until Cloudflare rejected it as too short (application 130);
+      - application 131 read "+880" out of a picker labelled plainly "Country" -- an intl-tel-input or
+        Oracle country-code control's accessible name is just that -- and stored it as identity.country.
+        That one closed a loop: select_dial_country searches a picker's rows for the country's *name*, so
+        with "+880" in the fact it could no longer drive the very kind of control it had learned from, and
+        application 135 sent the whole number to a box beside a picker stuck on +971.
+
+    So a value has to look like the fact it is replacing before it is allowed to replace it.
+    """
+    if store.is_about_the_field(label):
+        return "the label asks about the shape of the field, not for the detail itself"
+    if key == "identity.phone" and common.dial_code_only(value):
+        return "a dial code is not a phone number"
+    if key in ("identity.country", "identity.location") and common.is_dial_code(value):
+        # Keyed on the value, because the label gives nothing away: the control that corrupted
+        # identity.country was labelled "Country" and nothing else, which is_about_the_field passes and
+        # should pass. `is_dial_code` rather than `dial_code_only` because a postcode is four digits too,
+        # and "Dhaka 1207" is a location a candidate might really have typed.
+        return "a dial code is not a country or a location"
+    if key in learned and learned[key] != label:
+        # Two labels writing one fact in a single pass is a control split in two ("Address Line 1" and
+        # "Address Line 2" both land on identity.location), not the candidate changing their mind twice.
+        return f"{key} was already taken from {learned[key]!r} on this form"
+    if held and len(value) < len(held) and held.lower().startswith(value.lower()):
+        return f"it is the start of the {key} already held ({held[:40]!r}) — a widget trimming our own value"
+    return ""
 
 
 def _identity_fact_key(label: str) -> str:
@@ -292,6 +389,21 @@ def _page_change_handler(live: dict, page_ref: dict):
     return switch
 
 
+def _ensure_page_tracking(app_id: int, live: dict) -> None:
+    """Add page-change tracking to contexts created before this code was hot-reloaded."""
+    ctx = live.get("ctx")
+    if ctx is None or not hasattr(ctx, "page"):
+        return
+    page_ref = live.get("page_ref")
+    if page_ref is None:
+        page_ref = {"page": live.get("page")}
+        live["page_ref"] = page_ref
+        screenshot = _screenshot_fn(app_id, page_ref)
+        live["screenshot"] = screenshot
+        ctx.screenshot = screenshot
+    ctx.on_page_change = _page_change_handler(live, page_ref)
+
+
 def _shot_field(shot: str) -> dict:
     """Only overwrite the stored screenshot when a new one was really captured — a failed capture must not
     wipe the earlier 'needs you' shot, which is usually the one worth looking at."""
@@ -330,7 +442,9 @@ def _finish_needs_human(app_id: int, e: NeedsHuman, screenshot) -> None:
         live["parked"] = True
     db.update_application(
         app_id, status="needs_you", reason=_note_issue(app_id, live, str(e.reason))[:500],
-        pending_question=e.question or "", pending_options=json.dumps(e.options or []),
+        # real_options, not e.options: offering the list's own "Select One" back to the candidate is how
+        # it came to be stored as the answer to "Phone Device Type" (see answers.real_options).
+        pending_question=e.question or "", pending_options=json.dumps(store.real_options(e.options)),
         step="Waiting for you", **_shot_field(screenshot("needs-you")),
     )
 
@@ -362,11 +476,53 @@ def _finish_submitted(app_id: int, screenshot, reason: str = "") -> None:
     _close(app_id, save_state=True)
 
 
+# A vendor adapter that never got as far as a form. The page is still on screen and nothing has been
+# submitted, so the generic walker — which finds fields by their visible label rather than by this vendor's
+# ids — is worth one try before the application is given up on. Greenhouse, Lever and Ashby each rewrote
+# their markup at some point and each produced exactly this: a dead adapter on a form a human (and the
+# generic walker) could see perfectly well.
+_FORM_NOT_FOUND_RE = re.compile(
+    r"\bform\b[^.]{0,40}\bnot found\b|\bno\b[^.]{0,40}\bform\b[^.]{0,40}\b(?:appeared|found)\b"
+    r"|\bno form fields\b|\bpage did not load\b|\bsubmit button not found\b"
+    r"|\bnot currently automated\b", re.I)
+
+
+def _generic_fallback(ctx: Any, err: Exception):
+    """The generic walker to retry `err` with, or None when a retry would be wrong.
+
+    Never after a generic walk (ctx.extra carries the flag it sets, through a LinkedIn hand-off as well),
+    never on a dead page, and only for a failure that says the adapter never reached the form — anything
+    later than that may have submitted something, and a second walker must not risk sending it twice.
+    """
+    if ctx is None or ctx.extra.get("generic_walked") or not _FORM_NOT_FOUND_RE.search(str(err)):
+        return None
+    if not common.page_alive(getattr(ctx, "page", None)):
+        return None
+    from jobbot.apply.base import get_adapter_for as _get       # re-imported: adapters hot-reload
+    return _get("generic")
+
+
 def _drive(app_id: int, live: dict) -> None:
     """Run adapter.apply on the live context and translate the outcome into application status."""
     adapter, ctx, screenshot = live["adapter"], live["ctx"], live["screenshot"]
     try:
-        adapter.apply(ctx)
+        try:
+            adapter.apply(ctx)
+        except ApplyError as e:
+            fallback = _generic_fallback(ctx, e)
+            if fallback is None:
+                raise
+            log.info("app %s: %s — trying the generic walker on the same page", app_id, e)
+            ctx.step("Trying the generic form walker")
+            try:
+                fallback.apply(ctx)
+            except AlreadyApplied:
+                raise       # the walker got far enough to read the employer's own notice; that is the news
+            except ApplyError as second:
+                # Report what the adapter that knows this board said; the walker's own "no form here" is
+                # the more generic of the two and usually the less informative.
+                log.info("app %s: the generic walker also stopped: %s", app_id, second)
+                raise e from second
     except NeedsHuman as e:
         log.info("app %s needs human: %s", app_id, e.reason)
         _finish_needs_human(app_id, e, screenshot)
@@ -395,9 +551,23 @@ def _refresh_adapter(app_id: int, live: dict) -> None:
     account signed into, the CV uploaded, the answers given. Restarting the server to load a fix destroys
     exactly that, so the fix is loaded in place instead and the retry continues on the same page.
 
+    facts.yaml is re-read for the same reason. The window is kept open precisely so the user can fix what
+    the form rejected before pressing Retry, and the fix for a rejected name, phone or URL belongs in
+    facts.yaml — but the resolver read that file once, when the application started, so without this the
+    retry replays the very value the form just refused. (Application 130 was rejected on a phone number
+    that facts.yaml had been made to hold; correcting the file and pressing Retry changed nothing.)
+
     Never raises: running the retry with the code already in memory is worse than running it with the fix,
     but it is far better than losing the window.
     """
+    _ensure_page_tracking(app_id, live)
+    try:
+        resolver = live.get("resolver")
+        if resolver is not None:
+            resolver.facts = config.load_facts()
+    except Exception as e:  # noqa: BLE001
+        log.warning("app %s: could not re-read facts.yaml (%s); retrying with the facts already loaded",
+                    app_id, e)
     try:
         from jobbot.apply.base import get_adapter_for, reload_adapters
         names = reload_adapters()
@@ -436,6 +606,9 @@ def _serve(app_id: int, live: dict) -> None:
                 log.error("app %s: unknown command %r", app_id, cmd)
                 continue
             _, question, answer = cmd
+            # The user has now had this window in front of them: whatever they typed into it is
+            # theirs, and from here on a filled control may be learned back into facts.yaml.
+            live["human_touched"] = True
             if question and answer:
                 # Learned here rather than in the dispatcher so the resolver's dict is only ever touched by
                 # the thread that reads it.
@@ -445,6 +618,9 @@ def _serve(app_id: int, live: dict) -> None:
                 # can last hours). The answer is cached, so a fresh run simply replays it.
                 log.info("app %s: parked browser is gone, starting fresh", app_id)
                 _close(app_id)          # on the owner thread, so this really does close it
+                # No window left to protect, so the fix the user made while we waited is loaded here just
+                # as _refresh_adapter would have loaded it onto a window that survived.
+                _reload_before_a_fresh_start(app_id)
                 _run_application(app_id)  # new Playwright on THIS thread; it runs its own _serve
                 return
             try:
@@ -463,6 +639,28 @@ def _serve(app_id: int, live: dict) -> None:
             return
 
 
+def _reload_before_a_fresh_start(app_id: int) -> None:
+    """Re-import the adapter modules before building a new browser for this application.
+
+    `_refresh_adapter` does this for a retry that keeps its parked window. Everything else — a brand-new
+    application, and a retry whose window died while it waited — came through here and ran whatever the
+    server imported when it started, which may be hours or days old. That is not a theoretical gap: a fix
+    for "could not find an application form" (application 118, Deloitte NZ on SmartRecruiters) was verified
+    against the live page, and Retry reproduced the identical blocker because the parked browser had gone,
+    this path was taken, and the server was still executing the generic.py it had imported that morning.
+
+    Safe here in a way it would not be mid-run: this is the moment before the application has a browser, a
+    context or an adapter of its own. Never raises — starting with stale code beats not starting.
+    """
+    with _RELOAD_LOCK:
+        try:
+            from jobbot.apply.base import reload_adapters
+            log.info("app %s: reloaded %d adapter modules", app_id, len(reload_adapters()))
+        except Exception as e:  # noqa: BLE001
+            log.warning("app %s: could not reload adapters (%s); starting with the code already loaded",
+                        app_id, e)
+
+
 def run_application(app_id: int) -> None:
     """Blocking for the whole life of the application, pauses included. Never raises.
 
@@ -470,6 +668,7 @@ def run_application(app_id: int) -> None:
     must be a thread that can sit idle: the web app gives each one its own.
     """
     try:
+        _reload_before_a_fresh_start(app_id)
         _run_application(app_id)
     except Exception as e:  # last-resort guard
         log.exception("run_application(%s) escaped: %s", app_id, e)
@@ -503,9 +702,19 @@ def _run_application(app_id: int) -> None:
         return
 
     facts = config.load_facts()
-    answers = config.load_answers()
-    resolver = Resolver(facts, answers, job, llm_enabled=_llm_enabled(),
-                        cv_text=config.load_cv_text(cv_path))
+    # Records carry where each remembered answer came from, which is what decides whether it is allowed to
+    # settle a given question; the flat map is the same answers as plain text, for the fuzzy scans.
+    records = config.load_answer_records()
+    answers = store.text_view(records)
+    # Re-imported rather than used from the module-level binding, for the same reason get_adapter_for is
+    # (see _drive): reload_adapters() rebuilds jobbot.apply.resolver, but runner is deliberately NOT
+    # reloadable, so the name bound here at import time still points at the class object from before the
+    # reload. Every edit to the resolver was therefore loaded and then ignored — application 146 paused to
+    # ask "What is highest level of education you have completed?" with the rule that answers it already
+    # written, saved and reloaded.
+    from jobbot.apply.resolver import Resolver as _Resolver
+    resolver = _Resolver(facts, answers, job, llm_enabled=_llm_enabled(),
+                         cv_text=config.load_cv_text(cv_path), records=records)
     db.update_application(app_id, status="running", step="Launching browser", reason="",
                           pending_question="", pending_options="")
 
@@ -540,7 +749,12 @@ def _run_application(app_id: int) -> None:
     try:
         browser = _launch_browser(pw, headless)
         live["browser"] = browser
-        kwargs: dict = {"viewport": {"width": 1280, "height": 900}}
+        # An empty grant denies every permission outright, so the site is never asked and Chrome never
+        # draws the bubble. That bubble is browser chrome, not page content: nothing on the page can
+        # dismiss it, Playwright cannot click it, it covers the top-left of the viewport and it swallows
+        # real clicks aimed at whatever is under it. Oracle Recruiting asks for location on the apply
+        # page (seen on Westpac's careers site), and a job application has no use for the answer.
+        kwargs: dict = {"viewport": {"width": 1280, "height": 900}, "permissions": []}
         if session_path.exists():
             kwargs["storage_state"] = str(session_path)
         context = browser.new_context(**kwargs)
@@ -548,6 +762,7 @@ def _run_application(app_id: int) -> None:
         page = context.new_page()
         page.set_default_timeout(8000)
         page_ref["page"] = page
+        live["page_ref"] = page_ref
         live["page"] = page
 
         def step(text: str) -> None:
@@ -561,7 +776,11 @@ def _run_application(app_id: int) -> None:
             answered_here.add(normalize_question(question))
             return resolver.answer(question, options, kind)
 
-        seen = make_seen(resolver, answered_here, fact_values, app_id)
+        # facts.yaml is only written from a window the user has actually had in front of them —
+        # see make_seen. `live` is the dict that survives a park, so this reads the flag live
+        # rather than capturing its value at startup, when it is always False.
+        seen = make_seen(resolver, answered_here, fact_values, app_id,
+                         window_touched=lambda: bool(live.get("human_touched")))
 
         ctx = ApplyContext(job=job, page=page, facts=facts, cv_path=cv_path, step=step, answer=answer,
                            screenshot=screenshot, seen=seen,
@@ -633,7 +852,9 @@ def _resume_application(app_id: int, answer: str) -> None:
     else:
         log.info("app %s: no live browser, starting fresh", app_id)
     if question and answer:
-        Resolver({}, config.load_answers(), {}, False).learn(question, answer)
+        from jobbot.apply.resolver import Resolver as _Resolver   # re-imported: the resolver hot-reloads
+        _Resolver({}, {}, {}, False).learn(question, answer, source="human")
     db.update_application(app_id, status="running", reason="", pending_question="", pending_options="",
                           step="Resuming")
+    _reload_before_a_fresh_start(app_id)
     _run_application(app_id)

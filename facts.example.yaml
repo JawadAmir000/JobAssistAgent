@@ -15,6 +15,18 @@ identity:
   github: https://github.com/your-handle
   portfolio: https://example.com
 
+education:
+  # A School / Degree / Field of study box is answered from here and nowhere else. Leave a value out and
+  # the run stops to ask you rather than letting the model guess one.
+  school: Your University
+  degree: Bachelor's Degree
+  field_of_study: Your Field
+  # Boards validate these against their own list, and yours may not be on it. List the near-misses you are
+  # happy to be entered as, best first; an exact match is always preferred over any of them.
+  field_of_study_alternatives: []
+  start_year: 2000
+  end_year: 2004
+
 work:
   current_title: Your Title
   current_company: Your Company

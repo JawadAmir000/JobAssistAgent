@@ -18,10 +18,14 @@ HOURS_CHOICES = [("24", "Last 24 hours"), ("72", "Last 3 days"), ("168", "Last w
 # Secrets the Settings form will store. The account password is the one jobbot uses for every employer
 # account it creates (Workday and anything else that puts a signup in front of the form); it is generated on
 # first use, so the field is here to override it or to read one in from another machine, not to be filled in.
-SECRET_NAMES = ["ANTHROPIC_API_KEY", "JOBBOT_MAIL_PASSWORD", credentials.SECRET_NAME]
+SECRET_NAMES = ["ANTHROPIC_API_KEY", "JOBBOT_MAIL_PASSWORD", credentials.SECRET_NAME,
+                credentials.SHORT_SECRET_NAME]
 SECRET_NOTES = {
     credentials.SECRET_NAME: "Generated automatically the first time jobbot signs you up to an employer, "
                              "and reused everywhere so those accounts stay reachable. Paste one to override.",
+    credentials.SHORT_SECRET_NAME: "The same thing again, short enough for the signup forms that cap the "
+                                   "length (SAP SuccessFactors stops at 18 characters). Only used where the "
+                                   "form says so, and only created the first time one does.",
 }
 
 
@@ -84,14 +88,20 @@ def hours_label(hours_old: str | int | None) -> str:
 
 
 def parse_options(raw: str | None) -> list[str]:
-    """pending_options is a JSON list; tolerate garbage."""
+    """pending_options is a JSON list; tolerate garbage, and never offer the list's own prompt.
+
+    The runner already filters these before storing them. This filters again on the way out, because rows
+    written before it did are still in the database — and picking "Select One" off one of those is what
+    taught the cache to answer "Phone Device Type" with the prompt (see answers.real_options).
+    """
     if not raw:
         return []
     try:
         val = json.loads(raw)
     except (ValueError, TypeError):
         return []
-    return [str(v) for v in val] if isinstance(val, list) else []
+    from jobbot.answers import real_options
+    return real_options(val) if isinstance(val, list) else []
 
 
 def settings_snapshot() -> dict[str, Any]:
@@ -148,6 +158,8 @@ def provider_infos() -> list[dict[str, Any]]:
 def secret_status(name: str) -> tuple[str, str | None]:
     """('set'|'not set', note) without ever revealing the value."""
     note = SECRET_NOTES.get(name)
+    if name == credentials.SHORT_SECRET_NAME and credentials.stored_short_password():
+        return "set", note
     if name == credentials.SECRET_NAME and credentials.stored_password():
         # Not necessarily under this name: it may still be the old JOBBOT_WORKDAY_PASSWORD, or the file used
         # where there is no keychain. Reporting "not set" for a password jobbot is actively using would send
@@ -164,6 +176,43 @@ def secret_status(name: str) -> tuple[str, str | None]:
     if os.environ.get(name):
         return "set (env)", keyring_note or note
     return "not set", keyring_note or note
+
+
+# ---------- the answer memory ----------
+# The order the review list is shown in. "legacy" first because those are the ones the candidate has never
+# seen: they came out of the old flat file with no idea where they had been picked up from.
+_SOURCE_ORDER = {"legacy": 0, "scraped": 1, "typed": 2, "llm": 3, "rule": 4, "facts": 5, "human": 6}
+ANSWER_PREVIEW = 300
+
+
+def answer_rows(quarantined: bool = False, needs_review: bool = False) -> list[dict]:
+    """Rows for the Settings review tables: one per remembered answer, least-vouched-for first.
+
+    `needs_review` narrows it to the entries whose origin is unknown — everything the old flat file carried
+    — so the candidate has a finite list to work through rather than the whole store.
+    """
+    from jobbot import answers as store
+    rows = []
+    for key, rec in store.load().items():
+        if quarantined != (rec.confidence == "quarantined"):
+            continue
+        if rec.confidence == "rejected" and not quarantined:
+            continue
+        if needs_review and rec.source != "legacy":
+            continue
+        answer = rec.answer if len(rec.answer) <= ANSWER_PREVIEW else rec.answer[:ANSWER_PREVIEW] + "…"
+        rows.append({"key": key, "question": rec.question or key, "answer": answer,
+                     "truncated": len(rec.answer) > ANSWER_PREVIEW, "source": rec.source,
+                     "confidence": rec.confidence, "scope": rec.scope, "company": rec.company,
+                     "note": rec.note, "learned_at": short_when(rec.learned_at),
+                     "used_count": rec.used_count})
+    rows.sort(key=lambda r: (_SOURCE_ORDER.get(r["source"], 9), r["question"]))
+    return rows
+
+
+def short_when(iso: str) -> str:
+    """A stored timestamp as a plain date, '' when there is none."""
+    return (iso or "")[:10]
 
 
 def read_text(path) -> str:

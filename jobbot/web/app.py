@@ -265,7 +265,12 @@ def _settings_ctx(msg: str | None = None, err: str | None = None) -> dict:
         "secrets": {n: h.secret_status(n) for n in h.SECRET_NAMES},
         "mail_state": h.mail_status(),
         "facts_text": h.read_text(config.FACTS_PATH),
-        "answers_text": h.read_text(config.ANSWERS_PATH) or "{}",
+        # The box stays the flat {question: answer} shape it has always been, even though the file now
+        # stores provenance beside each one: it is for reading and fixing answers, not for editing records.
+        "answers_text": json.dumps(config.load_answers(), indent=2, ensure_ascii=False, sort_keys=True),
+        "answer_review": h.answer_rows(needs_review=True),
+        "answer_rows": h.answer_rows(),
+        "answer_quarantined": h.answer_rows(quarantined=True),
         "hours_choices": h.HOURS_CHOICES,
         "msg": msg, "err": err,
     }
@@ -353,8 +358,52 @@ def settings_answers(request: Request, answers: str = Form("{}")):
         ctx = _settings_ctx(err=f"answers.json not saved: {e}")
         ctx["answers_text"] = answers
         return _page(request, "settings", "tabs/settings.html", ctx)
-    config.save_answers({str(k): str(v) for k, v in parsed.items()})
+    from jobbot import answers as store
+    # What they changed or added is their own answer; what they left alone keeps the provenance it had.
+    # Quarantined records are not in the box, so being absent from it never deletes one.
+    store.save(store.apply_text_edit(store.load(), {str(k): str(v) for k, v in parsed.items()}))
     return _page(request, "settings", "tabs/settings.html", _settings_ctx(msg="answers.json saved."))
+
+
+@app.post("/settings/answers/review", response_class=HTMLResponse)
+def settings_answer_review(request: Request, key: str = Form(""), action: str = Form("")):
+    """Keep, quarantine, restore or delete one remembered answer.
+
+    The key is a form field rather than part of the path: these are whole questions, spaces and all.
+    """
+    from jobbot import answers as store
+    records = store.load()
+    rec = records.get(key)
+    if rec is None:
+        return _page(request, "settings", "tabs/settings.html",
+                     _settings_ctx(err="That answer is no longer in the list."))
+    if action == "delete":
+        del records[key]
+        msg = "Answer deleted."
+    elif action == "quarantine":
+        rec.confidence, rec.note = "quarantined", "you set this aside"
+        msg = "Answer set aside; it will not be used again."
+    elif action in ("keep", "restore"):
+        # Confirming it makes it theirs: that is what lifts it above a rule or anything the model wrote.
+        rec.source, rec.confidence = "human", "confirmed"
+        rec.confirmed_at, rec.note = store.now(), ""
+        msg = "Answer confirmed."
+    else:
+        return _page(request, "settings", "tabs/settings.html", _settings_ctx(err=f"Unknown action {action!r}."))
+    store.save(records)
+    return _page(request, "settings", "tabs/settings.html", _settings_ctx(msg=msg))
+
+
+@app.post("/settings/answers/purge", response_class=HTMLResponse)
+def settings_answers_purge(request: Request):
+    from jobbot import answers as store
+    records = store.load()
+    gone = [k for k, r in records.items() if r.confidence == "quarantined"]
+    for k in gone:
+        del records[k]
+    store.save(records)
+    return _page(request, "settings", "tabs/settings.html",
+                 _settings_ctx(msg=f"{len(gone)} set-aside answer(s) deleted."))
 
 
 # ---------- companies tab ----------

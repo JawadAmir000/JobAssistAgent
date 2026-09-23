@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 from jobbot import credentials, mail
 from jobbot.apply import common as c
+from jobbot.apply import navigator
 from jobbot.apply.base import Adapter, ApplyContext, ApplyError, NeedsHuman, register
 
 log = logging.getLogger(__name__)
@@ -65,6 +66,11 @@ PROMPT_INPUT = "[data-automation-id='multiselectInputContainer'] input"
 # Tried in order, not together: Workday's options match both, and one comma-joined selector offered every
 # option to the resolver twice ("Job Board, Job Board, Recruiting Event, Recruiting Event, ...").
 PROMPT_OPTIONS = ("[data-automation-id='promptOption']:visible", "[role=option]:visible")
+# What a search-as-you-type prompt shows before anything has been typed into it. It is drawn with the same
+# markup as a real option, so it was read as one and offered to the resolver as the only thing on the menu
+# (application 121, "Type to Add Skills" -> "it offered: No Items.").
+PROMPT_EMPTY_RE = re.compile(r"^(?:no items\.?|no results?(?: found)?\.?|no matches?(?: found)?\.?|"
+                             r"start typing|type to search|loading\.{0,3})$", re.I)
 SELECTED_ITEM = "[data-automation-id='selectedItem']"
 PROMPT_LEVELS = 3         # how deep the option tree is walked before giving up on it
 # Workday's other dropdown: a plain <button aria-haspopup="listbox"> reading "Select One", with the question
@@ -446,19 +452,36 @@ class WorkdayAdapter(Adapter):
                 if self._submit_if_review(ctx):
                     return
                 if not self._click_first(page, NEXT):
-                    raise NeedsHuman(
-                        f"jobbot filled the '{heading or 'current'}' step but found no Next button. Continue "
-                        "in the browser window, then click Continue here.")
+                    # A tenant that renames its own buttons. The automation ids above are Workday's, but a
+                    # tenant may ship its own footer, so let the model name the control from the ones on
+                    # the page before handing a filled step back to the user (see navigator.py).
+                    if not navigator.press_next(ctx, "move this Workday application to its next step"):
+                        raise NeedsHuman(
+                            f"jobbot filled the '{heading or 'current'}' step but found no Next button. "
+                            "Continue in the browser window, then click Continue here.")
 
             if not self._wait_for_move(page, before):
-                # Next did not move: Workday rendered a validation error in place. Say which field it was —
-                # the message used to guess ("probably asking for something"), and the answer was sitting in
-                # the page the whole time, in the red text under the control that was left empty.
+                # Next did not move: Workday rendered a validation error in place. Before handing it back,
+                # fill the step once more — the error names a field that was left empty, and a second pass
+                # is how the generic walker recovers the same situation. Only once: a step that refuses
+                # twice is refusing something jobbot cannot supply, and looping on it helps nobody.
                 errors = c.form_errors(page)
-                detail = (" It is asking for: " + "; ".join(errors[:3])[:240]) if errors else ""
-                raise NeedsHuman(
-                    f"Workday would not move past '{heading or 'this step'}'.{detail} Fill it in the browser "
-                    "window, then click Continue — what you type there is remembered for next time.")
+                if errors:
+                    log.warning("workday: '%s' was refused (%s); filling it again", heading, errors[:3])
+                    ctx.step(f"Workday: {heading or 'step'} bounced — filling it again")
+                    self._fill_step(ctx)
+                    before = self._state(page)
+                    self._click_first(page, NEXT)
+                if not self._wait_for_move(page, before):
+                    # Say which field it was — the message used to guess ("probably asking for something"),
+                    # and the answer was sitting in the page the whole time, in the red text under the
+                    # control that was left empty.
+                    errors = c.form_errors(page) or errors
+                    detail = (" It is asking for: " + "; ".join(errors[:3])[:240]) if errors else ""
+                    raise NeedsHuman(
+                        f"Workday would not move past '{heading or 'this step'}'.{detail} Fill it in the "
+                        "browser window, then click Continue — what you type there is remembered for next "
+                        "time.")
             seen_headings.append(heading)
 
         raise ApplyError(f"Workday application did not finish in {MAX_STEPS} steps ({seen_headings}).")
@@ -513,6 +536,8 @@ class WorkdayAdapter(Adapter):
         # Prompts first, identity second. The country dial code lives in a prompt, and the phone number
         # beside it is only right once that code is on screen: filling the number first wrote the full
         # +8801XXXXXXXXX into a box whose form was already saying +880, and Workday rejected it.
+        # The split itself now lives in common.dial_code_for_phone, which _identity calls; it skips prompts,
+        # so it reads the code this step has already set rather than fighting _prompts for the control.
         self._prompts(ctx)
         walker._identity(ctx)
         c.fill_account_password(page)       # a tenant that asks for the password again mid-flow
@@ -693,6 +718,10 @@ class WorkdayAdapter(Adapter):
         page = ctx.page
         answered = answered or self._prompt_answered
         options = self._open_prompt(page, box)
+        if not options:
+            # Nothing on the menu: this is the other kind of prompt, one that only lists what you have
+            # typed a query for. See _search_prompt.
+            options = self._search_prompt(ctx, page, box, label)
         seen: list[str] = []
         for _ in range(PROMPT_LEVELS):
             if not options:
@@ -715,6 +744,49 @@ class WorkdayAdapter(Adapter):
             + (f" (it offered: {', '.join(seen[:8])})" if seen else " (the list did not open)")
             + ". Choose one in the browser window, then click Continue — it is remembered for next time.",
             question=label, options=seen[:25], kind="select")
+
+    def _search_prompt(self, ctx: ApplyContext, page, box, label: str) -> list:
+        """Options for a prompt that lists nothing until a query is typed into it.
+
+        The docstring on _fill_prompt says Workday's lists are not searchable, and for the tree-shaped ones
+        ("How Did You Hear About Us?") that is true. Some are the opposite and say so in their own label:
+        "Type to Add Skills" shows "No Items." until you type, so the walk opened it, read that placeholder
+        as the only option on the menu, and stopped to ask the user (application 121, Southern Cross Health
+        Insurance -- "it offered: No Items."). PROMPT_EMPTY_RE now keeps the placeholder out of the options;
+        this puts something real in.
+
+        The query is the answer itself -- the resolver knows the candidate's skills from facts.yaml -- and
+        then its first word, because "Amazon Bedrock AgentCore" matches nothing in a list that holds
+        "Amazon Web Services" while "Amazon" matches plenty.
+        """
+        try:
+            query = c.clean(ctx.answer(label, None, "text"))
+        except NeedsHuman:
+            raise                       # the resolver wants the user; that is a real pause, not a miss
+        except Exception as e:          # noqa: BLE001
+            log.debug("workday: no query for %r: %s", label, e)
+            return []
+        if not query:
+            return []
+        tried: list[str] = []
+        for term in (query, query.split()[0] if query.split() else ""):
+            if not term or term in tried:
+                continue
+            tried.append(term)
+            try:
+                box.click(timeout=c.SHORT)
+                box.fill("", timeout=c.SHORT)
+                box.press_sequentially(term, delay=40, timeout=c.MEDIUM)
+            except Exception as e:      # noqa: BLE001
+                log.debug("workday: typing %r into %r: %s", term, label, e)
+                continue
+            page.wait_for_timeout(PROMPT_WAIT)
+            options = self._prompt_options(page)
+            log.info("workday: %r lists nothing until typed; %r offered %d option(s)",
+                     label, term, len(options))
+            if options:
+                return options
+        return []
 
     def _open_prompt(self, page, box) -> list:
         """Open the popup and return its options, giving the list a second chance to appear.
@@ -777,7 +849,7 @@ class WorkdayAdapter(Adapter):
                     if el.evaluate("e => !!e.closest(\"[data-automation-id='selectedItemList']\")"):
                         continue
                     text = c.clean(el.inner_text())
-                    if text:
+                    if text and not PROMPT_EMPTY_RE.match(text):
                         out.append((text, el))
                 except Exception as e:  # noqa: BLE001
                     log.debug("workday: reading option %d: %s", i, e)

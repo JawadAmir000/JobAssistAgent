@@ -110,7 +110,8 @@ class AshbyAdapter(Adapter):
         self._fill_label(page, r"^first name$", f("identity.first_name"))
         self._fill_label(page, r"^last name$", f("identity.last_name"))
         self._fill_label(page, r"^e-?mail( address)?$", f("identity.email"))
-        self._fill_label(page, r"^phone( number)?$", f("identity.phone"))
+        self._fill_label(page, r"^phone( number)?$", f("identity.phone"), phone=True,
+                         country=f("identity.country"))
         self._fill_label(page, r"linkedin", f("identity.linkedin"))
         self._fill_label(page, r"github", f("identity.github"))
         self._fill_label(page, r"portfolio|website|personal site", f("identity.portfolio"))
@@ -307,12 +308,19 @@ class AshbyAdapter(Adapter):
             return False
 
     @staticmethod
-    def _fill_label(page, pattern: str, value: str) -> None:
+    def _fill_label(page, pattern: str, value: str, *, phone: bool = False, country: str = "") -> None:
         if not value:
             return
         try:
             el = page.get_by_label(re.compile(pattern, re.I))
             if c.visible(el, c.SHORT):
-                c.fill_verified(el.first, value)
+                # A phone box may be resting on its widget's country prefix, which reads back as filled
+                # and would make fill_verified leave the number untyped — see common.fill_phone. Passing
+                # the page with it also splits the number against a country-code control held separately,
+                # which Ashby does not draw today and the next board to reach here might.
+                if phone:
+                    c.fill_phone(el.first, value, page=page, country=country)
+                else:
+                    c.fill_verified(el.first, value)
         except Exception:
             pass

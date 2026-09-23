@@ -138,7 +138,8 @@ class GreenhouseAdapter(Adapter):
         c.fill_verified(page.locator("#first_name").first, ctx.fact("identity.first_name"))
         c.fill_verified(page.locator("#last_name").first, ctx.fact("identity.last_name"))
         c.fill_verified(page.locator("#email").first, ctx.fact("identity.email"))
-        c.fill_verified(page.locator("#phone").first, ctx.fact("identity.phone"))
+        c.fill_phone(page.locator("#phone").first, ctx.fact("identity.phone"),
+                     page=page, country=ctx.fact("identity.country"))
 
     def _links_and_location(self, ctx: ApplyContext) -> None:
         page = ctx.page

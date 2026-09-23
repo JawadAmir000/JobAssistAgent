@@ -64,7 +64,8 @@ class LeverAdapter(Adapter):
         c.fill_verified(page.locator("input[name='name']").first,
                         f("identity.full_name") or f"{f('identity.first_name')} {f('identity.last_name')}".strip())
         c.fill_verified(page.locator("input[name='email']").first, f("identity.email"))
-        c.fill_verified(page.locator("input[name='phone']").first, f("identity.phone"))
+        c.fill_phone(page.locator("input[name='phone']").first, f("identity.phone"),
+                     page=page, country=f("identity.country"))
         c.fill_verified(page.locator("input[name='org']").first, f("work.current_company"))
         c.fill_verified(page.locator("input[name='urls[LinkedIn]']").first, f("identity.linkedin"))
         c.fill_verified(page.locator("input[name='urls[GitHub]']").first, f("identity.github"))
