@@ -457,3 +457,41 @@ called again only when the page no longer matches the cache.
 jobbot already has the deterministic half (walker + cookies + hot reload) and the trust model that none of
 those tools have. What it lacks is the observe → diagnose → adapt loop and the site memory that makes the
 loop pay for itself.
+
+## 8. What landed on 2026-09-23 (step 2, and the memory half of step 5)
+
+**New modules** (all hot-reloadable; the first edit after a server restart picks them up in `base._RELOADABLE`):
+
+- `apply/observe.py` — `snapshot(page)`: headings, visible text, fillable-field count, the pressable controls
+  (navigator's marked menu), and the page's own signals (confirmation, already applied, captcha, bot block,
+  emailed code, emailed sign-in link, account gate, blocked submit). `signature(snap)` keys a step as
+  host + id-free URL path + heading, so the third visit to a board lands on the same key as the first.
+- `apply/planner.py` — `unstick(ctx, goal, fill)`, called wherever the walker used to give up (no form found,
+  neither Submit nor Next, Next pressed and nothing moved). Classifies cheapest first — page signals, then
+  memory, then the model — into one of ten kinds, runs the handler for that kind (the same code the walker's
+  own rules use), and checks on the page whether it worked. Terminal kinds (`closed`, `not_application`)
+  raise an error tagged `verdict`, which the runner now reports over a vendor adapter's guess.
+- `apply/playbook.py` — the memory, two tables in `jobbot.db`. `playbook_steps`: on this site's step, this
+  kind, and the control that moved it on — replayed next time with no model call, distrusted once it fails
+  more than it works. `playbook_lessons`: "a page that reads like this is kind X", for the kinds whose
+  handling does not depend on a site's own buttons (emailed link, code, account, captcha, confirmation,
+  already applied, closed, not an application) — recognised on any site that words it the same way. Written
+  only from outcomes (the page moved on / the application went in), never from what the model said.
+
+**Verified** on real applications: JOIN (app 169) submitted through an emailed sign-in link and a calendar
+start-date step; Harper (170) correctly diagnosed as a listing with no form, Future Secure AI (171) as a
+404. The learn-then-recall loop was run with the real model against two synthetic sites on a scratch copy
+of the database: the first "check your inbox" page (worded so no rule matches) took one model call and was
+learned; the second, on another host and worded differently, was recognised from memory with none.
+
+**Found and fixed on the way** (Deloitte NZ on SmartRecruiters, app 172, whose form is Lit web components):
+labels and option texts delivered through `<slot>`s or drawn in shadow roots now read (`_LABEL_JS`,
+`field_errors`' `labelFor`, `option_text`); a label that is only a required star is no longer a label; a
+tick box is named by the sentence beside it; the CV is not uploaded again when the page already lists it;
+pronouns are their own facts-only fact (`eeo.pronouns`), never derived from gender; a refusal message is
+reported as its own line plus the next, not everything above it; and a retry's Resolver instance is moved
+onto the reloaded class (`resolver._adopt_live_resolvers`), so resolver fixes now really land on Retry.
+
+**Still open:** a UI view of what the playbook has learned; `plan_fields` (the model mapping an unknown
+widget to a fact); diff-based learn-back (step 3); and model-only terminal verdicts are deliberately not
+remembered, because a wrong "closed" lesson would silently refuse good postings.

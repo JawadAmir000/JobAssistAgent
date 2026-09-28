@@ -190,7 +190,9 @@ _NEGATIVE_RE = re.compile(r"^\s*(?:no|n|false|none|never|i\s+(?:do\s*n[o']?t|am\
 _ONE_TIME_RE = re.compile(
     r"\b(?:verification|security|confirmation|one\s*time|otp|access|2fa|two\s*factor)\s*(?:code|pin)\b"
     r"|\bcode\s+from\s+(?:the\s+)?(?:email|e\s*mail|sms|text|inbox)\b"
-    r"|\bone\s*time\s*(?:password|passcode)\b")
+    r"|\bone\s*time\s*(?:password|passcode)\b"
+    # A magic sign-in link is the same thing in another shape: it signs in once and then it is spent.
+    r"|\b(?:sign\s*in|log\s*in|login|magic)\s*link\b")
 
 
 def is_one_time_secret(question: str) -> bool:
@@ -927,7 +929,12 @@ class Resolver:
             return str(eeo.get("disability_status") or "").strip()
         if has("race", "ethnic", "hispanic", "latino"):
             return str(eeo.get("race_ethnicity") or "").strip()
-        if has("gender", "sex ", "pronoun ", "pronouns "):
+        # Pronouns are their own fact, never read off gender: "Male" is not an option on a pronoun list
+        # (application 172, Deloitte NZ: "Could not choose 'Male' for 'What are your pronouns?'"), and
+        # which pronouns someone uses is theirs to say. Blank means the run asks once.
+        if has("pronoun ", "pronouns "):
+            return str(eeo.get("pronouns") or "").strip()
+        if has("gender", "sex "):
             return str(eeo.get("gender") or "").strip()
         return ""
 
@@ -1246,6 +1253,39 @@ class Resolver:
             # No usable answer: fall through to NeedsHuman so the user supplies it once and it is cached.
             # Writing "N/A" or "I don't know" onto a real application is worse than pausing.
             return None
+        if not options and re.fullmatch(r"(?:select resume\s+)?[^\n/\\]{1,150}\.(?:pdf|docx?|rtf|txt|odt)", reply, re.I):
+            # A file name is never an answer typed into a question. It is what the model produces when the
+            # "question" was an upload widget's own text (application 175: "Drop or select (.doc / .pdf)").
+            log.info("LLM answered %r with a file name; not using it", question[:60])
+            return None
         if options:
             return self._map_answer(normalize_question(question), reply, options)
         return reply
+
+
+def _adopt_live_resolvers() -> int:
+    """Move every Resolver built from an older copy of this module onto the class just loaded.
+
+    A reload replaces the module's functions, but a paused application keeps the Resolver instance it was
+    started with, and that instance's methods are still the old ones. runner._refresh_adapter re-reads
+    facts.yaml into it and reloads this module, yet the retry went on answering with the old rules
+    (application 172: the pronoun rule was fixed, reloaded, and "Male" was still chosen for "What are your
+    pronouns?"). Rebinding the class is the whole fix: the instance's state stays, its behaviour is new.
+    """
+    import gc
+
+    moved = 0
+    for obj in gc.get_objects():
+        cls = type(obj)
+        if cls is not Resolver and cls.__name__ == "Resolver" and cls.__module__ == __name__:
+            try:
+                obj.__class__ = Resolver
+                moved += 1
+            except TypeError:       # a layout the new class cannot take; leave it on the old code
+                continue
+    if moved:
+        log.info("resolver: %d running application(s) now answer with the reloaded rules", moved)
+    return moved
+
+
+_adopt_live_resolvers()

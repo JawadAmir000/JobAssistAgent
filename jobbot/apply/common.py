@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import logging
 import random
 import os
@@ -10,6 +11,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from jobbot.apply.base import AlreadyApplied, ApplyContext, ApplyError, NeedsHuman
 
@@ -52,6 +54,9 @@ CONFIRM_TEXTS = (
     "thanks for your application", "you have applied", "you've applied", "application sent",
     "application complete", "we got your application", "we've got your application", "your application is in",
     "you're all set", "you are all set", "application was sent", "has been sent to",
+    # an adverb in the middle: Rippling's "You have successfully applied to Forward Deployed Engineer"
+    # matched none of the above, so its confirmation page was taken for a bounced form (application 175)
+    "successfully applied", "applied successfully", "application was successful", "application is complete",
 )
 FORM_GONE_GRACE_S = 4.0     # a form that vanished after Submit must stay gone this long to count as sent
 CONFIRM_URL_HINTS = ("confirmation", "thanks", "thank-you", "thankyou", "submitted", "success", "applied")
@@ -968,18 +973,19 @@ def submit_blocked_message(page: Any) -> str:
     and submitted, when the page already said "You have reached the maximum number of applications".
     """
     try:
-        text = clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))
+        raw = page.evaluate("() => (document.body && document.body.innerText) || ''") or ""
     except Exception:
         return ""
-    if not text:
-        return ""
-    m = _SUBMIT_BLOCKED_RE.search(text)
-    if not m:
-        return ""
-    # Report the sentence it appeared in, plus the next one, which usually carries the detail.
-    start = max(0, text.rfind(".", 0, m.start()) + 1)
-    chunk = text[start:m.end() + 220].strip()
-    return re.split(r"(?<=\.)\s(?=[A-Z])", chunk)[0][:300] if chunk else ""
+    # Line by line, because a refusal is a heading with its explanation on the next line. Cut at the last
+    # full stop instead, a page whose text had none before the refusal returned everything above it: Ashby's
+    # "We couldn't submit your application" (application 168, Doppel) came back as the job's title, location
+    # and pay band, with the reason — "flagged as possible spam" — cut off the end.
+    lines = [clean(ln) for ln in raw.splitlines() if clean(ln)]
+    for i, line in enumerate(lines):
+        if _SUBMIT_BLOCKED_RE.search(line):
+            nxt = lines[i + 1] if i + 1 < len(lines) and len(line) < 120 else ""
+            return f"{line} {nxt}".strip()[:300]
+    return ""
 
 
 # Announcements that share the markup of an error without being one. Boards put upload confirmations and
@@ -1006,9 +1012,13 @@ def form_errors(page: Any) -> list[str]:
                 const out = [];
 
                 // (1) messages the page rendered itself
+                // A single-page app announces each new page's title in a [role=alert] live region (Next.js's
+                // route announcer, application 175's "Apply - Forward Deployed Engineer"). That is navigation,
+                // not a complaint, and read as one it turned a confirmed submit into a "repair" and a pause.
+                const announcer = el => !!deepClosest(el, 'next-route-announcer, [id*=announcer i], [class*=announcer i], [data-testid*=announcer i]') || clean(el.innerText || el.textContent) === clean(document.title);
                 const sel = "[aria-invalid=true], .field-error, .error, [class*='error' i], [role=alert]";
                 for (const el of deepAll(sel)) {
-                    if (!vis(el)) continue;
+                    if (!vis(el) || announcer(el)) continue;
                     const t = clean(el.innerText || el.textContent);
                     if (t && t.length < 160) out.push(t);
                 }
@@ -1069,18 +1079,33 @@ _FIELD_ERRORS_JS = """
         if (!e.hasAttribute('data-jobbot-err')) e.setAttribute('data-jobbot-err', String(n++));
         return e.getAttribute('data-jobbot-err');
     };
+    const real = t => /[\\p{L}\\p{N}]/u.test(t || '');
+    // Text as it reads on screen, <slot> content included. A web-component form (SmartRecruiters' spl-*
+    // fields, application 172) passes its question into the label through a slot, so the label's own text
+    // is the required star alone and the question itself is only reachable through the slot.
+    const slotText = n => {
+        if (!n) return '';
+        if (n.nodeType === 3) return n.textContent;
+        if (n.nodeType !== 1 || ['STYLE', 'SCRIPT', 'TEMPLATE'].includes(n.tagName)) return '';
+        if (n.tagName === 'SLOT') {
+            const a = n.assignedNodes({flatten: true});
+            return (a.length ? a : [...n.childNodes]).map(slotText).join(' ');
+        }
+        return [...(n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)].map(slotText).join(' ');
+    };
+    const tx = n => { const a = clean(n.innerText || n.textContent); return real(a) ? a : clean(slotText(n)); };
     const labelFor = e => {
-        if (e.labels && e.labels.length) { const t = clean(e.labels[0].innerText); if (t) return t; }
+        if (e.labels && e.labels.length) { const t = tx(e.labels[0]); if (real(t)) return t; }
         const by = e.getAttribute('aria-labelledby');
         if (by) { const root = e.getRootNode();
             for (const id of by.split(/\\s+/)) {
                 const nd = root.getElementById ? root.getElementById(id) : document.getElementById(id);
-                if (nd) { const t = clean(nd.innerText); if (t) return t; } } }
-        const al = e.getAttribute('aria-label'); if (al) return clean(al);
+                if (nd) { const t = tx(nd); if (real(t)) return t; } } }
+        const al = e.getAttribute('aria-label'); if (real(al)) return clean(al);
         let p = e.parentElement, hops = 0;
         while (p && hops++ < 5) {
             const lab = p.querySelector('label, legend, [class*="label" i]');
-            if (lab) { const t = clean(lab.innerText); if (t) return t.slice(0, 120); }
+            if (lab) { const t = tx(lab); if (real(t)) return t.slice(0, 120); }
             p = p.parentElement;
         }
         return clean(e.getAttribute('placeholder') || e.getAttribute('name') || e.getAttribute('id'));
@@ -1157,8 +1182,10 @@ _FIELD_ERRORS_JS = """
     const ERR_SEL = "[aria-invalid=true], [role=alert], [aria-live=assertive], [aria-live=polite],"
                   + " [class*='err' i], [class*='invalid' i], [class*='validation' i], .help-block,"
                   + " [class*='warning' i], [id*='error' i], [id*='err' i]";
+    // A page title read out by a route announcer is navigation, not a complaint (see form_errors).
+    const announcer = el => !!deepClosest(el, 'next-route-announcer, [id*=announcer i], [class*=announcer i], [data-testid*=announcer i]') || clean(el.innerText || el.textContent) === clean(document.title);
     for (const el of deepAll(ERR_SEL)) {
-        if (!vis(el)) continue;
+        if (!vis(el) || announcer(el)) continue;
         if (fillable(el)) continue;          // an input flagged invalid is picked up on its own below
         const txt = el.innerText || el.textContent;
         add(ownersOf(el, txt), txt);
@@ -1363,8 +1390,14 @@ def repair_fields(ctx: ApplyContext, fields: list[dict]) -> list[str]:
         except Exception as e:  # noqa: BLE001
             log.debug("repair: %s not reachable: %s", sel, e)
             continue
+        if not re.search(r"\w", f.get("label") or "") or is_prompt_value(f["label"]) or is_furniture_label(f["label"]):
+            # field_errors names a control the quick way, which takes a list's own "Select" for its name;
+            # the full reader finds the question written above it (application 175).
+            f["label"] = get_label_for(el) or f["label"]
         log.info("repairing %r (%s, holds %r): %s",
                  f["label"][:60], f["kind"], f["value"][:40], f["message"][:90])
+        if not re.search(r"\w", f.get("label") or ""):
+            _log_unnamed_field(el)
         try:
             if _repair_one(ctx, el, f):
                 changed.append(f"{f['label'][:60] or 'a field'} — {f['message'][:80]}")
@@ -1375,6 +1408,17 @@ def repair_fields(ctx: ApplyContext, fields: list[dict]) -> list[str]:
         except Exception as e:  # noqa: BLE001
             log.debug("repair of %r failed: %s", f["label"][:50], e)
     return changed
+
+
+def _log_unnamed_field(el: Any) -> None:
+    """A rejected control nothing names. Logged with its surroundings (shape only, values stripped), because
+    the page is usually one that refuses a second browser, and this line is the only way to see it."""
+    try:
+        shape = el.evaluate("""e => { let n = e; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;
+            return n.outerHTML.replace(/ (class|style)="[^"]*"/g, '').replace(/ value="[^"]*"/g, ' value=…').slice(0, 2500); }""")
+        log.warning("repair: unnamed rejected control; its surroundings were %s", re.sub(r"\s+", " ", shape))
+    except Exception as e:  # noqa: BLE001
+        log.debug("repair: could not describe an unnamed control: %s", e)
 
 
 def rejection_summary(fields: list[dict], errors: list[str]) -> str:
@@ -1481,18 +1525,86 @@ def get_label_for(el: Any) -> str:
 
 _LABEL_JS = """e => {
     const clean = s => (s || '').replace(/\\s+/g, ' ').trim();
+    // A required star on its own is not a label. SmartRecruiters (Deloitte NZ, application 172) gives its
+    // privacy-consent box a <label> holding only "*" and puts the sentence in a sibling; stopping on the
+    // star turned a consent tick into an "Empty question" pause.
+    const real = t => /[\\p{L}\\p{N}]/u.test(t || '');
+    // Text as it reads on screen, <slot> content included. A web-component form (SmartRecruiters' spl-*
+    // fields, application 172) passes its question into the label through a slot, so the label's own text
+    // is the required star alone and the question itself is only reachable through the slot.
+    const slotText = n => {
+        if (!n) return '';
+        if (n.nodeType === 3) return n.textContent;
+        if (n.nodeType !== 1 || ['STYLE', 'SCRIPT', 'TEMPLATE'].includes(n.tagName)) return '';
+        if (n.tagName === 'SLOT') {
+            const a = n.assignedNodes({flatten: true});
+            return (a.length ? a : [...n.childNodes]).map(slotText).join(' ');
+        }
+        return [...(n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)].map(slotText).join(' ');
+    };
+    const tx = n => { const a = clean(n.innerText || n.textContent); return real(a) ? a : clean(slotText(n)); };
+    // What a control shows while empty ("Select", "Search", "Choose…") names nothing.
+    const prompt = t => /^\\s*(?:-+\\s*)?(?:please\\s+)?(?:select|search|choose|pick|type to search|start typing)\\b[\\s\\w]{0,20}?(?:\\.{3}|…)?\\s*(?:-+)?\\s*$/i.test(t || '')
+                        && !/\\?/.test(t || '');
+    const CTRL = 'input:not([type=hidden]), textarea, select, button, [role=combobox], [role=radiogroup], '
+               + '[role=radio], [role=checkbox], [role=listbox], [role=switch], [contenteditable=true]';
+    const before = start => {
+        const own = n => { let x = n; while (x.parentElement && !x.parentElement.contains(start)) x = x.parentElement; return x; };
+        const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+        w.currentNode = start;
+        for (let n = w.previousNode(), seen = 0; n && seen < 400; n = w.previousNode(), seen++) {
+            if (n.nodeType === 1) {
+                // A field between here and the text above it: that text is the other field's question.
+                if (!n.contains(start) && n.matches(CTRL) && vis(n)) return '';
+                continue;
+            }
+            const host = n.parentElement;
+            if (!host || start.contains(host) || !real(n.textContent)) continue;
+            if (host.closest('script, style, noscript, [aria-hidden=true]')) continue;
+            const branch = own(host);
+            if (branch.matches(CTRL) || branch.querySelector(CTRL)) return '';   // the previous field's own text
+            const blk = host.closest('p, label, legend, h1, h2, h3, h4, h5, h6, li, dt, div, span') || host;
+            if (!vis(blk)) continue;
+            const t = tx(blk);
+            if (!real(t) || prompt(t)) continue;
+            if (t.length > 600) return '';          // a page of instructions, not a question
+            return t;
+        }
+        return '';
+    };
     const vis = n => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     // An empty label names nothing, so each of the searches below passes over one and keeps looking.
-    for (const l of (e.labels || [])) { const t = clean(l.innerText || l.textContent); if (t) return t; }
+    for (const l of (e.labels || [])) { const t = tx(l); if (real(t)) return t; }
     const al = e.getAttribute('aria-labelledby');
     const root = e.getRootNode();
     const byId = id => (root.getElementById ? root.getElementById(id) : document.getElementById(id));
-    if (al) { const t = al.split(/\\s+/).map(id => { const n = byId(id); return n ? (n.innerText || n.textContent) : ''; }).join(' '); if (clean(t)) return clean(t); }
-    const aria = e.getAttribute('aria-label'); if (aria) return clean(aria);
-    const id = e.id; if (id) { for (const l of root.querySelectorAll(`label[for="${CSS.escape(id)}"]`)) { const t = clean(l.innerText || l.textContent); if (t) return t; } }
-    const wrap = e.closest('label'); if (wrap) { const t = clean(wrap.innerText || wrap.textContent); if (t) return t; }
-    const fs = e.closest('fieldset'); if (fs) { const lg = fs.querySelector('legend'); if (lg) { const t = clean(lg.innerText || lg.textContent); if (t) return t; } }
-    const ph = e.getAttribute('placeholder'); if (ph) return clean(ph);
+    if (al) { const t = al.split(/\\s+/).map(id => { const n = byId(id); return n ? (n.innerText || n.textContent) : ''; }).join(' '); if (real(clean(t))) return clean(t); }
+    const aria = e.getAttribute('aria-label'); if (real(aria) && !prompt(aria)) return clean(aria);
+    const id = e.id; if (id) { for (const l of root.querySelectorAll(`label[for="${CSS.escape(id)}"]`)) { const t = tx(l); if (real(t)) return t; } }
+    const wrap = e.closest('label'); if (wrap) { const t = tx(wrap); if (real(t)) return t; }
+    const fs = e.closest('fieldset'); if (fs) { const lg = fs.querySelector('legend'); if (lg) { const t = tx(lg); if (real(t)) return t; } }
+    // The question written before the control. Many boards put it in a plain <p> above the field and tie it to
+    // nothing: Rippling's "Are you legally eligible to work…" sits over a combobox whose only name is its own
+    // "Select" prompt, and its essay question over a textarea with no name at all, so the ancestor scan
+    // below climbed to the cover-letter drop zone and the model answered "Drop or select (.doc/.pdf)" with a
+    // file name (application 175). Read as a person reads a form: the nearest text after the previous field
+    // and before this one. Text inside another field's own wrapper is that field's, never this one's, which
+    // keeps a floating label (drawn after its input) from naming the field that follows it.
+    if (!(e.type === 'checkbox' || e.type === 'radio')) { const q = before(e); if (q) return q; }
+    const ph = e.getAttribute('placeholder'); if (real(ph) && !prompt(ph)) return clean(ph);
+    // A tick box is named by the sentence beside it, on either side. Looked for inside the wrappers that
+    // hold this control alone, before the ancestor scan below can climb to a neighbouring field's label.
+    if (e.type === 'checkbox' || e.type === 'radio') {
+        let w = e.parentElement;
+        for (let i = 0; i < 4 && w; i++, w = w.parentElement) {
+            if (w.querySelectorAll('input:not([type=hidden]), textarea, select, [role=combobox]').length > 1) break;
+            for (const k of w.children) {
+                if (k === e || k.contains(e) || k.querySelector('input, textarea, select, button')) continue;
+                const t = tx(k);
+                if (real(t) && t.length <= 400 && vis(k)) return t;
+            }
+        }
+    }
     let p = e.parentElement; for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
         // Every candidate at this level, not just the first: an empty one is furniture, and stopping on it
         // hid the real label three levels up. The nearest one ABOVE the control wins, so a wrapper holding
@@ -1500,8 +1612,8 @@ _LABEL_JS = """e => {
         let above = '', below = '';
         for (const l of p.querySelectorAll('label, legend, .label, [class*="label" i], h3, h4, h5')) {
             if (l.contains(e)) continue;
-            const t = clean(l.innerText || l.textContent);
-            if (!t) continue;
+            const t = tx(l);
+            if (!real(t)) continue;
             if (l.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING) above = t;
             else if (!below) below = t;
         }
@@ -1516,8 +1628,8 @@ _LABEL_JS = """e => {
         for (let j = mine - 1; j >= 0; j--) {
             const k = kids[j];
             if (k.querySelector('input, textarea, select, button')) continue;
-            const t = clean(k.innerText || k.textContent);
-            if (t && t.length <= 200 && vis(k)) return t;
+            const t = tx(k);
+            if (real(t) && t.length <= 200 && vis(k)) return t;
         }
     }
     return clean(e.name || '');
@@ -1528,6 +1640,24 @@ def same_value(a: str, b: str) -> str:
     """True when two field values are the same answer — case, spacing and a trailing slash aside."""
     norm = lambda s: clean(s).rstrip("/").lower()   # noqa: E731
     return norm(a) == norm(b)
+
+
+# What a widget prints on itself: an upload zone's "Drop or select (.doc / .docx / .pdf)", a search box's
+# "Search", a résumé picker's "Select resume Forward-Deployed-AI-Engineer.pdf". Taken for questions, each was
+# answered and cached — the model duly put a file name into an essay box (application 175, Nutrient).
+FURNITURE_LABEL_RE = re.compile(
+    r"^\s*(?:drop|drag|choose|select|browse|upload|attach)\b.{0,60}\b(?:files?|here|resume|résumé|cv|pdf|docx?)\b"
+    r"|^\s*(?:search|select|choose)\s*(?:\.{3}|…)?\s*$", re.I)
+FILENAME_RE = re.compile(r"^[^\n/\\]{1,150}\.(?:pdf|docx?|rtf|txt|odt|pages)$", re.I)
+
+
+def is_furniture_label(label: str) -> bool:
+    """True for words a control prints on itself rather than a question it asks."""
+    return bool(FURNITURE_LABEL_RE.search(clean(label)))
+
+
+def looks_like_filename(value: str) -> bool:
+    return bool(FILENAME_RE.match(clean(value)))
 
 
 def strip_required(label: str) -> str:
@@ -1607,6 +1737,13 @@ _DRAWN_BY_LABEL_JS = """e => {
         const b = l.getBoundingClientRect(), s = getComputedStyle(l);
         if (b.width > 3 && b.height > 3 && s.visibility !== 'hidden' && s.display !== 'none'
                 && s.opacity !== '0') { lbl = l; break; }
+    }
+    if (!lbl) {
+        // No <label>: the control may be drawn by an ARIA widget wrapped round it instead. Rippling draws
+        // each radio as <div role="radio"> over a zero-sized native input, so every Yes/No on its form was
+        // skipped as invisible (application 175).
+        const w = e.parentElement && e.parentElement.closest('[role=radio], [role=checkbox], [role=switch]');
+        if (w) { const b = w.getBoundingClientRect(); if (b.width > 3 && b.height > 3) lbl = w; }
     }
     if (!lbl) return '';
     return (lbl.innerText || lbl.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
@@ -1700,6 +1837,16 @@ def tick(el: Any) -> bool:
         log.debug("tick: label click refused (%s)", str(e)[:100])
     if is_checked_now(el):
         return True
+    try:
+        # An ARIA widget drawn round a hidden input (Rippling's <div role="radio">) is what takes the click;
+        # a scripted click on the input underneath does not reach the framework's own state.
+        widget = el.locator("xpath=ancestor::*[@role='radio' or @role='checkbox' or @role='switch'][1]")
+        if widget.count() and is_visible_now(widget.first):
+            widget.first.click(timeout=MEDIUM)
+            if is_checked_now(el) or (widget.first.get_attribute("aria-checked") or "") == "true":
+                return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("tick: widget click refused (%s)", str(e)[:100])
     try:
         # Last resort, and the only one that reaches a label rendered outside the input's ancestry:
         # activating the <label> in script toggles the control it names exactly as a click would.
@@ -1799,6 +1946,55 @@ _COMBO_JS = r"""
 """
 
 
+_OPTION_TEXT_JS = """e => {
+    const clean = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const flat = n => {
+        if (!n) return '';
+        if (n.nodeType === 3) return n.textContent;
+        if (n.nodeType !== 1 || ['STYLE', 'SCRIPT', 'TEMPLATE'].includes(n.tagName)) return '';
+        if (n.tagName === 'SLOT') {
+            const a = n.assignedNodes({flatten: true});
+            return (a.length ? a : [...n.childNodes]).map(flat).join(' ');
+        }
+        return [...(n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)].map(flat).join(' ');
+    };
+    // The same words drawn twice (once in the shadow tree, once through a slot, as SmartRecruiters' options
+    // are) read back as "A A". One copy is what the option says.
+    const once = t => { const n = t.length, m = (n - 1) / 2;
+        return (n % 2 === 1 && t[m] === ' ' && t.slice(0, m) === t.slice(m + 1)) ? t.slice(0, m) : t; };
+    let t = clean(e.innerText) || clean(flat(e));
+    for (let h = e.getRootNode().host; !t && h; h = h.getRootNode().host) t = clean(h.innerText) || clean(flat(h));
+    return once(t || clean(e.getAttribute('aria-label') || e.getAttribute('label') || e.getAttribute('value') || ''));
+}"""
+
+
+def option_text(item: Any) -> str:
+    """What a list option reads as on screen. Not inner_text() alone: SmartRecruiters draws each option as a
+    web component whose words arrive through a <slot>, so every option read as '' and no answer could ever
+    be matched to one (application 172, "Could not choose '$110,001 - $120,000 / year'", seen five times)."""
+    try:
+        return clean(item.evaluate(_OPTION_TEXT_JS))
+    except Exception:  # noqa: BLE001
+        try:
+            return clean(item.inner_text())
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def file_listed(page: Any, path: Any) -> bool:
+    """True when the page already shows a file of this name as uploaded."""
+    name = pathlib.Path(str(path or "")).name
+    if not name:
+        return False
+    try:
+        # Shadow roots included: a web-component board draws its list of uploads inside one.
+        return bool(page.evaluate("n => {" + DEEP_JS + """
+            return _deepRoots.some(r => ((r === document ? (document.body && document.body.innerText)
+                                                          : r.textContent) || '').includes(n)); }""", name))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
     """Open a react-select / aria combobox and read its option texts, then close it.
 
@@ -1815,7 +2011,7 @@ def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
         listbox = page.locator("[role=listbox]:visible, [role=option]:visible")
         items = page.locator("[role=option]:visible")
         for i in range(min(items.count(), limit)):
-            t = clean(items.nth(i).inner_text())
+            t = option_text(items.nth(i))
             if t:
                 opts.append(t)
         page.keyboard.press("Escape")
@@ -1844,7 +2040,7 @@ def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
         page.keyboard.type(answer, delay=20)
         page.wait_for_timeout(600)
         items = page.locator("[role=option]:visible")
-        texts = [clean(items.nth(i).inner_text()) for i in range(min(items.count(), 60))]
+        texts = [option_text(items.nth(i)) for i in range(min(items.count(), 60))]
         want = clean(answer).lower()
         pick = next((i for i, t in enumerate(texts) if t.lower() == want or same_option(t, answer)), None)
         if pick is None and len(texts) == 1 and want and want in texts[0].lower():
@@ -1863,20 +2059,60 @@ def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
         page.wait_for_timeout(300)
         items = page.locator("[role=option]:visible")
         for i in range(min(items.count(), 60)):
-            text = clean(items.nth(i).inner_text())
+            text = option_text(items.nth(i))
             if text.lower() == want or same_option(text, answer):
                 items.nth(i).click(timeout=SHORT)
                 page.wait_for_timeout(300)
                 break
         else:
             page.keyboard.press("Escape")
-        return bool(combobox_value(combo))
+        if combobox_value(combo):
+            return True
+        _log_combo_miss(combo, answer, texts)
+        return False
     except Exception as e:
         log.debug("choose_combobox failed: %s", e)
         return False
 
 
+def _log_combo_miss(combo: Any, answer: str, typed_options: list[str]) -> None:
+    """Say what a list offered when the answer could not be chosen from it. A widget that draws its options
+    somewhere the locators above cannot see shows up here as an empty list; one whose wording differs
+    shows up with the options it really has."""
+    try:
+        shape = combo.evaluate("""e => { const h = e.getRootNode().host; const n = h || e.parentElement || e;
+            return (n.outerHTML || '').replace(/ (class|style)="[^"]*"/g, '').slice(0, 1200); }""")
+    except Exception:  # noqa: BLE001
+        shape = ""
+    log.warning("combobox: could not choose %r; options seen after typing: %s; control: %s",
+                answer[:80], typed_options[:12], re.sub(r"\s+", " ", shape or "")[:1200])
+
+
+# The words a list control shows while nothing is chosen. Rippling's eligibility question drew "Select" in a
+# <p>, which read back as the answer, so the question was reported as answered and never asked (application
+# 175); its Apply button stayed disabled over it.
+PROMPT_VALUE_RE = re.compile(
+    r"^\s*(?:-+\s*)?(?:please\s+)?(?:select|choose|pick|search)"
+    r"(?:\s+(?:one|an?\s+option|an?\s+answer|an?\s+item|here))?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$", re.I)
+
+
+def is_prompt_value(text: str) -> bool:
+    return bool(PROMPT_VALUE_RE.match(clean(text)))
+
+
 def combobox_value(combo: Any) -> str:
+    """What a combobox holds, '' while it only shows its prompt. See _combobox_shown for the reading."""
+    shown = _combobox_shown(combo)
+    if not shown or is_prompt_value(shown):
+        return ""
+    try:
+        own = [clean(combo.get_attribute(a) or "") for a in ("aria-label", "placeholder")]
+    except Exception:  # noqa: BLE001
+        own = []
+    return "" if clean(shown) in [o for o in own if o] else shown
+
+
+def _combobox_shown(combo: Any) -> str:
     """Current value shown by a combobox (the vendor's value node, or the input text).
 
     react-select renders the chosen value as a sibling of the input's own wrapper:
@@ -1946,6 +2182,9 @@ def combobox_is_placeholder(combo: Any) -> bool:
     Unlike <select>, combobox_value() has no index to check: it reads whatever the widget renders, and a
     react-select drawing "Select..." or a locale list drawing its default looks exactly like an answer.
     """
+    shown = _combobox_shown(combo)
+    if shown and not combobox_value(combo):
+        return True
     try:
         return bool(combo.evaluate(
             "e => {" + _COMBO_JS +
@@ -2085,7 +2324,25 @@ def is_dial_control(el: Any) -> bool:
                 const lbl = ref.split(/\\s+/).map(x => document.getElementById(x))
                               .filter(Boolean).map(x => x.textContent || '').join(' ');
                 return /\\b(country|dial(l?ing)?|area)\\s*code\\b/i.test(lbl);
-            }"""))
+            }""")) or _shows_dial_code(el)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_DIAL_SHOWN_RE = re.compile(r"[^\d+]{0,40}\(?\+\s?\d{1,4}\)?[^\d]{0,40}")
+
+
+def _shows_dial_code(el: Any) -> bool:
+    """A list control whose current choice reads like "+1 US" or "Bangladesh (+880)". Rippling's picker is
+    named only "Search" and sits under the "Phone number" label, so neither its id nor its name says what it
+    is; what it shows does (application 175 learned "+1 US" as the answer to "Search")."""
+    try:
+        role = (el.get_attribute("role") or "").lower()
+        tag = (el.evaluate("e => e.tagName") or "").lower()
+        if role != "combobox" and tag != "select":
+            return False
+        shown = combobox_value(el) if role == "combobox" else current_value(el)
+        return bool(shown) and bool(_DIAL_SHOWN_RE.fullmatch(clean(shown)))
     except Exception:  # noqa: BLE001
         return False
 
@@ -2220,7 +2477,7 @@ def _click_dial_option(page: Any, combo: Any, code: str) -> bool:
             page.wait_for_timeout(600)
             rows = page.locator(DIAL_ROW_SEL)
             hit = next((i for i in range(min(rows.count(), DIAL_OPTIONS))
-                        if dial_in(clean(rows.nth(i).inner_text())) == code), None)
+                        if dial_in(option_text(rows.nth(i))) == code), None)
             if hit is not None:
                 rows.nth(hit).click(timeout=SHORT)
                 page.wait_for_timeout(400)
@@ -2277,7 +2534,7 @@ def set_dial_code(page: Any, phone: str) -> str:
                 # found." while the very row we wanted sat in the unfiltered list (application 141). The
                 # list is the authority; the search box is not.
                 rows = _dial_rows(page, el)
-                texts = [clean(rows.nth(i).inner_text()) for i in range(min(rows.count(), DIAL_OPTIONS))]
+                texts = [option_text(rows.nth(i)) for i in range(min(rows.count(), DIAL_OPTIONS))]
                 code, _ = _dial_from_options(texts, digits)
                 if code:
                     hit = next(i for i, t in enumerate(texts) if dial_in(t) == code)
@@ -2363,7 +2620,7 @@ def select_dial_country(page: Any, country: str, phone: str = "") -> str:
         pattern = re.compile(rf"\b{re.escape(country)}\b", re.I)
         for i in range(n):
             row = rows.nth(i)
-            text = clean(row.inner_text())
+            text = option_text(row)
             if pattern.search(text) and (not want or ("+" + want[:3] in text.replace(" ", "")) or "+" not in text):
                 row.click(timeout=SHORT)
                 page.wait_for_timeout(400)
@@ -2904,6 +3161,15 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         return
     if kind == "text" or kind == "textarea":
         existing = current_value(el)
+        if existing and looks_like_filename(existing) and not re.search(r"file|resume|résumé|\bcv\b|attach", label, re.I):
+            # A file name in a box that asks a question is left over from a misread label, not an answer.
+            # Kept, `seen` would learn it as the candidate's reply to this question.
+            log.info("clearing %r out of %r: a file name is not an answer to it", existing[:60], label[:60])
+            try:
+                el.fill("", timeout=SHORT)
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not clear %r: %s", label[:40], e)
+            existing = current_value(el)
         if existing:
             ctx.seen(existing, label, kind=kind, default=text_is_default(el))
             return
@@ -3326,6 +3592,251 @@ def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
     ctx.step("Verification code entered")
 
 
+# The sign-in-by-email step. JOIN asks for the candidate's email on its first page and then, instead of a
+# form, shows "We've sent you a secure login link — Check your email": the application only continues once
+# that link is opened, in this browser. There is no code to type and no button that moves it on, so the
+# walker used to press nothing and fail with "found neither a Submit nor a Next button" (application 169).
+_LOGIN_LINK_PROMPT_RE = re.compile(
+    r"(?:sent|emailed|mailed) you an? (?:secure |magic |one[- ]time )?(?:log ?in|sign[- ]?in|magic|access) link"
+    r"|check your (?:email|inbox) (?:for|to find) (?:a|the|your) (?:log ?in |sign[- ]?in |magic )?link", re.I)
+# The link to follow in that mail, as opposed to its imprint and terms links.
+LOGIN_LINK_URL_RE = re.compile(r"log-?in|sign-?in|magic|verif|auth|token", re.I)
+LOGIN_LINK_QUESTION = "Sign-in link from the email (one-time)"
+LOGIN_LINK_WAIT_MS = 4000
+
+
+def login_link_prompt(page: Any) -> bool:
+    """True when the page is waiting for the candidate to open a sign-in link it emailed them."""
+    try:
+        text = clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(text and _LOGIN_LINK_PROMPT_RE.search(text))
+
+
+def follow_login_link(ctx: ApplyContext, sent_at) -> None:
+    """Open the emailed sign-in link in the application's own window, which is what continues the form.
+
+    Read from the mailbox like a code. When it cannot be, the user is asked to paste it once: opening it
+    from the mail app would sign in their everyday browser, not the window jobbot is filling.
+    """
+    from jobbot import mail
+
+    page = ctx.page
+    ctx.step("Opening the sign-in link from your mailbox")
+    host = (urlparse(page.url).hostname or "").removeprefix("www.").split(".")[0]
+    link = mail.fetch_link(sent_at, match=LOGIN_LINK_URL_RE,
+                           hints=(ctx.job.get("company", ""), ctx.job.get("ats", ""), host))
+    if not link:
+        link = (ctx.answer(LOGIN_LINK_QUESTION, None, "text") or "").strip()
+    # JOIN's plain-text part carries "&amp;" between the query parameters, and a link followed with those
+    # still in it drops the token and signs nobody in.
+    link = html.unescape(link)
+    if not link.lower().startswith("http"):
+        raise ApplyError("The sign-in link from the email is not a web address")
+    page.goto(link, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(LOGIN_LINK_WAIT_MS)
+    log.info("followed the emailed sign-in link; now on %s", page.url[:100])
+    if login_link_prompt(page):
+        # Expired, or already spent by an earlier attempt. Following it again would loop to MAX_PAGES.
+        raise NeedsHuman("The emailed sign-in link did not sign in (it may have expired). Press 'Resend link' "
+                         "in the open window, then click Retry.")
+    ctx.step("Signed in from the email link")
+
+
+# A date asked for with a calendar rather than a box. JOIN draws its "When are you available to start?" step as
+# an always-open Ark UI date picker: a grid of day cells, each carrying its ISO date, with a month and a year
+# react-select above it that only turn the page. Walked as ordinary controls, those two selects were taken for
+# questions of their own, labelled by the month they showed, and the run failed on "Could not choose
+# 'September' for 'September'" (application 169) while the date itself was never picked.
+CALENDAR_SEL = ("[aria-roledescription=datepicker], [data-scope=date-picker][data-part=content], "
+                "[role=application][aria-label*=calendar i]")
+_CALENDAR_CELL_SEL = "[role=gridcell]"
+_CALENDAR_NEXT_SEL = ("[data-part=next-trigger], button[aria-label*='next month' i], "
+                      "[role=button][aria-label*='next month' i]")
+_CALENDAR_MAX_MONTHS = 12
+_SOON_RE = re.compile(r"\b(?:immediately|asap|as soon as possible|right away|now|none|no notice)\b|^\s*0\s*$", re.I)
+_IN_RE = re.compile(r"(\d+)\s*(day|week|month)", re.I)
+
+
+def in_calendar(el: Any) -> bool:
+    """True for a control that belongs to a calendar widget: its month and year pickers are navigation."""
+    try:
+        return bool(el.evaluate("(e, sel) => !!e.closest(sel)", CALENDAR_SEL))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _calendar_label(cal: Any) -> str:
+    """The question a calendar answers: the nearest heading or label written before it."""
+    try:
+        return clean(cal.evaluate("""e => {
+            const q = 'h1,h2,h3,h4,legend,label';
+            for (let n = e, d = 0; n && d < 8; n = n.parentElement, d++) {
+                for (let s = n.previousElementSibling; s; s = s.previousElementSibling) {
+                    const t = s.matches(q) ? s : s.querySelector(q);
+                    if (t && t.innerText.trim()) return t.innerText.trim();
+                }
+            }
+            return '';
+        }"""))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _target_date(answer: str, today):
+    """The earliest date an answer allows: "Immediately" is today, "2 weeks" is a fortnight on, a date is
+    that date. Never in the past, which no availability calendar offers."""
+    from dateutil import parser as dateparser
+
+    text = clean(answer)
+    if not text or _SOON_RE.search(text):
+        return today
+    m = _IN_RE.search(text)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        return today + timedelta(days=n * {"day": 1, "week": 7, "month": 30}[unit])
+    try:
+        return max(today, dateparser.parse(text, fuzzy=True, default=datetime.combine(today, datetime.min.time())).date())
+    except (ValueError, OverflowError):
+        return None
+
+
+def _cell_date(cell: Any):
+    """The date a calendar cell stands for, from its ISO data-value or else its aria-label."""
+    from dateutil import parser as dateparser
+
+    try:
+        info = cell.evaluate("""e => {
+            const t = e.querySelector('[data-value],[aria-label]') || e;
+            return [e.getAttribute('data-value') || t.getAttribute('data-value') || e.getAttribute('data-date') || '',
+                    t.getAttribute('aria-label') || e.getAttribute('aria-label') || '',
+                    !!(e.matches('[aria-disabled=true],[data-disabled],[data-unavailable]') ||
+                       t.matches('[aria-disabled=true],[data-disabled],[data-unavailable]'))];
+        }""")
+    except Exception:  # noqa: BLE001
+        return None
+    value, aria, disabled = info
+    if disabled:
+        return None
+    for raw in (value, re.sub(r"^\s*(?:choose|select)\s+", "", aria or "", flags=re.I)):
+        if not raw:
+            continue
+        try:
+            return dateparser.parse(raw, fuzzy=True).date()
+        except (ValueError, OverflowError):
+            continue
+    return None
+
+
+def fill_calendar(ctx: ApplyContext) -> bool:
+    """Answer a calendar question by clicking the earliest day the answer allows. True when a day was picked.
+
+    Asked like any other question, by the heading above the calendar, so "When are you available to start"
+    comes from preferences.start_date. A calendar that already has a day selected is left alone.
+    """
+    page = ctx.page
+    try:
+        cals = [c_ for c_ in _visible_matches(page, CALENDAR_SEL, limit=4)
+                if c_.locator(_CALENDAR_CELL_SEL).count()]
+    except Exception:  # noqa: BLE001
+        return False
+    picked = False
+    for cal in cals:
+        if cal.locator("[role=gridcell][aria-selected=true], [role=gridcell] [data-selected]").count():
+            continue
+        label = _calendar_label(cal) or "Start date"
+        ans = _ask(ctx, cal, label, None, "text")
+        if ans is None:
+            continue
+        today = datetime.now().date()
+        target = _target_date(str(ans), today)
+        if target is None:
+            raise ApplyError(f"Could not read {ans!r} as a date for {label!r}")
+        for _ in range(_CALENDAR_MAX_MONTHS + 1):
+            best, best_date = None, None
+            cells = cal.locator(_CALENDAR_CELL_SEL)
+            for i in range(min(cells.count(), 42)):
+                cell = cells.nth(i)
+                d = _cell_date(cell)
+                if d is not None and d >= target and (best_date is None or d < best_date):
+                    best, best_date = cell, d
+            if best is not None:
+                trigger = best.locator("[role=button], button").first
+                (trigger if trigger.count() else best).click(timeout=SHORT)
+                page.wait_for_timeout(400)
+                log.info("calendar: picked %s for %r (answer %r)", best_date.isoformat(), label, ans)
+                picked = True
+                break
+            nxt = cal.locator(_CALENDAR_NEXT_SEL).first
+            if not nxt.count():
+                break
+            nxt.click(timeout=SHORT)
+            page.wait_for_timeout(400)
+        if best is None:
+            raise ApplyError(f"The calendar for {label!r} offers no day on or after {target.isoformat()}")
+    return picked
+
+
+# Sign-in pages that belong to an identity provider, not to the employer. Some employers accept applications
+# only from a signed-in account there — Google Careers sends Apply to accounts.google.com (application 176).
+# jobbot never types anything into these: they are the candidate's own personal accounts, the providers refuse
+# sign-ins from an automated browser and ask for a second factor, and jobbot's generated employer password
+# typed at one is a failed login on the candidate's real account. The candidate signs in once in the window;
+# the runner saves the session on Continue, so later applications to that employer go straight through.
+_SSO_HOSTS = (
+    (re.compile(r"(^|\.)accounts\.google\.com$"), "Google"),
+    (re.compile(r"(^|\.)login\.(?:microsoftonline|live|microsoft)\.com$"), "Microsoft"),
+    (re.compile(r"(^|\.)appleid\.apple\.com$"), "Apple"),
+    (re.compile(r"(^|\.)github\.com$"), "GitHub"),
+    (re.compile(r"(^|\.)okta(?:preview)?\.com$"), "Okta"),
+)
+_SSO_PATH = {"GitHub": re.compile(r"^/(?:login|session)"), }
+SSO_MSG = ("This employer only takes applications from a signed-in {provider} account, and jobbot never signs "
+           "in to your personal accounts for you. Sign in to {provider} once in the open window, then click "
+           "Continue — the sign-in is saved, so later applications to this employer skip this step.")
+
+
+def sso_provider(url: str) -> str:
+    """The identity provider whose sign-in page `url` is ('Google', 'Microsoft', ...), '' for anything else."""
+    try:
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    for pattern, name in _SSO_HOSTS:
+        if pattern.search(host):
+            path_rule = _SSO_PATH.get(name)
+            if path_rule and not path_rule.search(parsed.path or ""):
+                return ""
+            return name
+    return ""
+
+
+def detect_sso(page: Any) -> None:
+    """Pause, with the reason, when the application has been sent to an identity provider's sign-in."""
+    provider = sso_provider(getattr(page, "url", "") or "")
+    if provider:
+        raise NeedsHuman(SSO_MSG.format(provider=provider))
+
+
+def _confirmation_arrives(page: Any, wait_s: float = 5.0) -> bool:
+    """Whether a confirmation shows up within `wait_s`. Asked before any rejection is acted on, because a
+    single-page board swaps the form for its thank-you a moment after the click, and whatever was read in
+    between is neither the form's verdict nor worth "repairing" a filled field over."""
+    deadline = time.time() + wait_s
+    while True:
+        if confirmation_showing(page):
+            log.info("the page confirmed the application after all")
+            return True
+        if time.time() >= deadline:
+            return False
+        try:
+            page.wait_for_timeout(500)
+        except Exception:  # noqa: BLE001 - a closed page confirms nothing
+            return False
+
+
 def confirmation_showing(page: Any) -> bool:
     """True when the page is, right now, telling the candidate the application went in.
 
@@ -3422,6 +3933,11 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
             raise       # the application is in, or only the candidate can move this on
         except ApplyError as e:
             message = str(e)
+            if _confirmation_arrives(page):
+                # The page was still between the form and its thank-you when it was read: what looked
+                # like a complaint was the form being torn down (application 175, Rippling).
+                ctx.extra.pop("submit_uncertain", None)
+                return
             if message.startswith("Submit not confirmed"):
                 ctx.extra["submit_uncertain"] = {"url": (getattr(page, "url", "") or "")[:300]}
                 log.warning("submit could not be confirmed; not sending it again on our own")

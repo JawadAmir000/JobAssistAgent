@@ -520,8 +520,11 @@ def _drive(app_id: int, live: dict) -> None:
                 raise       # the walker got far enough to read the employer's own notice; that is the news
             except ApplyError as second:
                 # Report what the adapter that knows this board said; the walker's own "no form here" is
-                # the more generic of the two and usually the less informative.
+                # the more generic of the two and usually the less informative. Unless the planner looked at
+                # the page and said what it is (a closed posting, a listing with no form): that is the news.
                 log.info("app %s: the generic walker also stopped: %s", app_id, second)
+                if getattr(second, "verdict", ""):
+                    raise second from e
                 raise e from second
     except NeedsHuman as e:
         log.info("app %s needs human: %s", app_id, e.reason)

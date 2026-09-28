@@ -43,7 +43,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from jobbot.apply import account, common as c, navigator
+from jobbot.apply import account, common as c, navigator, observe, planner, playbook
 from jobbot.apply.base import Adapter, ApplyContext, ApplyError, NeedsHuman, register
 
 log = logging.getLogger(__name__)
@@ -317,6 +317,10 @@ class GenericFormAdapter(Adapter):
         # "I'm interested" button (Zoho Recruit does) it swallows the click and the form never appears —
         # which reads as "no application form on this page" when the form was one dismissal away.
         c.dismiss_cookie_banner(page)
+        # A resume onto a "check your email" page (the sign-in link was asked for and has now been pasted):
+        # following it is what puts the form back on screen, so it comes before the search for one.
+        self._login_link(ctx)
+        page = ctx.page
 
         if self._already_in_flow(ctx):
             ctx.step("Continuing where it left off")
@@ -330,6 +334,9 @@ class GenericFormAdapter(Adapter):
             c.dismiss_cookie_banner(page)
             c.detect_captcha(page)
             c.detect_bot_block(page)
+            if self._login_link(ctx):
+                page = ctx.page
+                continue
             # The form may live in an iframe (iCIMS keeps its whole flow in one, and frame-busts any attempt
             # to open it on its own), so every page of the wizard is found afresh and filled where it is.
             root = self._form_root(page)
@@ -369,14 +376,32 @@ class GenericFormAdapter(Adapter):
                 # sign-in rather than a dead end. Getting through it puts the next step on screen.
                 if self._pass_account_gate(fctx):
                     continue
-                # Nothing on this step is worded like a Next or a Submit. Ask the model which control it
-                # is, from the ones actually on the page — see navigator.py.
+                # A send button that is there but greyed out is not a missing button: the form is waiting
+                # for a required field. Name them from the page itself — the model, shown the bottom of a
+                # long form, guessed "name, email" for fields that were filled (application 175).
+                if self._submit_disabled(root):
+                    missing = self._empty_required(root)
+                    if missing:
+                        log.info("generic: the send button is disabled; still empty: %s", "; ".join(missing)[:300])
+                        self._questions(fctx)
+                        missing = self._empty_required(root)
+                        if not missing:
+                            continue
+                        raise NeedsHuman(
+                            f"The form keeps its send button disabled until these are filled: "
+                            f"{'; '.join(missing[:6])}. Fill them in the open window, then click Continue — "
+                            f"what you enter there is remembered for next time.")
+                # Nothing on this step is worded like a Next or a Submit. Work out what kind of page it is
+                # instead — from memory when this page or one like it has been solved before — and act on
+                # that. See planner.py.
                 pages_before = self._context_pages(page)
-                if navigator.press_next(fctx, "move this job application to its next step, or send it"):
+                outcome = planner.unstick(fctx, "move this job application to its next step, or send it",
+                                          fill=self._gate_fill(fctx))
+                if outcome:
                     self._adopt_page_opened_since(ctx, pages_before)
                     page = ctx.page
                     root = self._form_root(page)
-                    if self._confirmed(root) or self._confirmed(page):
+                    if outcome == "submitted" or self._confirmed(root) or self._confirmed(page):
                         ctx.step("Submitted")   # the control it pressed was this board's send button
                         return
                     continue
@@ -436,6 +461,19 @@ class GenericFormAdapter(Adapter):
                             f"Fix it in the open window, then click Continue — what you type there is "
                             f"remembered for next time.")
                 else:
+                    # The press did nothing visible and nothing complains. Often the page did change in a
+                    # way the signature cannot see (a "check your email" panel, a modal sign-in) or the
+                    # real forward control is another one; the planner looks at the page afresh.
+                    pages_before = self._context_pages(page)
+                    outcome = planner.unstick(fctx, "move this job application to its next step, or send it",
+                                              fill=self._gate_fill(fctx))
+                    if outcome:
+                        self._adopt_page_opened_since(ctx, pages_before)
+                        page = ctx.page
+                        if outcome == "submitted" or self._confirmed(self._form_root(page)) or self._confirmed(page):
+                            ctx.step("Submitted")
+                            return
+                        continue
                     raise ApplyError(
                         "jobbot pressed Next but the page did not move on, and the site shows no validation "
                         "error; the application's next step is not currently automated.")
@@ -517,6 +555,11 @@ class GenericFormAdapter(Adapter):
         ctx.step("Uploading CV")
         if self._cv_already_attached(page):
             log.info("generic: a CV is already attached to this step; not uploading another")
+        elif c.file_listed(page, ctx.cv_path):
+            # Every retry re-walks the step, and a board that lists uploads rather than holding them in a
+            # file input takes each pass as one more attachment: Deloitte NZ's SmartRecruiters form had the
+            # CV twice under "Additional attachments" after one retry (application 172).
+            log.info("generic: the page already lists the CV; not uploading it again")
         elif c.upload_resume(page, ctx.cv_path):
             # The upload is not the end of it on a board that reads the CV. SmartRecruiters parses it about
             # a second later and writes what it found back over the personal-information fields: on the
@@ -534,6 +577,7 @@ class GenericFormAdapter(Adapter):
 
         ctx.step("Answering the form")
         self._questions(ctx)
+        c.fill_calendar(ctx)
 
     def _verification(self, ctx: ApplyContext) -> bool:
         """True when this step was an emailed code and it has now been typed in.
@@ -550,6 +594,24 @@ class GenericFormAdapter(Adapter):
         c.handle_verification(ctx, prompt, sent_at - timedelta(seconds=c.VERIFY_CLOCK_SKEW_S))
         return True
 
+    def _login_link(self, ctx: ApplyContext) -> bool:
+        """True when this step was a "we've emailed you a sign-in link" page and the link has been opened.
+
+        JOIN puts one after the email step: nothing on it is fillable or pressable, so walked as a form page
+        it ended in "found neither a Submit nor a Next button".
+        """
+        if not c.login_link_prompt(ctx.page):
+            return False
+        sent_at = ctx.extra.get("advanced_at") or (datetime.now(timezone.utc)
+                                                  - timedelta(seconds=VERIFY_LOOKBACK_S))
+        log.info("generic: this step waits for an emailed sign-in link")
+        before = observe.snapshot(ctx.page)
+        c.follow_login_link(ctx, sent_at - timedelta(seconds=c.VERIFY_CLOCK_SKEW_S))
+        # Solved by a rule, remembered as a lesson: the next site that words this page a little differently
+        # than the rule expects is recognised from memory instead (planner.py).
+        playbook.remember(before, "email_link")
+        return True
+
     def _cv_already_attached(self, page) -> bool:
         """True when this step already carries the CV and a second upload would be wrong rather than
         merely wasteful. False here, because on an ordinary form a file input that holds a file is skipped
@@ -564,12 +626,15 @@ class GenericFormAdapter(Adapter):
         fill ordinary fields from facts.yaml. A signup asks for names, a phone and a country like any other
         form, and the walker above already answers those.
         """
+        return account.pass_gate(ctx, self._gate_fill(ctx))
+
+    def _gate_fill(self, ctx: ApplyContext):
+        """How a signup's ordinary fields get filled: from facts.yaml, like any other form."""
         def fill() -> None:
             self.scope = self._detect_scope(ctx.page) or "form"
             self._identity(ctx)
             self._questions(ctx)
-
-        return account.pass_gate(ctx, fill)
+        return fill
 
     def _open_form(self, ctx: ApplyContext) -> None:
         """Make the application form visible, or stop and say the page is not one.
@@ -656,7 +721,13 @@ class GenericFormAdapter(Adapter):
         """
         for _ in range(2):
             pages_before = self._context_pages(ctx.page)
-            if not navigator.press_next(ctx, "open this employer's application form for this job"):
+            # The planner rather than a bare press: the page with no form is as often a sign-in, an emailed
+            # link or a closed posting as it is an oddly worded Apply button, and it knows those apart.
+            outcome = planner.unstick(ctx, "open this employer's application form for this job",
+                                      fill=self._gate_fill(ctx))
+            if outcome == "submitted":
+                raise c.AlreadyApplied("The employer's page already shows this application as sent.")
+            if not outcome:
                 return False
             # The press may have opened the application in a second tab, as an employer's own site does
             # when it hands off to its ATS. Follow it there, exactly as the named openers do.
@@ -954,6 +1025,16 @@ class GenericFormAdapter(Adapter):
                              label, current, value)
                     c.fill_if_empty(el, value, clear=True)
                     continue
+            if current and value and not c.same_value(current, value) and self._from_cv(ctx, current):
+                # The board read the CV and wrote what it found over what we typed. Rippling did this to the
+                # email (application 175): the CV carries the candidate's personal address, facts.yaml the
+                # mailbox jobbot reads its codes from, and the branch below took the parse for the
+                # candidate's hand correction and rewrote identity.email in facts.yaml. facts.yaml is the
+                # truth the form gets; the CV is only where the board guessed from.
+                log.info("%r holds %r from the board's CV parse; writing facts.yaml's %r over it",
+                         label, current, value)
+                c.fill_if_empty(el, value, clear=True)
+                continue
             if current and value and not c.same_value(current, value) and not c.error_for_field(errors, label):
                 # The user typed something else into this field in the window. It is their correction, not
                 # ours to overwrite, and facts.yaml is where the next application will read it from.
@@ -983,6 +1064,15 @@ class GenericFormAdapter(Adapter):
                 c.fill_verified(el, value)
                 if key in LOCATION_KEYS:
                     self._settle_suggestions(page, value)
+
+    @staticmethod
+    def _from_cv(ctx: ApplyContext, value: str) -> bool:
+        """True when `value` is written in the CV itself — what a board's CV parser puts into a box."""
+        if "cv_text_lower" not in ctx.extra:
+            from jobbot import config
+            ctx.extra["cv_text_lower"] = re.sub(r"\s+", " ", config.load_cv_text(ctx.cv_path) or "").lower()
+        needle = re.sub(r"\s+", " ", value or "").strip().lower()
+        return len(needle) >= 4 and needle in ctx.extra["cv_text_lower"]
 
     def _url_field(self, ctx: ApplyContext, el, label: str, key: str, value: str, current: str,
                    errors: list[str]) -> None:
@@ -1062,6 +1152,8 @@ class GenericFormAdapter(Adapter):
                 role = (el.get_attribute("role") or "").lower()
                 if not label and tag != "select":
                     continue
+                if c.is_furniture_label(label):
+                    continue        # an upload zone's or a search box's own words, not a question
                 key = self._identity_key(label)
                 # `is not None` on purpose: _identity_key returns '' for a field to leave alone (a middle
                 # name), and truthiness would let that fall through and be asked about.
@@ -1078,6 +1170,10 @@ class GenericFormAdapter(Adapter):
                     continue        # a bot trap: filling it is how a finished application gets binned
                 if c.is_prompt_control(el):
                     continue        # a Workday prompt; workday.py picks from its list, typing does nothing
+                if c.in_calendar(el):
+                    continue        # a calendar's month/year picker turns its page; fill_calendar picks the day
+                if (role == "combobox" or tag == "select") and c.is_dial_control(el):
+                    continue        # a phone number's country code, set by _identity from the phone fact
 
                 if role == "combobox":
                     c.answer_and_set(ctx, el, label, "combobox")
@@ -1100,7 +1196,13 @@ class GenericFormAdapter(Adapter):
         if group:
             handled_groups.add(group)
 
-        container = el.locator("xpath=ancestor::fieldset[1]")
+        # A group that declares itself (role=radiogroup / role=group) is the container, and it is asked by
+        # its own name — its aria label, or the question written above it. Rippling has no fieldset and no
+        # <label> anywhere near its groups, so the fallbacks below found the option "Yes" as the question.
+        aria_group = el.locator("xpath=ancestor::*[@role='radiogroup' or @role='group'][1]")
+        container = aria_group
+        if container.count() == 0:
+            container = el.locator("xpath=ancestor::fieldset[1]")
         if container.count() == 0:
             container = el.locator("xpath=ancestor::div[.//label][1]")
         if container.count() == 0:
@@ -1112,6 +1214,7 @@ class GenericFormAdapter(Adapter):
         # Reading the container for a lone box is how Deloitte's "Notification:" tick was reported under
         # the label "Email Address:" — the first label in the table it shares — and cached as an answer.
         label = (c.strip_required(c.get_label_for(el)) if lone else "") \
+            or (c.strip_required(c.get_label_for(aria_group.first)) if aria_group.count() else "") \
             or c.strip_required(self._group_label(container, el))
         if not label:
             return
@@ -1239,6 +1342,71 @@ class GenericFormAdapter(Adapter):
                              "closed or moved. Check it in the browser window.")
 
     # ---------- helpers ----------
+    def _submit_disabled(self, page) -> bool:
+        """True when the form's own send/next button is on screen but greyed out — the form saying that a
+        required field is still empty, rather than that there is no way forward."""
+        for name in self.submit_names + self.next_names:
+            try:
+                loc = page.get_by_role("button", name=re.compile(rf"^\s*{re.escape(name)}\s*$", re.I))
+                for i in range(min(loc.count(), 3)):
+                    el = loc.nth(i)
+                    if c.is_visible_now(el) and (not el.is_enabled()
+                                                 or (el.get_attribute("aria-disabled") or "") == "true"):
+                        return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _empty_required(self, page) -> list[str]:
+        """The questions on this step that the form requires and that are still empty, by label.
+
+        Required means the form says so — a required / aria-required control, or a label carrying the star —
+        not is_required's "unknown counts as required", because this list is shown to the candidate and a
+        field named here that the form does not need would send them looking for a problem that is not there.
+        """
+        missing: list[str] = []
+        sel = self._controls_selector(self.scope, extra=True) + f", {self.scope} [role=radiogroup]"
+        groups: set[str] = set()
+        try:
+            ctl = page.locator(sel)
+            n = min(ctl.count(), 80)
+        except Exception:  # noqa: BLE001
+            return missing
+        for i in range(n):
+            el = ctl.nth(i)
+            try:
+                typ = (el.get_attribute("type") or "").lower()
+                role = (el.get_attribute("role") or "").lower()
+                tag = (el.evaluate("e => e.tagName") or "").lower()
+                if typ in ("file", "radio", "checkbox") or not c.is_visible_now(el):
+                    continue        # files go through the uploader; tick boxes are counted by their group
+                if (role == "combobox" or tag == "select") and c.is_dial_control(el):
+                    continue
+                label = c.get_label_for(el)
+                starred = bool(re.search(r"\*\s*$", label))
+                declared = (el.get_attribute("required") is not None
+                            or (el.get_attribute("aria-required") or "") == "true")
+                if not (starred or declared) or c.is_furniture_label(label):
+                    continue
+                if role == "radiogroup":
+                    key = el.get_attribute("id") or label
+                    if key in groups or el.locator("input:checked, [aria-checked=true]").count():
+                        continue
+                    groups.add(key)
+                    empty = True
+                elif role == "combobox":
+                    empty = not c.combobox_value(el)
+                elif tag == "select":
+                    empty = not c.clean(el.evaluate(
+                        "e => e.selectedIndex > 0 ? e.options[e.selectedIndex].textContent : ''"))
+                else:
+                    empty = not c.current_value(el)
+                if empty:
+                    missing.append(c.strip_required(label)[:90] or "an unnamed field")
+            except Exception as e:  # noqa: BLE001
+                log.debug("generic: required check on control %d: %s", i, e)
+        return missing
+
     @staticmethod
     def _controls_selector(scope: str, extra: bool = False, visible: bool = False) -> str:
         """Every fillable control under `scope`; `extra` adds the selects and comboboxes _questions handles."""

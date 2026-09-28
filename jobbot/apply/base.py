@@ -110,7 +110,8 @@ _LOADED = False
 # credentials is here for the same reason the rest are: a password rule it learns (a form's length cap, say)
 # is useless if it only takes effect after a restart, and a restart is what closes the parked window.
 _RELOADABLE = ("jobbot.answers", "jobbot.credentials", "jobbot.apply.common", "jobbot.apply.resolver",
-               "jobbot.apply.account", "jobbot.apply.navigator",
+               "jobbot.apply.account", "jobbot.apply.navigator", "jobbot.apply.observe",
+               "jobbot.apply.playbook", "jobbot.apply.planner",
                "jobbot.apply.generic",
                "jobbot.apply.greenhouse", "jobbot.apply.lever", "jobbot.apply.ashby",
                "jobbot.apply.linkedin", "jobbot.apply.workday")

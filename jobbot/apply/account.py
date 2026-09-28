@@ -235,6 +235,10 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
     registered", which costs nothing and says exactly what to do next.
     """
     page = ctx.page
+    # An identity provider's sign-in is the candidate's own account, never an employer gate: jobbot's
+    # generated password typed there is a failed login on their real Google/Microsoft account (see
+    # common.detect_sso, which pauses for it instead).
+    c.detect_sso(page)
     if not at_gate(page):
         return False
     email = ctx.fact("identity.email")
