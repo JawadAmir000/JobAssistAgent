@@ -15,6 +15,18 @@ from urllib.parse import urlparse
 
 from jobbot.apply.base import AlreadyApplied, ApplyContext, ApplyError, NeedsHuman
 
+# jobbot.mail holds only functions and constants, so it is safe to swap under a running server, and this
+# module is reloaded on every Retry: reloading it from here is what lets a fix to the code reader (the
+# "follow" OTP, application 225) land without a restart that would close every parked window.
+# base._RELOADABLE lists it too, which takes over once the server has been restarted.
+try:
+    import importlib as _importlib
+    import sys as _sys
+    if "jobbot.mail" in _sys.modules:
+        _importlib.reload(_sys.modules["jobbot.mail"])
+except Exception:  # noqa: BLE001 - an unreloadable mail module keeps the version already loaded
+    pass
+
 log = logging.getLogger(__name__)
 
 SHORT = 1500      # ms - "is it there?" probes
@@ -60,6 +72,23 @@ CONFIRM_TEXTS = (
 )
 FORM_GONE_GRACE_S = 4.0     # a form that vanished after Submit must stay gone this long to count as sent
 CONFIRM_URL_HINTS = ("confirmation", "thanks", "thank-you", "thankyou", "submitted", "success", "applied")
+# The hints above, as words of the URL's path and query -- never its host. "career5.successfactors.eu"
+# carries "success" in the host, so every SuccessFactors page read as a thank-you page and Capgemini was
+# recorded as applied from a "Loading..." screen (application 215). Word-bounded for the same reason:
+# "/successfactors/", "?unapplied=" and "/applied-ai-engineer" are not confirmations either.
+_CONFIRM_URL_RE = re.compile(
+    r"(?<![a-z0-9])(?:confirm(?:ation|ed)?|thanks|thank-?you|submitted|success(?:ful(?:ly)?)?|applied)"
+    r"(?![a-z0-9]|-(?:ai|ml|data|science|scientist|engineer|research))", re.I)
+
+
+def confirm_url(url: str) -> bool:
+    """True when the URL itself says the application went in (see _CONFIRM_URL_RE)."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return False
+    return bool(_CONFIRM_URL_RE.search(f"{parts.path}?{parts.query}#{parts.fragment}"))
 
 _WS = re.compile(r"\s+")
 
@@ -251,6 +280,30 @@ def is_number_box(el: Any) -> bool:
         return (el.get_attribute("type") or "").lower() in ("number", "range")
     except Exception:
         return False
+
+
+# A question whose only honest answer is a figure. LinkedIn's Easy Apply draws these as plain type=text
+# boxes and then rejects anything but digits with "Invalid input" -- "10+" for "Approximately how many
+# AI-powered applications have you built?" stopped application 178. Asked as a number, the resolver turns
+# "10+" / "6 years" into the bare figure, or asks the user when there is none.
+_COUNT_QUESTION_RE = re.compile(
+    r"^\s*(?:approximately|roughly|about|in total,?)?\s*how\s+many\b"
+    r"|^\s*(?:total\s+)?(?:number|no\.?)\s+of\b"
+    r"|^\s*years\s+of\b", re.I)
+_PLAIN_NUMBER_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*$")
+
+
+_TODAY_DATE_RE = re.compile(r"(?:today s|todays|today|current|signature|signing|submission)\s+date|date signed"
+                            r"|date(?:\s+(?:of\s+)?(?:signature|signing|today))")
+
+
+def normalize_label(label: str) -> str:
+    from jobbot.answers import normalize_question
+    return normalize_question(strip_required(label or ""))
+
+
+def asks_for_count(label: str) -> bool:
+    return bool(_COUNT_QUESTION_RE.search(clean(label or "")))
 
 
 def has_bad_input(el: Any) -> bool:
@@ -697,7 +750,7 @@ def wait_for_confirmation(page: Any, timeout_s: int = CONFIRM_TIMEOUT_S, names: 
     while time.time() < deadline:
         try:
             url = page.url.lower()
-            if url != start_url.lower() and any(h in url for h in CONFIRM_URL_HINTS):
+            if url != start_url.lower() and confirm_url(url):
                 return True
             body = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
             if any(t in body for t in CONFIRM_TEXTS):
@@ -1021,6 +1074,29 @@ def form_errors(page: Any) -> list[str]:
                     if (!vis(el) || announcer(el)) continue;
                     const t = clean(el.innerText || el.textContent);
                     if (t && t.length < 160) out.push(t);
+                }
+
+                // (1b) messages tied to a control by aria-describedby / aria-errormessage. LinkedIn's
+                // native-<dialog> Easy Apply draws "This field is required" / "Invalid input" as a bare red
+                // <p> inside the node the control points at -- no role, no aria-invalid, hashed classes --
+                // so the pass above saw nothing and the step paused as "gave no reason" (application 178).
+                // That node also holds a "0/20" character counter, so only red or error-worded text counts.
+                const red = el => { const m = getComputedStyle(el).color.match(/\\d+/g) || [];
+                    return m.length >= 3 && +m[0] > 150 && +m[1] < 100 && +m[2] < 100; };
+                const errWords = /required|invalid|must|please (?:enter|select|choose|provide)|enter an? |not valid|too (?:long|short)/i;
+                for (const c of deepAll('[aria-describedby], [aria-errormessage]')) {
+                    const ids = ((c.getAttribute('aria-describedby') || '') + ' ' + (c.getAttribute('aria-errormessage') || '')).split(/\\s+/).filter(Boolean);
+                    const q = clean(c.getAttribute('aria-label') || (c.labels && c.labels[0] && c.labels[0].innerText) || '');
+                    for (const id of ids) {
+                        const box = (c.getRootNode().getElementById ? c.getRootNode() : document).getElementById(id);
+                        if (!box || !vis(box)) continue;
+                        for (const leaf of [box, ...box.querySelectorAll('*')]) {
+                            if (leaf.children.length) continue;     // leaves only, the box itself included
+                            const t = clean(leaf.innerText || leaf.textContent);
+                            if (!t || t.length >= 160 || !vis(leaf) || !(red(leaf) || errWords.test(t))) continue;
+                            out.push(q ? q.replace(/\\s*\\*+\\s*$/, '') + ': ' + t : t);
+                        }
+                    }
                 }
 
                 // (2) the browser's own constraint validation, which renders outside the DOM
@@ -1588,7 +1664,15 @@ _LABEL_JS = """e => {
     const root = e.getRootNode();
     const byId = id => (root.getElementById ? root.getElementById(id) : document.getElementById(id));
     if (al) { const t = al.split(/\\s+/).map(id => { const n = byId(id); return n ? (n.innerText || n.textContent) : ''; }).join(' '); if (real(clean(t))) return clean(t); }
-    const aria = e.getAttribute('aria-label'); if (real(aria) && !prompt(aria)) return clean(aria);
+    // A radio whose aria-label is shared with the other options of its group is labelled with the group's
+    // *question*, not with its own option. LinkedIn's native-<dialog> Easy Apply does this: every radio of
+    // "Have you built…?" carries that question as aria-label, beside an empty <label> and a <p>Yes</p>, so
+    // both options read as the question and "Yes" could never be picked (application 178). The option's own
+    // words are the text beside it, found by the tick-box scan further down.
+    const aria = e.getAttribute('aria-label');
+    const sharedAria = (e.type === 'radio' || e.type === 'checkbox') && e.name && real(aria) && root.querySelectorAll
+        && [...root.querySelectorAll(`input[name="${CSS.escape(e.name)}"]`)].some(o => o !== e && o.getAttribute('aria-label') === aria);
+    if (real(aria) && !prompt(aria) && !sharedAria) return clean(aria);
     const id = e.id; if (id) { for (const l of root.querySelectorAll(`label[for="${CSS.escape(id)}"]`)) { const t = tx(l); if (real(t)) return t; } }
     const wrap = e.closest('label'); if (wrap) { const t = tx(wrap); if (real(t)) return t; }
     const fs = e.closest('fieldset'); if (fs) { const lg = fs.querySelector('legend'); if (lg) { const t = tx(lg); if (real(t)) return t; } }
@@ -1755,7 +1839,11 @@ _DRAWN_BY_LABEL_JS = """e => {
         if (w) { const b = w.getBoundingClientRect(); if (b.width > 3 && b.height > 3) lbl = w; }
     }
     if (!lbl) return '';
-    return (lbl.innerText || lbl.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+    // An empty but visible <label> is still what draws the control: LinkedIn's native-<dialog> Easy Apply
+    // styles <label for=radio></label> as the circle and prints "Yes" in a sibling <p>. Returning its
+    // (empty) text made every such radio read as not drawn at all, and each Yes/No on the step was
+    // skipped as invisible (application 178). Callers only ask whether one exists.
+    return (lbl.innerText || lbl.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200) || '(drawn)';
 }"""
 
 
@@ -1865,6 +1953,39 @@ def tick(el: Any) -> bool:
     except Exception as e:  # noqa: BLE001
         log.debug("tick: scripted click refused (%s)", str(e)[:100])
     return is_checked_now(el)
+
+
+def reassert_choice(container: Any) -> bool:
+    """Re-select the ticked radio in `container` with real clicks, so a form whose state never heard about
+    the tick hears about it now: a different option first, then the chosen one. True when the chosen one
+    ends up ticked again."""
+    try:
+        radios = container.locator("input[type=radio]")
+        n = radios.count()
+        chosen = next((i for i in range(n) if radios.nth(i).is_checked()), None)
+        if chosen is None or n < 2:
+            return False
+        other = 0 if chosen != 0 else 1
+
+        def click(i: int) -> None:
+            el = radios.nth(i)
+            label = el.locator("xpath=ancestor::label[1]")
+            if not label.count():
+                el_id = el.get_attribute("id")
+                label = container.locator(f"label[for='{el_id}']") if el_id else label
+            if not label.count():
+                label = el.locator("xpath=ancestor::*[.//label][1]//label")
+            (label.first if label.count() else el).click(timeout=MEDIUM)
+
+        click(other)
+        container.page.wait_for_timeout(150) if hasattr(container, "page") else None
+        click(chosen)
+        ok = radios.nth(chosen).is_checked()
+        log.info("re-selected the ticked option so the form registers it (%s)", "held" if ok else "did not hold")
+        return ok
+    except Exception as e:  # noqa: BLE001
+        log.debug("reassert_choice: %s", e)
+        return False
 
 
 def check_choice(container: Any, answer: str) -> bool:
@@ -2856,15 +2977,21 @@ def _best_suggestion(options: list[str], value: str) -> str:
     head = next((w for w in want.split() if len(w) > 3), "")
     try:
         from rapidfuzz import fuzz
-        best, score = "", 0
+        # token_set_ratio scores every superset of the answer's words 100, so "Dhaka Chandragati, Rajshahi
+        # Division, Bangladesh" tied "Dhaka, Dhaka Division, Bangladesh" for "Dhaka, Bangladesh" and won by
+        # coming first (application 213, Meta). Ties go to the option that begins the way the answer does
+        # (its first comma part, "Dhaka", exactly), then to the one with the fewest extra words.
+        lead = normalize_question(value.split(",")[0])
+        best, score = "", (0, 0, 0)
         for o in options:
             n = normalize_question(o)
             if head and head not in n:
                 continue
-            sc = fuzz.token_set_ratio(n, want)
+            sc = (fuzz.token_set_ratio(n, want), int(normalize_question(o.split(",")[0]) == lead),
+                  fuzz.token_sort_ratio(n, want))
             if sc > score:
                 best, score = o, sc
-        if score >= 80:
+        if score[0] >= 80:
             return best
     except Exception:  # noqa: BLE001
         pass
@@ -3019,6 +3146,32 @@ _HONEYPOT_RE = re.compile(
     # Oracle Recruiting ships one on every "apply with your email" step and labels it in as many words:
     # <input id="honey-pot-1" aria-hidden="true"> beside <label>honeypot</label>.
     r"|honey\s*-?\s*pot|bot[\s-]?(?:field|trap)", re.I)
+
+
+_CHAT_WIDGET_JS = r"""e => {
+    // A recruiting chatbot or live-chat panel docked beside the form. Its reply box is a textarea like any
+    // other, and a walker scoped to <body> answered it: Presight's Oracle page got the candidate summary
+    // posted into its "Presight Careers" assistant twice (application 221) -- a message sent on the
+    // candidate's behalf that nobody asked for.
+    const ph = (e.getAttribute('placeholder') || e.getAttribute('aria-label') || '').toLowerCase();
+    if (/\b(?:write|type|send|enter)\s+(?:a|your)\s+(?:reply|message)\b|\bask (?:me|a question|anything)\b|^message\b/.test(ph))
+        return true;
+    for (let n = e.parentElement, i = 0; n && n !== document.body && i < 12; n = n.parentElement, i++) {
+        const tag = (n.className && n.className.toString ? n.className.toString() : '') + ' ' + (n.id || '') + ' '
+                  + (n.getAttribute('aria-label') || '') + ' ' + n.tagName;
+        if (/\b(?:chat|chatbot|livechat|messenger|intercom|drift|zendesk|webchat|conversation|assistant-panel)\b|chat-?(?:widget|window|panel|container|box)/i.test(tag))
+            return true;
+    }
+    return false;
+}"""
+
+
+def in_chat_widget(el: Any) -> bool:
+    """True for a control inside a chat panel beside the form -- never an application question."""
+    try:
+        return bool(el.evaluate(_CHAT_WIDGET_JS))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_honeypot(el: Any, label: str = "") -> bool:
@@ -3313,15 +3466,33 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             except Exception as e:  # noqa: BLE001
                 log.debug("could not clear %r: %s", label[:40], e)
             existing = current_value(el)
+        if existing and kind == "text" and _TODAY_DATE_RE.fullmatch(normalize_label(label)):
+            # A signing date is today's, whatever an earlier run or the model left in the box: ServiceNow went
+            # out dated 2026-02-01 on 2026-09-29 because the box already held it (application 222).
+            from datetime import date
+            today = date.today().isoformat()
+            if existing.strip() != today:
+                log.info("%r holds %r; writing today's date %s", label[:40], existing[:20], today)
+                fill_if_empty(el, today, clear=True)
+                return
+        if existing and kind == "text" and asks_for_count(label) and not _PLAIN_NUMBER_RE.match(existing):
+            # "10+" in a box that asks "how many": LinkedIn answers it with "Invalid input" and nothing else,
+            # and every retry read "10+" back as the answer already given (application 178).
+            from jobbot.apply.resolver import as_number
+            num = as_number(existing, label)
+            if num is not None:
+                log.info("%r asks for a count; rewriting %r as %r", label[:60], existing[:30], num)
+                fill_if_empty(el, num, clear=True)
+                return
         if existing:
-            ctx.seen(existing, label, kind=kind, default=text_is_default(el))
+            ctx.seen(existing, label, kind=kind, default=text_is_default(el) or _unchanged_identity(ctx, label, existing))
             return
         if kind == "textarea" and COVER_LABEL_RE.search(label or ""):
             letter = cover_letter_text(ctx)
             if letter:
                 fill_if_empty(el, letter)
                 return
-        if kind == "text" and is_number_box(el):
+        if kind == "text" and (is_number_box(el) or asks_for_count(label)):
             # The control decides the shape of the answer: "Negotiable" is a fine answer to a salary box and
             # no answer at all to a salary *number* box. The resolver turns what it knows into a number where
             # it honestly can ("None" notice period -> 0 weeks) and asks the user where it cannot.
@@ -3351,8 +3522,12 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
     elif kind == "select":
         opts = options or select_options(el)
         existing = clean(el.evaluate("e => e.selectedIndex > 0 ? e.options[e.selectedIndex].textContent : ''"))
+        if existing and (want := _policy_over_prefill(ctx, label, existing, opts, kind)):
+            if choose_select(el, want, opts):
+                return
         if existing:
-            ctx.seen(existing, label, kind=kind, options=opts, default=select_is_default(el))
+            ctx.seen(existing, label, kind=kind, options=opts,
+                     default=select_is_default(el) or _unchanged_identity(ctx, label, existing))
             return
         if len(opts) == 1:
             # "— Make a Selection — / Continue" (iCIMS's consent gate): one real choice is not a question,
@@ -3369,7 +3544,8 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
     elif kind == "combobox":
         existing = combobox_value(el)
         if existing:
-            ctx.seen(existing, label, kind=kind, placeholder=combobox_is_placeholder(el))
+            ctx.seen(existing, label, kind=kind, placeholder=combobox_is_placeholder(el),
+                     default=_unchanged_identity(ctx, label, existing))
             return
         opts = options if options is not None else combobox_options(page, el)
         if options is None and len(opts) >= 60:
@@ -3386,6 +3562,10 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             _choice_miss(el, label, ans, seen, kind)
     elif kind in ("radio", "checkbox"):
         cont = container if container is not None else el
+        if choice_checked(cont) and (want := _policy_over_prefill(ctx, label, checked_choice_label(cont),
+                                                                  options or choice_options(cont), kind)):
+            if check_choice(cont, want):
+                return
         if choice_checked(cont):
             ctx.seen(checked_choice_label(cont), label, kind=kind, options=options or choice_options(cont),
                      default=choice_is_default(cont))
@@ -3398,6 +3578,50 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             _choice_miss(el, label, ans, opts, kind, cont)
     elif kind == "file":
         return  # the CV goes through upload_resume; the cover letter through fill_cover_letter
+
+
+def _unchanged_identity(ctx: ApplyContext, label: str, value: str) -> bool:
+    """True when an identity field (country, location, email…) still holds exactly what it held the first
+    time jobbot looked at it on this application -- the form's own value, whoever has had the window since.
+
+    The learn-back writes a changed identity field into facts.yaml, and it only trusts a window a person has
+    had in front of them. That is not enough: after one pause, Just Eat's Country dropdown -- which the form
+    itself had set to "United Kingdom" from the job's location -- was taken for the candidate's correction
+    and rewrote identity.country (application 224). A correction is a *change*; nothing changed here.
+    """
+    try:
+        from jobbot.apply.runner import _identity_fact_key
+        if not _identity_fact_key(label):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    first = ctx.extra.setdefault("first_seen_identity", {})
+    key = clean(label).lower()
+    if key not in first:
+        first[key] = clean(value)
+        return True             # first sight: whatever is there, the page put it there
+    return first[key] == clean(value)
+
+
+def _policy_over_prefill(ctx: ApplyContext, label: str, existing: str, options: list[str], kind: str) -> str:
+    """The option policy wants in place of a value the form arrived with, '' to leave the value alone.
+
+    Only for questions whose answer is fixed by policy, never by the employer or the candidate's mood:
+    "How did you hear about us?". Heidi's Ashby form came with "Heidi Website" already ticked, the walker
+    took a filled control for an answered one, and the pre-tick was sent and then cached as the candidate's
+    own typed answer (application 199) -- while the rule says the answer is always the job source.
+    """
+    from jobbot.apply.resolver import is_source_question
+    if not existing or not is_source_question(label):
+        return ""
+    try:
+        want = ctx.answer(label, options or None, kind)
+    except NeedsHuman:
+        return ""           # nothing on the list is true: leave the form's value, and do not learn it either
+    if not want or same_option(want, existing):
+        return ""
+    log.info("%r arrived holding %r; policy answers %r", label[:60], existing[:40], want[:40])
+    return want
 
 
 # ---------- cover letter ----------
@@ -3560,6 +3784,8 @@ VERIFY_INPUTS = ("input[name*='security' i], input[name*='verification' i], inpu
                  "input[id*='security' i], input[id*='verification' i], input[autocomplete='one-time-code'], "
                  "input[name*='otp' i], input[id*='otp' i], input[class*='otp' i], "
                  "input[aria-label*='verification' i], input[aria-label*='one-time' i], "
+                 # Lumen: six plain text boxes named only "Please enter OTP character 1…6" (application 225)
+                 "input[aria-label*='otp' i], input[placeholder*='otp' i], input[aria-label*='passcode' i], "
                  "input[inputmode='numeric'][maxlength='1'], input[maxlength='1']")
 # Oracle Recruiting's "Confirm Your Identity" step draws six round boxes that declare none of the above: no
 # maxlength, no name worth matching, nothing but a numeric keyboard hint. Application 129 therefore walked
@@ -3698,10 +3924,22 @@ def fill_verification_code(page: Any, code: str) -> bool:
     try:
         boxes = code_boxes(page)
         if len(boxes) >= len(code) > 1:
-            for ch, box in zip(code, boxes):
-                box.click(timeout=SHORT)
+            for box in boxes:
                 box.fill("", timeout=SHORT)      # clear first: a retry must not append to what is there
-                box.fill(ch, timeout=SHORT)
+            # Real keystrokes into the first box. One-box-per-character widgets (Eightfold, behind Lumen's
+            # careers site) keep the code in their own state, fed by key events that also move the focus
+            # along; a value set with fill() shows in the box and is still "Missing or Invalid OTP" on
+            # submit (application 225).
+            boxes[0].click(timeout=SHORT)
+            page.keyboard.type(code, delay=60)
+            page.wait_for_timeout(200)
+            typed = "".join(current_value(b)[:1] for b in boxes[:len(code)])
+            if typed != code:
+                log.info("verification: keystrokes did not land box by box; typing each box on its own")
+                for ch, box in zip(code, boxes):
+                    box.click(timeout=SHORT)
+                    box.fill("", timeout=SHORT)
+                    box.press_sequentially(ch, delay=40)
             page.wait_for_timeout(300)
             return True
         if boxes:
@@ -3715,6 +3953,137 @@ def fill_verification_code(page: Any, code: str) -> bool:
     return False
 
 
+_SMS_2FA_RE = re.compile(
+    r"(?:2|two)[- ]?(?:factor|step)\s+(?:authentication|verification)|\b2fa\b|\bmfa\b"
+    r"|(?:text|sms)\s+(?:you\s+)?(?:a\s+)?(?:one[- ]time\s+)?(?:verification\s+)?code"
+    r"|phone number for verification", re.I)
+
+
+_OUTLINE_JS = r"""(needle) => {""" + DEEP_JS + r"""
+    const want = needle.toLowerCase();
+    for (const r of _deepRoots) for (const el of r.querySelectorAll('*')) {
+        if (['SCRIPT', 'STYLE', 'TEMPLATE'].includes(el.tagName)) continue;
+        const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ')
+                    .replace(/\s+/g, ' ').trim().toLowerCase();
+        if (!own || !own.includes(want)) continue;
+        if (deepClosest(el, '[class*=error i], [role=alert], [aria-live]')) continue;   // the complaint, not the field
+        let box = el;
+        for (let i = 0; i < 2; i++) { const up = box.parentElement || (box.parentNode && box.parentNode.host);
+                                      if (!up || up === document.body) break; box = up; }
+        const d = (n, k) => { if (k > 8 || !n.tagName) return '';
+            const a = ['type', 'role', 'name', 'aria-label', 'aria-pressed', 'aria-checked', 'slot', 'label']
+                .map(x => n.getAttribute(x) ? x + '=' + String(n.getAttribute(x)).slice(0, 30) : '').filter(Boolean).join(' ');
+            const cls = (n.getAttribute('class') || '').split(/\s+/).filter(c => c && c.length < 40).slice(0, 2).join('.');
+            const t = [...n.childNodes].filter(c => c.nodeType === 3).map(c => c.textContent.trim()).join(' ').slice(0, 40);
+            const kids = n.shadowRoot ? [...n.shadowRoot.children, ...n.children] : [...n.children];
+            return ' '.repeat(k) + n.tagName.toLowerCase() + (cls ? '.' + cls : '') + (n.shadowRoot ? '(#s)' : '')
+                 + (a ? ' [' + a + ']' : '') + (t ? ' "' + t + '"' : '') + '\n' + kids.slice(0, 12).map(c => d(c, k + 1)).join(''); };
+        return d(box, 0).slice(0, 3000);
+    }
+    return '';
+}"""
+
+
+_ILLEGAL_CHARS_RE = re.compile(r"(?:contains?|has)\s+(?:illegal|invalid|disallowed|unsupported)\s+characters?:?\s*(.+)$", re.I)
+
+
+def strip_illegal_characters(page: Any, errors: list[str]) -> int:
+    """Remove the characters a form names as illegal from the fields it names. Returns how many changed.
+
+    Workday: "Role Description Contains illegal characters < > [ ] \" { } \\" -- the job description its own
+    CV parse wrote in carried a quote, and every save bounced on it (application 251). The characters are
+    read from the message itself, so another board's list works the same way."""
+    changed = 0
+    for err in errors or []:
+        m = _ILLEGAL_CHARS_RE.search(err or "")
+        if not m:
+            continue
+        bad = set(ch for ch in m.group(1) if not ch.isspace())
+        if not bad:
+            continue
+        head = clean(err[:m.start()])
+        head = re.sub(r"^(?:errors? found\s*)?(?:error\s*[-:]\s*)?", "", head, flags=re.I).strip(" -:")
+        try:
+            boxes = page.locator("textarea:visible, input[type=text]:visible")
+            for i in range(min(boxes.count(), 80)):
+                el = boxes.nth(i)
+                val = current_value(el)
+                if not val or not any(ch in bad for ch in val):
+                    continue
+                label = clean(get_label_for(el))
+                if head and label and head.lower() not in label.lower() and label.lower() not in head.lower():
+                    continue
+                el.fill("".join(ch for ch in val if ch not in bad), timeout=MEDIUM)
+                changed += 1
+                log.info("removed the characters %s from %r, which the form refuses", "".join(sorted(bad)), label[:50])
+        except Exception as e:  # noqa: BLE001
+            log.debug("strip_illegal_characters: %s", e)
+    return changed
+
+
+def _silent_bot_check(page: Any, complaint: str) -> bool:
+    """A generic "error processing your application" on a page carrying an invisible reCAPTCHA/hCaptcha."""
+    if not re.search(r"error processing your application|something went wrong|please try again", complaint or "", re.I):
+        return False
+    try:
+        return bool(page.locator(".grecaptcha-badge, iframe[src*='recaptcha'], iframe[src*='hcaptcha'], "
+                                 "iframe[title*='reCAPTCHA' i]").count())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def log_field_outline(page: Any, complaint: str) -> None:
+    """Log the markup around the field a form keeps refusing, so the next unknown widget explains itself in
+    the log instead of costing a probe and a rerun (applications 222 and 230 each needed one). Structure,
+    attributes and short labels only -- never an input's value."""
+    m = re.search(r"(?:required field:|field is required:|:)\s*(.{12,60}?)(?:;|$)", complaint or "")
+    needle = clean(m.group(1) if m else complaint)[:40]
+    if len(needle) < 8:
+        return
+    try:
+        outline = page.evaluate(_OUTLINE_JS, needle)
+    except Exception as e:  # noqa: BLE001
+        log.debug("field outline: %s", e)
+        return
+    if outline:
+        log.warning("field outline for the refused %r:\n%s", needle, outline)
+
+
+def detect_sms_2fa(page: Any) -> None:
+    """Stop, with the reason, on a step that texts a code to the candidate's phone. The mailbox reader cannot
+    see an SMS, and the walker used to press Continue on "Set up 2-factor authentication" and report a
+    submit it could not confirm (application 225, Lumen/Eightfold) -- sending the user to look for an
+    application that was never sent."""
+    try:
+        text = clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))[:4000]
+        if not text or not _SMS_2FA_RE.search(text):
+            return
+        if not page.locator("input[type=tel]:visible, input[name*=phone i]:visible, input[placeholder*=phone i]:visible, "
+                            "input[autocomplete*=one-time-code]:visible").count():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    raise NeedsHuman("This employer wants to text a verification code to your phone (two-factor sign-in), which "
+                     "jobbot cannot read. Finish that step in the open window, then click Continue — the "
+                     "application carries on from there.")
+
+
+RESEND_NAMES = ("resend email", "resend code", "resend", "send a new code", "send new code", "resend the code",
+                "send code again", "get a new code", "request a new code", "didn't get a code? resend")
+
+
+def _named_link_on(page: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        try:
+            loc = page.get_by_role("link", name=re.compile(rf"^\s*{re.escape(name)}\s*$", re.I))
+            for i in range(min(loc.count(), 3)):
+                if is_visible_now(loc.nth(i)):
+                    return loc.nth(i)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
     """Satisfy the emailed-code step: read the code from the mailbox, or ask the user for it once.
 
@@ -3725,8 +4094,26 @@ def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
 
     length, to = prompt.get("length") or 8, prompt.get("to") or ""
     ctx.step("Waiting for the verification code by email")
-    code = mail.fetch_code(submitted_at, length=length,
-                           hints=(ctx.job.get("company", ""), ctx.job.get("ats", "")))
+    hints = (ctx.job.get("company", ""), ctx.job.get("ats", ""))
+    code = mail.fetch_code(submitted_at, length=length, hints=hints)
+    if not code and mail.is_configured()[0] and not ctx.extra.get("code_resent"):
+        # The code this step is waiting for was mailed before the wait began -- on a Retry, or after a code
+        # that was typed wrong -- so no new mail is coming by itself. Lumen's step offers "resend email";
+        # pressing it once, then reading only mail newer than the press, is what a person would do
+        # (application 225). Once per application: every press restarts the sender's cooldown.
+        resend = named_button(ctx.page, RESEND_NAMES) or _named_link_on(ctx.page, RESEND_NAMES)
+        if resend is not None:
+            from datetime import datetime, timezone
+            ctx.extra["code_resent"] = True
+            sent = datetime.now(timezone.utc)
+            try:
+                resend.click(timeout=MEDIUM)
+                log.info("verification: no fresh code in the mailbox; pressed %r and waiting again",
+                         clean(resend.inner_text() or "")[:40])
+                ctx.step("Asked for a new verification code")
+                code = mail.fetch_code(sent, length=length, hints=hints)
+            except Exception as e:  # noqa: BLE001
+                log.debug("verification: resend: %s", e)
     if not code:
         ok, why = mail.is_configured()
         reason = VERIFY_MSG.format(to=to or mail.mail_user() or "your inbox")
@@ -3748,7 +4135,10 @@ def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
 # walker used to press nothing and fail with "found neither a Submit nor a Next button" (application 169).
 _LOGIN_LINK_PROMPT_RE = re.compile(
     r"(?:sent|emailed|mailed) you an? (?:secure |magic |one[- ]time )?(?:log ?in|sign[- ]?in|magic|access) link"
-    r"|check your (?:email|inbox) (?:for|to find) (?:a|the|your) (?:log ?in |sign[- ]?in |magic )?link", re.I)
+    r"|check your (?:email|inbox) (?:for|to find) (?:a|the|your) (?:log ?in |sign[- ]?in |magic )?link"
+    # Teamtailor, for an address it already knows: "Please click the verification link in the email to
+    # complete your application" -- the application is held until that link is opened (application 240).
+    r"|click (?:on )?the (?:verification|confirmation|activation) link in (?:the|your|this) e-?mail", re.I)
 # The link to follow in that mail, as opposed to its imprint and terms links.
 LOGIN_LINK_URL_RE = re.compile(r"log-?in|sign-?in|magic|verif|auth|token", re.I)
 LOGIN_LINK_QUESTION = "Sign-in link from the email (one-time)"
@@ -3993,8 +4383,7 @@ def confirmation_showing(page: Any) -> bool:
     The cheap half of wait_for_confirmation, for callers that only need to know what is on screen.
     """
     try:
-        url = (page.url or "").lower()
-        if any(h in url for h in CONFIRM_URL_HINTS):
+        if confirm_url(page.url or ""):
             return True
         body = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
         return any(t in body for t in CONFIRM_TEXTS)
@@ -4101,6 +4490,15 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
             if signature in seen_rejections:
                 # The same complaint after a repair means the repair achieved nothing, and a further
                 # identical submit would achieve nothing either.
+                log_field_outline(page, summary)
+                if _silent_bot_check(page, summary):
+                    # Greenhouse's "There was an error processing your application", with an invisible
+                    # reCAPTCHA on the page and every field valid: the site's own bot score refused the
+                    # submit (application 249). Nothing on the form is wrong, and nothing here should try
+                    # to get round it -- a person pressing Submit is what it is waiting for.
+                    raise NeedsHuman("The site's invisible bot check turned the submit down (every field is "
+                                     "filled). Press Submit yourself in the open window — the form is ready — "
+                                     "then click 'Mark applied' once it confirms.")
                 raise NeedsHuman(f"The form keeps refusing this application and jobbot has run out of ways "
                                  f"to fix it: {summary}. Correct it in the open window, then click "
                                  f"Continue — what you type there is remembered for next time.")

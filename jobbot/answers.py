@@ -199,6 +199,8 @@ PLACEHOLDER_VALUES: frozenset[str] = frozenset({
     "attach", "select", "select one", "select an option", "please select", "please choose", "choose",
     "choose one", "make a selection", "continue", "none", "nil", "n a", "na", "null", "-", "--", "---",
     "not applicable", "not specified", "none selected", "no selection", "pick one", "any",
+    # A search list's empty-state text, learned once as an answer to "Type to Add Skills" (applications 121, 251)
+    "no items", "no results", "no results found", "no matches", "no matches found", "no options", "type to search",
 })
 
 

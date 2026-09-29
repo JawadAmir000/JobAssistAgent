@@ -139,7 +139,9 @@ def extract_code(text: str, length: int = 8) -> str | None:
         return None
     # Case is preserved deliberately: Greenhouse mails codes like "yFENClG3", and an uppercased copy of that
     # is a different string. Matching stays case-insensitive; only the captured value is returned verbatim.
-    token = rf"([A-Za-z0-9]{{{length}}})"
+    # Bounded on both sides: "Enter the following code" gave "follow" -- the first six letters of the next
+    # word -- and Lumen's form was sent "follow" as its OTP (application 225).
+    token = rf"(?<![A-Za-z0-9])([A-Za-z0-9]{{{length}}})(?![A-Za-z0-9])"
     anchored = [
         rf"(?:verification|security|confirmation|access|one[- ]time)\s+code[^A-Za-z0-9]{{0,60}}{token}",
         rf"\bcode\s+(?:is|:)\s*[^A-Za-z0-9]{{0,10}}{token}",
@@ -148,9 +150,9 @@ def extract_code(text: str, length: int = 8) -> str | None:
         rf"\bapplication:\s*{token}",           # "paste this code into ... your application: yFENClG3"
     ]
     for pat in anchored:
-        m = re.search(pat, text, re.I)
-        if m:
-            return m.group(1)
+        for m in re.finditer(pat, text, re.I):
+            if not _is_word(m.group(1)):
+                return m.group(1)
     # Fallback: a standalone token of the right length that mixes letters and digits — prose does not.
     for m in re.finditer(rf"\b{token}\b", text):
         cand = m.group(1)
@@ -160,6 +162,12 @@ def extract_code(text: str, length: int = 8) -> str | None:
         if m.group(1).isdigit():
             return m.group(1)
     return None
+
+
+def _is_word(cand: str) -> bool:
+    """An ordinary word ("follow", "Please") rather than a code: all letters, and lower-case or capitalised.
+    Codes are digits, capitals, or Greenhouse's mixed case ("yFENClG3") -- never prose casing."""
+    return cand.isalpha() and (cand.islower() or cand.istitle())
 
 
 def _search_since(imap: imaplib.IMAP4_SSL, since: datetime) -> list[bytes]:

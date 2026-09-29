@@ -28,6 +28,17 @@ SUBMIT_NAMES = ("Submit Application", "Submit application", "Submit")
 
 FIELD_ENTRY = ".ashby-application-form-field-entry"
 QUESTION_TITLE = ".ashby-application-form-question-title"
+# Every question on the form. Most sit in a field-entry, but a radio-group question can be drawn as a bare
+# <div><fieldset class="…-input-radio-group"><label>Question</label>…</fieldset></div> with no entry round it:
+# Heidi's "What is your Work Authorization Status…?" was never walked, never asked, and the form bounced on
+# it every time (application 199).
+RADIO_GROUP = "fieldset.ashby-application-form-input-radio-group"
+# Edra's board draws the sponsorship question as <fieldset class="_fieldEntry_…"> with radios and no
+# ashby-* class at all (application 230), so any radio fieldset outside a field-entry is a question too.
+QUESTION_ENTRY = (f"{FIELD_ENTRY}, div:has(> {RADIO_GROUP}):not({FIELD_ENTRY} *), "
+                  f"fieldset:has(input[type=radio], input[type=checkbox]):not({FIELD_ENTRY} *):not({RADIO_GROUP})")
+# (checkboxes too: Thought Machine's required "By submitting this application I acknowledge…" is one such
+# fieldset holding a single "Yes" box, and was never ticked -- application 260)
 FORM_READY = f"#_systemfield_name, #_systemfield_email, {FIELD_ENTRY}"   # any visible == the form is open
 RESUME_INPUT = "#_systemfield_resume"
 LOCATION_ENTRY = f"{FIELD_ENTRY}[data-field-path='_systemfield_location']"
@@ -169,7 +180,7 @@ class AshbyAdapter(Adapter):
             log.debug("ashby location: %s", e)
 
     def _questions(self, ctx: ApplyContext) -> None:
-        entries = ctx.page.locator(FIELD_ENTRY)
+        entries = ctx.page.locator(QUESTION_ENTRY)
         for i in range(entries.count()):
             entry = entries.nth(i)
             path = ""
@@ -205,9 +216,12 @@ class AshbyAdapter(Adapter):
     @staticmethod
     def _required_missing(page) -> list[str]:
         try:
-            return page.evaluate("""() => [...document.querySelectorAll('.ashby-application-form-field-entry')]
+            return page.evaluate("""() => [...document.querySelectorAll('.ashby-application-form-field-entry,'
+                    + ' fieldset.ashby-application-form-input-radio-group:not(.ashby-application-form-field-entry *),'
+                    + ' fieldset:not(.ashby-application-form-field-entry *):not(.ashby-application-form-input-radio-group)')]
+                .filter(en => en.matches('.ashby-application-form-field-entry') || en.querySelector('input[type=radio], input[type=checkbox]'))
                 .filter(en => {
-                    const lab = en.querySelector('.ashby-application-form-question-title'); if (!lab) return false;
+                    const lab = en.querySelector('.ashby-application-form-question-title, :scope > label, :scope > legend'); if (!lab) return false;
                     const req = /required/i.test(lab.className) || /\*\s*$/.test(lab.innerText)
                              || !!en.querySelector('[aria-required=true],[required]');
                     if (!req) return false;
@@ -217,7 +231,7 @@ class AshbyAdapter(Adapter):
                         || !!en.querySelector('button[aria-pressed=true],button[aria-checked=true]')
                         || /\.(pdf|docx?|rtf|txt)\b/i.test(en.innerText);
                     return !has; })
-                .map(en => en.querySelector('.ashby-application-form-question-title').innerText.trim().replace(/\*$/, '').trim())""") or []
+                .map(en => en.querySelector('.ashby-application-form-question-title, :scope > label, :scope > legend').innerText.trim().replace(/\*$/, '').trim())""") or []
         except Exception:
             return []
 
@@ -240,6 +254,12 @@ class AshbyAdapter(Adapter):
             c.answer_and_set(ctx, combo.first, label, "combobox")
             return True
         choices = entry.locator("input[type=radio], input[type=checkbox]")
+        if choices.count() and c.choice_checked(entry) and c.error_for_field(c.form_errors(ctx.page), label):
+            # Ticked on the page and still "Missing entry for required field": the tick went into the DOM
+            # without reaching the form's own state, and a click on a radio that is already on fires nothing.
+            # Edra's sponsorship question bounced five submits this way (application 230).
+            c.reassert_choice(entry)
+            return True
         if choices.count():
             typ = (choices.first.get_attribute("type") or "radio").lower()
             opts = c.choice_options(entry)

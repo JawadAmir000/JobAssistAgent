@@ -67,7 +67,7 @@ PORTABLE = {"email_link", "verification_code", "account", "sso", "captcha", "con
 def unstick(ctx: ApplyContext, goal: str, fill: Callable[[], None] | None = None) -> str:
     """Get the application past the current page. See the module docstring for the outcomes."""
     page = ctx.page
-    before = observe.snapshot(page)
+    before = _settled_snapshot(page)
     verdict = _classify(ctx, before, goal)
     if not verdict:
         return ""
@@ -87,6 +87,37 @@ def unstick(ctx: ApplyContext, goal: str, fill: Callable[[], None] | None = None
     if source != "signal" or ok:
         playbook.remember(before, kind, press or "", ok=ok, lesson=kind in PORTABLE)
     return outcome
+
+
+_LOADING_RE = re.compile(r"^\W*(?:loading|please wait|one moment|just a moment)\b|\bloading\s*(?:\.{3}|…)", re.I)
+SETTLE_LIMIT_MS = 20000
+
+
+def _still_loading(snap: dict) -> bool:
+    """A page drawn before its content: nothing to fill or press, and either next to no text or a spinner's
+    own words. SuccessFactors shows "Loading..." for several seconds after Apply, and judged in that state it
+    was called a confirmation once and "not an application" once (applications 215 and 218)."""
+    if snap.get("fields"):
+        return False
+    text = (snap.get("text") or "").strip()
+    if _LOADING_RE.search(text[:400]):
+        return True     # a header link ("Employee Login") around a spinner is still a spinner
+    return len(text) < 200 and len(snap.get("controls") or []) <= 3
+
+
+def _settled_snapshot(page: Any) -> dict:
+    snap = observe.snapshot(page)
+    waited = 0
+    while _still_loading(snap) and waited < SETTLE_LIMIT_MS:
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:  # noqa: BLE001 - closed: judge what we have
+            break
+        waited += 1500
+        snap = observe.snapshot(page)
+    if waited:
+        log.info("planner: waited %.1fs for the page to finish loading", waited / 1000)
+    return snap
 
 
 # ---------- classify ----------

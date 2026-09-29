@@ -228,6 +228,11 @@ class LinkedInAdapter(Adapter):
         """Click Apply and return wherever LinkedIn sends us — a popup, or this tab leaving linkedin.com."""
         btn = self._apply_control(page)
         if btn is None:
+            # The "Application status" card is drawn a few seconds after domcontentloaded, so the early
+            # applied_notice check in apply() can run before it exists. No Apply button is exactly what an
+            # already-sent application looks like: give the card time to arrive before asking the user.
+            if not self._signed_out(page) and (notice := wait_applied_notice(page)):
+                raise AlreadyApplied(f"LinkedIn says this application is already in ({notice}).")
             raise NeedsHuman(SIGNED_OUT if self._signed_out(page) else
                              "No Apply button found on this LinkedIn page. Apply in the browser window, "
                              "then click Continue.")
@@ -262,15 +267,36 @@ def applied_notice(page) -> str:
 
     Matched on an element's whole text rather than a substring, so the phrase inside a job description
     ("...once your application is submitted, we will...") cannot trip it.
+
+    Any text element, not a fixed list of tags: the 2026 job page prints "Application submitted" in a
+    bare <p>, which a 'button, span, div, h2, h3' scan never looked at -- application 192 was asked for
+    by hand eight times with the card in plain view.
     """
     try:
         return c.clean(page.evaluate(
-            "() => {" + c.DEEP_JS + " const t = deepAll('button, span, div, h2, h3')"
-            ".map(e => (e.innerText || '').trim())"
-            ".find(t => /^applied( \\d+ .* ago)?$/i.test(t)"
-            "        || /^application submitted$/i.test(t)); return t || ''; }"))
+            # A bare "Applied" only off links and out of the page chrome: LinkedIn's own "My jobs > Applied"
+            # tracker link says exactly that on every job page, and would read as this job being applied to.
+            "() => {" + c.DEEP_JS + " const hit = deepAll('button, span, div, p, li, strong, a, h2, h3, h4')"
+            ".find(e => { const t = (e.innerText || '').trim();"
+            "   if (/^application submitted$/i.test(t)) return true;"
+            "   return /^applied( \\d+ .* ago)?$/i.test(t) && !deepClosest(e, 'a, nav, header, [role=navigation], [role=menu]'); });"
+            " return hit ? (hit.innerText || '').trim() : ''; }"))
     except Exception:  # noqa: BLE001
         return ""
+
+
+def wait_applied_notice(page, timeout_ms: int = 8000) -> str:
+    """applied_notice, polled until LinkedIn has had time to render the status card."""
+    while True:
+        if notice := applied_notice(page):
+            return notice
+        if timeout_ms <= 0:
+            return ""
+        try:
+            page.wait_for_timeout(500)
+        except Exception:  # noqa: BLE001 - a closed page has no notice; the caller's own checks report it
+            return ""
+        timeout_ms -= 500
 
 
 # ============================== Easy Apply ==============================
@@ -293,7 +319,10 @@ def applied_notice(page) -> str:
 #   * nothing may close the modal. Its X asks "discard this application?", and an application discarded
 #     halfway is not a pause the user can come back to — so the walker only ever presses buttons it named.
 
-EASY_DIALOG = "div[role=dialog]"
+# Two builds of the modal are live at once: the older <div role=dialog>, and (from Sep 2026) a native
+# <dialog open> with no role, hashed class names and a Next button that has no aria-label. Every scope
+# below goes through this one selector so both are walked the same way.
+EASY_DIALOG = ":is(div[role=dialog], dialog[open])"
 # Which dialog is the application. LinkedIn draws others on the same page — the sign-in modal a signed-out
 # visitor gets, a "save this search" prompt, a cookie notice — and every one of them is role=dialog with
 # fields in it, so "a dialog is open" is not a test at all: it would have walked a sign-in panel as though
@@ -308,6 +337,11 @@ EASY_MODAL_SEL = ", ".join((
     "div[role=dialog]:has([aria-label='Continue to next step' i])",
     "div[role=dialog]:has([aria-label='Review your application' i])",
     "div[role=dialog]:has([aria-label='Submit application' i])",
+    # The native-<dialog> build carries none of the markers above. What it does carry is its header,
+    # "Apply to <Company>" -- no sign-in, cookie or job-alert dialog says that. Application 178 sat in
+    # "LinkedIn did not open the Easy Apply form" three times with the form open on screen.
+    f"{EASY_DIALOG}:has(header:has-text('Apply to'))",
+    f"{EASY_DIALOG}:has(h2:has-text('Apply to'))",
 ))
 # Both spellings of every wizard control: the accessible name LinkedIn gives it, and the word it prints,
 # for a build (or a test page) that labels the button the plain way.
@@ -370,7 +404,15 @@ class EasyApplyWalker(GenericFormAdapter):
 
             signature = self._signature(page)
             if not self._press(dialog, self.next_names):
-                raise self._no_way_on(dialog)
+                # The first step of a freshly opened modal can still be animating in, its Next not yet
+                # enabled: Coforge paused on "offers no Next or Submit" with Next on screen and went through
+                # untouched on Retry (application 234). One settle, re-found, before giving up.
+                page.wait_for_timeout(EASY_STEP_SETTLE_MS)
+                dialog = self._dialog(page)
+                if self._button(dialog, self.submit_names) is not None:
+                    continue
+                if not self._press(dialog, self.next_names):
+                    raise self._no_way_on(dialog)
             page.wait_for_timeout(EASY_STEP_SETTLE_MS)
             if self._confirmed(page):
                 ctx.step("Submitted")
@@ -426,6 +468,8 @@ class EasyApplyWalker(GenericFormAdapter):
         if btn is None:
             if LinkedInAdapter._signed_out(page):
                 raise NeedsHuman(SIGNED_OUT)
+            if notice := wait_applied_notice(page):
+                raise AlreadyApplied(f"LinkedIn says this application is already in ({notice}).")
             # Signed in and still no Apply control: LinkedIn renames and re-lays-out this card often, and
             # "No Apply button found on this LinkedIn page" is the second most common blocker in the
             # issues table. Let the model name the control before the page is handed back.
@@ -505,7 +549,9 @@ class EasyApplyWalker(GenericFormAdapter):
                 // every heading, not the first: the modal's own title ("Apply to Acme") is the first
                 // one and is the same on every step, while the step's own name sits below it.
                 const head = deepIn(modal, 'h1, h2, h3, h4').map(txt).join('/');
-                const progress = deepIn(modal, 'progress').map(p => p.value).join(',');
+                // <progress> on the old build; the native-<dialog> build draws an SVG bar and prints "2/4 pages"
+                const progress = deepIn(modal, 'progress').map(p => p.value).join(',') +
+                    ((txt(modal).match(/\d+\s*\/\s*\d+\s*pages?/i) || [''])[0]);
                 const labels = deepIn(modal, 'label, legend').map(txt).join('|').slice(0, 300);
                 return head + '|' + progress + '|' + labels;
             }""", EASY_DIALOG)
@@ -515,11 +561,21 @@ class EasyApplyWalker(GenericFormAdapter):
     @staticmethod
     def _heading(page) -> str:
         """The step's own title ("Contact info", "Additional questions"), for the progress line."""
+        # The last *visible* heading that is not the modal's own "Apply to <Company>" title: the native
+        # <dialog> build keeps a hidden "0 notifications" <h2> inside the modal, and the progress line
+        # read "Easy Apply — 0 notifications" on every step.
         try:
-            return c.clean(page.locator(f"{EASY_DIALOG} h1, {EASY_DIALOG} h2, {EASY_DIALOG} h3").last
-                           .inner_text(timeout=c.SHORT))[:60]
+            heads = page.locator(f"{EASY_DIALOG} :is(h1, h2, h3)")
+            for i in range(min(heads.count(), 12) - 1, -1, -1):
+                h = heads.nth(i)
+                if not c.is_visible_now(h):
+                    continue
+                t = c.clean(h.inner_text(timeout=c.SHORT))
+                if t and not t.lower().startswith("apply to") and not re.match(r"^\d+ notifications?$", t, re.I):
+                    return t[:60]
         except Exception:  # noqa: BLE001
-            return ""
+            pass
+        return ""
 
     def _no_way_on(self, dialog) -> Exception:
         """Why there was no Next to press. A disabled Next means the step is still missing something, and

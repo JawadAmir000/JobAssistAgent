@@ -141,6 +141,14 @@ IDENTITY: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(last|family|sur)\s*name\b|\bnom\s+de\s+famille\b|^\s*nom\s*[*:]?\s*$|\bnachname\b|\bfamilienname\b"
                 r"|\bapellidos?\b|\bachternaam\b|\bcognome\b|\bsobrenome\b", re.I), "identity.last_name"),
     (re.compile(r"\bmiddle\s*name\b", re.I), ""),                       # skip: nothing truthful to put here
+    # Somebody else's contact detail: "Has someone at Cursor referred you? If so, please include their email"
+    # was given the candidate's own address (application 265). A referrer, reference or manager is not us.
+    (re.compile(r"^(?=.*\b(?:e-?mail|phone|name|contact)\b)(?!.*\bsource\b).*"
+                r"\b(?:referr(?:ed|er|al)|refer(?:red)?\s+you|reference|referee|manager|supervisor|recruiter|"
+                r"emergency\s+contact|their\s+(?:e-?mail|phone|name)|who\s+referred)\b", re.I), ""),
+    # A phone *extension* is not the phone: AGF's Workday "Phone Extension" got the number typed into it
+    # (application 251). Mobile numbers have no extension; leave it empty.
+    (re.compile(r"\b(?:phone\s*)?extension\b|\bext\.?\s*$", re.I), ""),
     # Name fields for a script we do not write in. Workday asks for both ("Bengali Given Name(s)" next to
     # "Given Name(s) - Western Script"), and the Latin name belongs in exactly one of them.
     (re.compile(r"\b(?:bengali|bangla|chinese|japanese|kanji|katakana|hiragana|hangul|korean|cyrillic|"
@@ -322,11 +330,22 @@ class GenericFormAdapter(Adapter):
         self._login_link(ctx)
         page = ctx.page
 
+        if self._hand_off(ctx):
+            return
         if self._already_in_flow(ctx):
             ctx.step("Continuing where it left off")
         else:
             ctx.step("Looking for the application form")
-            self._open_form(ctx)
+            try:
+                self._open_form(ctx)
+            except (NeedsHuman, ApplyError):
+                # An employer's own careers page whose Apply leads into a vendor this module is not: the
+                # page is now the vendor's, and its adapter knows the sign-in, the steps and the prompts.
+                if self._hand_off(ctx):
+                    return
+                raise
+            if self._hand_off(ctx):
+                return
         page = ctx.page
 
         for page_no in range(1, self.max_pages + 1):
@@ -334,6 +353,7 @@ class GenericFormAdapter(Adapter):
             c.dismiss_cookie_banner(page)
             c.detect_captcha(page)
             c.detect_bot_block(page)
+            c.detect_sms_2fa(page)
             if self._login_link(ctx):
                 page = ctx.page
                 continue
@@ -577,7 +597,144 @@ class GenericFormAdapter(Adapter):
 
         ctx.step("Answering the form")
         self._questions(ctx)
+        self._toggle_groups(ctx)
+        self._aria_radio_groups(ctx)
         c.fill_calendar(ctx)
+
+    # A question answered by pressing one of a row of buttons ("Yes" "No"), each an ARIA toggle
+    # (aria-pressed) rather than a radio. Oracle Recruiting draws its Application Questions this way, and a
+    # walker that only knows inputs left both of Presight's required Yes/No questions blank and bounced on
+    # "There are 4 issues that need your attention" (application 221). Ashby does the same; ashby.py has
+    # its own copy of this for its own markup.
+    _TOGGLE_GROUPS_JS = r"""(scope) => {
+        const vis = el => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+        const root = document.querySelector(scope) || document.body;
+        const groups = new Map();
+        for (const b of root.querySelectorAll('button[aria-pressed], [role=button][aria-pressed]')) {
+            if (!vis(b)) continue;
+            const p = b.parentElement;
+            if (!p) continue;
+            if (!groups.has(p)) groups.set(p, []);
+            groups.get(p).push(b);
+        }
+        const out = [];
+        let n = 0;
+        for (const [p, bs] of groups) {
+            if (bs.length < 2 || bs.length > 8) continue;
+            const id = 'jobbot-toggle-' + (n++);
+            p.setAttribute('data-jobbot-toggle', id);
+            out.push({id: id, pressed: bs.some(b => b.getAttribute('aria-pressed') === 'true'),
+                      options: bs.map(b => (b.innerText || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())});
+        }
+        return out;
+    }"""
+
+    # Radios drawn as ARIA widgets with no <input> anywhere under them. SmartRecruiters' <spl-radio-group>
+    # holds <spl-radio role=radio aria-checked> custom elements inside shadow roots, the question in a
+    # light-DOM <span slot="label">; a walker that collects inputs saw no question at all, and ServiceNow's
+    # required "…Government entity?" bounced the submit as "This field is required." (application 222).
+    _ARIA_RADIO_JS = r"""(scope) => {""" + c.DEEP_JS + r"""
+        // A component host is often laid out as display:contents and measures 0x0; what it draws lives in
+        // its shadow root, so that is where "on screen" is decided.
+        const box = el => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+        const vis = el => box(el) || !!(el.shadowRoot && [...el.shadowRoot.querySelectorAll('*')].some(box));
+        const text = n => ((n && (n.innerText || n.textContent)) || '').replace(/\s+/g, ' ').trim();
+        const groups = new Map();
+        for (const r of deepAll('[role=radio]')) {
+            if (r.matches('input') || r.querySelector('input[type=radio]') || !vis(r)) continue;
+            const g = deepClosest(r.parentNode && (r.parentNode.host || r.parentNode), '[role=radiogroup], fieldset')
+                      || r.parentElement || (r.parentNode && r.parentNode.host);
+            if (!g) continue;
+            if (!groups.has(g)) groups.set(g, []);
+            if (!groups.get(g).includes(r)) groups.get(g).push(r);
+        }
+        const out = [];
+        let n = 0;
+        for (const [g, rs] of groups) {
+            if (rs.length < 2) continue;
+            // The group's question: its own name, else a slotted label on the component that hosts it.
+            let host = g; for (let h = g; h; h = h.getRootNode && h.getRootNode().host) host = h;
+            const byId = id => { const root = g.getRootNode(); return (root.getElementById ? root.getElementById(id) : null) || document.getElementById(id); };
+            let label = g.getAttribute('aria-label') || '';
+            const lb = g.getAttribute('aria-labelledby');
+            if (!label && lb) label = lb.split(/\s+/).map(i => text(byId(i))).join(' ');
+            for (let h = rs[0]; !label && h; h = h.parentElement || (h.parentNode && h.parentNode.host)) {
+                // "label" on some builds, "label-content" on SmartRecruiters' spl-radio-group
+                const slotted = h.querySelector && h.querySelector(':scope > [slot=label], :scope > [slot=label-content]');
+                if (slotted) label = text(slotted);
+                if (h === host) break;
+            }
+            const id = 'jobbot-ariaradio-' + (n++);
+            rs.forEach((r, i) => r.setAttribute('data-jobbot-ariaradio', id + '-' + i));
+            out.push({id: id, label: label.replace(/\s*\*\s*$/, ''),
+                      checked: rs.some(r => r.getAttribute('aria-checked') === 'true'),
+                      // spl-radio carries its words in label="Yes"; value="1" is what it submits
+                      options: rs.map(r => text(r) || r.getAttribute('aria-label') || r.getAttribute('label') || '')});
+        }
+        return out;
+    }"""
+
+    def _aria_radio_groups(self, ctx: ApplyContext) -> None:
+        page = ctx.page
+        try:
+            groups = page.evaluate(self._ARIA_RADIO_JS, self.scope) or []
+        except Exception as e:  # noqa: BLE001
+            return
+        for g in groups:
+            opts = [c.clean(o) for o in g.get("options") or []]
+            label = c.strip_required(c.clean(g.get("label") or ""))
+            if g.get("checked") or len([o for o in opts if o]) < 2 or not label:
+                continue
+            ans = ctx.answer(label, [o for o in opts if o], "radio")
+            if not ans:
+                continue
+            idx = next((i for i, o in enumerate(opts) if o and c.same_option(o, ans)), None)
+            if idx is None:
+                raise NeedsHuman(f"'{label}' has no option jobbot could match to {ans!r} (it offers: "
+                                 f"{', '.join(o for o in opts[:8] if o)}). Pick the right one here, or click it in "
+                                 "the browser window and click Continue — it is remembered for next time.",
+                                 question=label, options=[o for o in opts if o][:25], kind="radio")
+            radio = page.locator(f"[data-jobbot-ariaradio='{g['id']}-{idx}']").first
+            try:
+                radio.click(timeout=c.MEDIUM)
+                page.wait_for_timeout(200)
+                log.info("generic: %r -> %r", label[:60], opts[idx])
+            except Exception as e:  # noqa: BLE001
+                log.warning("generic: could not pick %r for %r: %s", opts[idx], label[:60], str(e)[:80])
+
+    def _toggle_groups(self, ctx: ApplyContext) -> None:
+        page = ctx.page
+        try:
+            groups = page.evaluate(self._TOGGLE_GROUPS_JS, self.scope if self.scope != "body" else "body") or []
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: toggle groups: %s", e)
+            return
+        for g in groups:
+            opts = [o for o in g.get("options") or [] if o]
+            if g.get("pressed") or len(opts) < 2:
+                continue
+            box = page.locator(f"[data-jobbot-toggle='{g['id']}']").first
+            if c.in_chat_widget(box):
+                continue
+            label = c.strip_required(c.get_label_for(box))
+            if not label or label in opts:
+                continue
+            ans = ctx.answer(label, opts, "radio")
+            if not ans:
+                continue
+            pick = next((o for o in opts if c.same_option(o, ans)), None)
+            if pick is None:
+                raise NeedsHuman(f"'{label}' has no button jobbot could match to {ans!r} (it offers: "
+                                 f"{', '.join(opts[:8])}). Pick the right one here, or click it in the browser "
+                                 "window and click Continue — it is remembered for next time.",
+                                 question=label, options=opts[:25], kind="radio")
+            btn = box.locator("button[aria-pressed], [role=button][aria-pressed]").nth(opts.index(pick))
+            try:
+                btn.click(timeout=c.MEDIUM)
+                page.wait_for_timeout(200)
+                log.info("generic: %r -> pressed %r", label[:60], pick)
+            except Exception as e:  # noqa: BLE001
+                log.warning("generic: could not press %r for %r: %s", pick, label[:60], str(e)[:80])
 
     def _verification(self, ctx: ApplyContext) -> bool:
         """True when this step was an emailed code and it has now been typed in.
@@ -1008,6 +1165,14 @@ class GenericFormAdapter(Adapter):
                     # applications 135-138 did, and the widget answered by resetting itself to +971.
                     continue
                 value = phone_value     # the national part wherever the form holds the code itself
+                if current and value and current != value and c.error_for_field(errors, label):
+                    # The right number in a shape the form refuses: AGF's Workday kept the CV parse's
+                    # "+880 177 161 4053" beside its own country-code prompt and said "Enter a valid format
+                    # for Phone Number" on every save (application 251). The rule below leaves any shape of
+                    # the same number alone; a rejection is the one time the shape matters.
+                    log.info("phone field %r holds %r and the form refuses it; writing %r", label, current, value)
+                    c.fill_if_empty(el, value, clear=True)
+                    continue
                 if current and c.same_phone(current, raw_phone):
                     continue    # the same number in another shape — a form (or an employer profile) that
                                 # keeps the dial code apart shows only the national part. Not a correction,
@@ -1036,9 +1201,20 @@ class GenericFormAdapter(Adapter):
                 c.fill_if_empty(el, value, clear=True)
                 continue
             if current and value and not c.same_value(current, value) and not c.error_for_field(errors, label):
+                # A <select> identity field (LinkedIn's "Email address" is a list of the account's
+                # addresses) is not a box the user typed over: pick ours when it is on offer, and when it is
+                # not, report it *with* its options so the learn-back can see the control chose for itself.
+                if self._is_select(el):
+                    opts = c.select_options(el)
+                    if c.choose_select(el, value, opts):
+                        continue
+                    ctx.seen(current, label, kind="select", options=opts,
+                             default=c._unchanged_identity(ctx, label, current))
+                    continue
                 # The user typed something else into this field in the window. It is their correction, not
-                # ours to overwrite, and facts.yaml is where the next application will read it from.
-                ctx.seen(current, label, kind="text")
+                # ours to overwrite, and facts.yaml is where the next application will read it from -- unless
+                # it is exactly what the field held when jobbot first saw it (see common._unchanged_identity).
+                ctx.seen(current, label, kind="text", default=c._unchanged_identity(ctx, label, current))
                 continue
             if key == "identity.phone":
                 log.info("phone field %r: form holds the dial code %r, writing %r (was %r)",
@@ -1064,6 +1240,32 @@ class GenericFormAdapter(Adapter):
                 c.fill_verified(el, value)
                 if key in LOCATION_KEYS:
                     self._settle_suggestions(page, value)
+
+    def _hand_off(self, ctx: ApplyContext) -> bool:
+        """Pass the application to the adapter that owns the page it is on now, when that is not this
+        walker. accenture.com's "Apply" opens Accenture's Workday tenant; the generic walker, which has no
+        idea of Workday's account step, called it "an account in a shape jobbot does not recognise" four
+        times (application 226) while workday.py signs into exactly that page by itself."""
+        from jobbot.apply.base import detect_ats, get_adapter_for
+        url = getattr(ctx.page, "url", "") or ""
+        ats = detect_ats(url)
+        if ats in ("other", "", None) or ctx.extra.get("handed_off_to") == ats:
+            return False
+        adapter = get_adapter_for(ats)
+        if adapter is None or isinstance(adapter, GenericFormAdapter) or type(adapter) is type(self):
+            return False
+        ctx.extra["handed_off_to"] = ats
+        log.info("generic: the application moved to %s (%s); handing it to that adapter", ats, url[:100])
+        ctx.step(f"Handing over to the {ats} form")
+        adapter.apply(replace(ctx, job={**ctx.job, "ats": ats, "url": url}))
+        return True
+
+    @staticmethod
+    def _is_select(el) -> bool:
+        try:
+            return (el.evaluate("e => e.tagName") or "").lower() == "select"
+        except Exception:  # noqa: BLE001
+            return False
 
     @staticmethod
     def _from_cv(ctx: ApplyContext, value: str) -> bool:
@@ -1141,6 +1343,8 @@ class GenericFormAdapter(Adapter):
                     continue
                 if typ == "file":
                     continue        # the CV goes through upload_resume, the letter through fill_cover_letter
+                if c.in_chat_widget(el):
+                    continue        # a chatbot's reply box: typing there sends a message (see common)
                 if typ in ("radio", "checkbox"):
                     self._choice(ctx, el, typ, handled_groups)
                     continue
@@ -1200,6 +1404,17 @@ class GenericFormAdapter(Adapter):
         # its own name — its aria label, or the question written above it. Rippling has no fieldset and no
         # <label> anywhere near its groups, so the fallbacks below found the option "Yes" as the question.
         aria_group = el.locator("xpath=ancestor::*[@role='radiogroup' or @role='group'][1]")
+        # The nearer wrapper wins. Workday puts a whole section in a role=group and each question in its own
+        # <fieldset><legend>; taking the group named "Have you previously worked for AGF?" after the
+        # "How Did You Hear About Us?" written above the section, and the source rule then refused Yes/No
+        # (application 251).
+        try:
+            if aria_group.count() and el.evaluate(
+                    "e => { const f = e.closest('fieldset'), g = e.closest('[role=radiogroup], [role=group]');"
+                    "       return !!(f && g && g !== f && g.contains(f)); }"):
+                aria_group = el.locator("xpath=ancestor::fieldset[1]")
+        except Exception:  # noqa: BLE001
+            pass
         container = aria_group
         if container.count() == 0:
             container = el.locator("xpath=ancestor::fieldset[1]")
@@ -1311,8 +1526,7 @@ class GenericFormAdapter(Adapter):
     @staticmethod
     def _confirmed(page) -> bool:
         try:
-            url = (page.url or "").lower()
-            if any(h in url for h in c.CONFIRM_URL_HINTS):
+            if c.confirm_url(page.url or ""):
                 return True
             body = c.clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
             return any(t in body for t in c.CONFIRM_TEXTS)

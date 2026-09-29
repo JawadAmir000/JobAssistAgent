@@ -109,7 +109,7 @@ _LOADED = False
 # because the adapters bind them by name at import and would otherwise keep pointing at the old copies.
 # credentials is here for the same reason the rest are: a password rule it learns (a form's length cap, say)
 # is useless if it only takes effect after a restart, and a restart is what closes the parked window.
-_RELOADABLE = ("jobbot.answers", "jobbot.credentials", "jobbot.apply.common", "jobbot.apply.resolver",
+_RELOADABLE = ("jobbot.answers", "jobbot.credentials", "jobbot.mail", "jobbot.apply.common", "jobbot.apply.resolver",
                "jobbot.apply.account", "jobbot.apply.navigator", "jobbot.apply.observe",
                "jobbot.apply.playbook", "jobbot.apply.planner",
                "jobbot.apply.generic",

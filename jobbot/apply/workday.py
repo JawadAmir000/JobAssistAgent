@@ -140,6 +140,10 @@ ACCOUNT_UNVERIFIED = re.compile(
     r"|request a verification email|check your email to verify", re.I)
 
 
+class _SkillsAdded(Exception):
+    """_search_skills filled a skills prompt itself; nothing is left for _fill_prompt to pick."""
+
+
 @register
 class WorkdayAdapter(Adapter):
     ats = "workday"
@@ -469,6 +473,7 @@ class WorkdayAdapter(Adapter):
                 if errors:
                     log.warning("workday: '%s' was refused (%s); filling it again", heading, errors[:3])
                     ctx.step(f"Workday: {heading or 'step'} bounced — filling it again")
+                    c.strip_illegal_characters(page, errors)
                     self._fill_step(ctx)
                     before = self._state(page)
                     self._click_first(page, NEXT)
@@ -721,7 +726,10 @@ class WorkdayAdapter(Adapter):
         if not options:
             # Nothing on the menu: this is the other kind of prompt, one that only lists what you have
             # typed a query for. See _search_prompt.
-            options = self._search_prompt(ctx, page, box, label)
+            try:
+                options = self._search_prompt(ctx, page, box, label)
+            except _SkillsAdded:
+                return
         seen: list[str] = []
         for _ in range(PROMPT_LEVELS):
             if not options:
@@ -735,10 +743,21 @@ class WorkdayAdapter(Adapter):
             if match is None:
                 break
             match.click(timeout=c.MEDIUM)
-            page.wait_for_timeout(PROMPT_WAIT)
-            if answered(box):
-                return
+            # A leaf takes a moment to become the box's value. Read the next "level" too early and it is
+            # whatever other list is still on screen: AGF's "How Did You Hear About Us?" took LinkedIn, and the
+            # walk then read a Yes/No menu as LinkedIn's children and paused on it (application 251).
+            for _ in range(3):
+                page.wait_for_timeout(PROMPT_WAIT)
+                if answered(box):
+                    return
             options = self._prompt_options(page)    # the click opened the next level of the tree
+            if options and texts and not any(t in texts for t, _ in options) and \
+                    all(PLACEHOLDER_RE.match(t) or t.lower() in ("yes", "no") for t, _ in options):
+                log.info("workday: %r — the list after %r is a Yes/No menu, not its children; stopping here",
+                         label, answer)
+                if answered(box):
+                    return
+                break
         raise NeedsHuman(
             f"jobbot could not pick a value for '{label}' from this Workday list"
             + (f" (it offered: {', '.join(seen[:8])})" if seen else " (the list did not open)")
@@ -759,6 +778,8 @@ class WorkdayAdapter(Adapter):
         then its first word, because "Amazon Bedrock AgentCore" matches nothing in a list that holds
         "Amazon Web Services" while "Amazon" matches plenty.
         """
+        if re.search(r"\bskills?\b", label, re.I):
+            return self._search_skills(ctx, page, box, label)
         try:
             query = c.clean(ctx.answer(label, None, "text"))
         except NeedsHuman:
@@ -786,6 +807,48 @@ class WorkdayAdapter(Adapter):
                      label, term, len(options))
             if options:
                 return options
+        return []
+
+    def _search_skills(self, ctx: ApplyContext, page, box, label: str) -> list:
+        """Add the candidate's skills to a "Type to Add Skills" prompt, from facts.yaml's skills list.
+
+        A skills box is a multi-select of the employer's own skill names, and the answer to it is a list, not a
+        sentence: asked as a question it came back as "No Items." -- the list's own empty text, cached from an
+        earlier run -- and AGF's step stopped on it (application 251). Each skill is searched for and the
+        first offered option whose name contains it is added; returns [] so the caller's walk ends here."""
+        added = 0
+        for skill in [str(x) for x in (ctx.facts.get("skills") or [])][:8]:
+            term = re.split(r"[/(]", skill)[0].strip()
+            if len(term) < 2:
+                continue
+            try:
+                box.click(timeout=c.SHORT)
+                box.fill("", timeout=c.SHORT)
+                box.press_sequentially(term, delay=40, timeout=c.MEDIUM)
+                box.press("Enter", timeout=c.SHORT)
+            except Exception as e:  # noqa: BLE001
+                log.debug("workday: typing skill %r: %s", term, e)
+                continue
+            page.wait_for_timeout(PROMPT_WAIT)
+            options = self._prompt_options(page)
+            pick = next((el for text, el in options if term.lower() in text.lower()), None)
+            if pick is None:
+                continue
+            try:
+                pick.click(timeout=c.MEDIUM)
+                added += 1
+                page.wait_for_timeout(400)
+            except Exception as e:  # noqa: BLE001
+                log.debug("workday: adding skill %r: %s", term, e)
+            if added >= 5:
+                break
+        log.info("workday: %r — added %d skill(s) from facts.yaml", label, added)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001
+            pass
+        if added:
+            raise _SkillsAdded()
         return []
 
     def _open_prompt(self, page, box) -> list:

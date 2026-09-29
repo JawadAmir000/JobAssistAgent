@@ -179,6 +179,21 @@ _SOURCE_QUESTION_RE = re.compile(
 
 DEFAULT_JOB_SOURCE = "LinkedIn"
 
+# Dial codes for the countries a candidate is likely to live in, keyed by lower-case country name. Only used
+# to split facts.yaml's own phone number into its national part.
+_DIAL_CODES: dict[str, str] = {
+    "bangladesh": "880", "india": "91", "pakistan": "92", "sri lanka": "94", "nepal": "977",
+    "united states": "1", "canada": "1", "united kingdom": "44", "australia": "61", "new zealand": "64",
+    "singapore": "65", "malaysia": "60", "united arab emirates": "971", "saudi arabia": "966", "qatar": "974",
+    "germany": "49", "france": "33", "netherlands": "31", "ireland": "353", "spain": "34", "italy": "39",
+}
+
+# Rule answers that lists spell differently. Keyed and valued in normalize_question form.
+_OPTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "mobile": ("cell", "cell phone", "cellular", "mobile phone", "mobile cell", "cellphone", "handy"),
+    "personal": ("home", "private", "personal email"),
+}
+
 # "If yes, please explain" — a follow-up that only applies when the PREVIOUS answer was the trigger.
 # Scale AI's form asked this under a non-compete question answered "No", and the bot wrote a paragraph about
 # visa sponsorship into it. A conditional field whose condition was not met must be left empty.
@@ -788,6 +803,15 @@ class Resolver:
                                           r"|\bunauthori[sz]ed\b|\bno (?:work )?authori", low))
             if says_auth and authorized_now is not None:
                 score += 1 if (not auth_negated) == authorized_now else -2
+            # A status picker ("Citizen / Visa Holder / Permanent Resident / Other", Heidi on Ashby,
+            # application 199) names statuses rather than making claims in sentences. Where the candidate is
+            # not authorised, holding a visa there is as false as citizenship, and the catch-all is the one
+            # true pick -- without these two terms every option scored 0 or less and the run stopped to ask.
+            if authorized_now is False and not says_sponsor:
+                if re.search(r"\b(?:visa holder|work visa|work permit|temporary resident|holds? a visa)\b", low):
+                    score -= 2
+                elif re.fullmatch(r"\s*(?:other|none|none of the above|neither|not applicable|n a)\s*", low):
+                    score += 1
             scored.append((score, o))
         if not scored:
             return None
@@ -1000,6 +1024,21 @@ class Resolver:
         for o in options:
             if normalize_question(o) == nv:
                 return o
+        # A numbered list ("5 - Bachelors") and a degree named by its level: AGF's Workday "Degree" list did
+        # not match "Bachelor's Degree" and stopped to ask (application 251).
+        unnum = {re.sub(r"^\s*\d+\s*[-.):]?\s*", "", normalize_question(o)): o for o in options}
+        if nv in unnum:
+            return unnum[nv]
+        level = re.search(r"\b(bachelor|master|doctor|phd|associate|diploma)", nv)
+        if level:
+            hits = [o for n, o in unnum.items() if re.search(rf"\b{level.group(1)}", n)]
+            if len(hits) == 1:
+                return hits[0]
+        # The same thing under the other names lists give it ("Mobile" is "Cell" on some Workday tenants).
+        for alias in _OPTION_ALIASES.get(nv, ()):
+            for o in options:
+                if normalize_question(o) == alias:
+                    return o
         # fuzzy option match (e.g. "5" vs "5+ years", "Bangladesh" vs "Bangladesh (BD)")
         best, best_score = None, 0
         for o in options:
@@ -1038,12 +1077,50 @@ class Resolver:
         f = self.fact_str
         auth = self.fact("authorization", {}) or {}
 
+        # --- legal age ---
+        # "Are you over the age of 18?" -- facts.yaml keeps no date of birth, only identity.over_18 (derived from
+        # the education dates). AGF's Workday stopped to ask it (application 251).
+        if re.search(r"\b(?:over|at least|older than)\s+(?:the\s+)?(?:age\s+of\s+)?(?:18|eighteen|21|twenty one)\b"
+                     r"|\b(?:18|21)\s+years?\s+(?:of\s+age|old)\s+or\s+older\b|\blegal\s+(?:working\s+)?age\b", key):
+            over = self.fact("identity.over_18", None)
+            if over is not None:
+                return "Yes" if over else "No"
+
+        # --- the date of signing ---
+        # "Today's date" beside a signature box. The model answered "2026-02-01" on 2026-09-29 and the cache
+        # kept it for every later form (application 222, ServiceNow): a date is a fact of the day, never a
+        # guess and never a memory. ISO, which date boxes and free text both take.
+        if re.fullmatch(r"(?:today s|todays|today|current|signature|signing|submission|application)\s+date"
+                        r"|date(?:\s+(?:of\s+)?(?:signature|signing|today|submission|application))?|date signed"
+                        r"|date \(?(?:dd mm yyyy|mm dd yyyy|yyyy mm dd)\)?", key):
+            from datetime import date
+            return date.today().isoformat()
+
         # --- consent boxes ("I accept", "I have read the privacy notice", "I certify the above is true") ---
         # Ticking these is the price of applying at all; there is no honest "No" that still submits. Since
         # 2026-09-15 the optional opt-ins beside them are taken too, at the user's instruction, so that
         # nothing stops on a tickbox. Ahead of every other rule, and is_agreeable keeps claims of fact out.
         if is_agreeable(key):
             return "Yes"
+
+        # "Are you a citizen or permanent resident of Cuba, Syria, Iran…? (…export control authorizations)" --
+        # an export-control screen, a yes/no about a list of countries. It fell to the "authoriz" rule below
+        # on the word in its footnote, found no country there, and ServiceNow's form stopped to ask
+        # (application 222). Yes only when the list names the citizenship or the country lived in.
+        cit = str(auth.get("citizenship") or "").strip()
+        # Any wording of it: Telnyx's "OFAC: Please indicate whether you are either a citizen or lawful
+        # permanent resident of any of the following countries: Cuba, Crimea, Iran…" (application 241).
+        _sanctions = re.findall(r"\b(?:cuba|syria|iran|north korea|crimea|sudan|russia|belarus|venezuela|donetsk|luhansk)\b", key)
+        if cit and ((re.match(r"^(?:are|is)\s+(?:you|the candidate)\s+(?:a\s+)?(?:citizen|national|(?:lawful\s+)?permanent\s+resident)\b", key))
+                    or (has("citizen", "permanent resident") and len(set(_sanctions)) >= 2)):
+            mine = [x.lower() for x in (cit, f("identity.country")) if x]
+            if any(re.search(rf"\b{re.escape(m)}\b", key) for m in mine):
+                return "Yes"
+            if re.search(r"\b(?:of|from|in)\b", key) and re.search(
+                    r"\b(?:cuba|syria|iran|north korea|crimea|sudan|russia|belarus|venezuela|united states|u s|us|usa"
+                    r"|canada|australia|singapore|united kingdom|uk|eu|european union|new zealand|india|pakistan|china"
+                    r"|germany|france|netherlands|ireland|japan|uae|united arab emirates|saudi arabia|qatar)\b", key):
+                return "No"
 
         # --- work authorization (facts only; NEVER guess) ---
         if has("sponsor"):
@@ -1063,6 +1140,19 @@ class Resolver:
             return "Yes" if bool(req) else "No"
         if has("authoriz", "authoris", "legally", "right to work", "eligible to work", "work permit", "permitted to work"):
             countries = [str(c).lower() for c in (auth.get("authorized_countries") or [])]
+            # A country named anywhere, not only after "in"/"for": "authorized under UK laws to work for Janus
+            # Henderson" put the employer after "for" and the country before it (application 239).
+            named = re.search(r"\b(?:under|by)\s+(?:the\s+)?(uk|u k|us|u s|usa|eu|[a-z]+(?: [a-z]+)?)\s+(?:law|laws|legislation)\b"
+                              r"|\b(?:in|within)\s+(?:the\s+)?(united kingdom|united states|uk|usa|australia|canada|singapore"
+                              r"|new zealand|ireland|germany|netherlands|united arab emirates|uae)\b", key)
+            if named:
+                country = (named.group(1) or named.group(2) or "").strip()
+                aliases = {"uk": "united kingdom", "u k": "united kingdom", "us": "united states", "u s": "united states",
+                           "usa": "united states", "uae": "united arab emirates"}
+                country = aliases.get(country, country)
+                if country in {"united kingdom", "united states", "australia", "canada", "singapore", "new zealand",
+                               "ireland", "germany", "netherlands", "united arab emirates", "eu", "bangladesh"}:
+                    return "Yes" if any(aliases.get(c, c) == country for c in countries) else "No"
             m = re.search(r"(?:in|for) (?:the )?([a-z][a-z ]+?)(?: without| on a| now| currently| at| on | for | to |$)", key)
             if m:
                 country = m.group(1).strip()
@@ -1079,6 +1169,19 @@ class Resolver:
         if has("citizen"):
             cit = str(auth.get("citizenship") or "").strip()
             return cit or None
+        # "…eligible for Security Clearance, meaning you have lived in the UK for the past 5 years
+        # continuously. Can you confirm this applies to you?" -- a residency test, and facts.yaml says where the
+        # candidate lives. Faculty stopped to ask it (application 236). Only ever a No from here: living in the
+        # named country now does not prove the years, so that case still asks.
+        m = re.search(r"\blived\s+in\s+(?:the\s+)?([a-z][a-z .]{1,30}?)\s+(?:for|continuously|during|over)\b", key)
+        if m:
+            named = m.group(1).strip()
+            aliases = {"uk": "united kingdom", "u k": "united kingdom", "us": "united states", "usa": "united states",
+                       "u s": "united states", "uae": "united arab emirates"}
+            named = aliases.get(named, named)
+            home = f("identity.country").lower()
+            if home and named and named not in home and home not in named:
+                return "No"
         if has("clearance"):
             return None
 
@@ -1091,6 +1194,25 @@ class Resolver:
             return None   # asks how to say the name, not what it is; the model renders it phonetically
         if has("full name", "legal name", "your name", "preferred name") or key in ("name", "candidate name"):
             return f("identity.full_name") or (f("identity.first_name") + " " + f("identity.last_name")).strip() or None
+        # The kind of a contact detail, not the detail: Workday's "Phone Device Type" (Landline / Mobile) got
+        # the phone number itself from the rule below and stopped the run on "Could not map answer
+        # '+880…'" (application 219, Red Hat). The number in facts.yaml is a mobile; the address is personal.
+        # "Phone number (without country code)" asks for the number itself, national part only -- the words
+        # "country code" made it read as a question about the field, and it stopped to ask (application 224).
+        if has("phone", "mobile", "telephone", "contact number") and re.search(
+                r"\b(?:without|excluding|excl|no|minus)\s+(?:the\s+)?(?:country|dial(?:l?ing)?|international)\s*(?:code|prefix)", key):
+            phone = f("identity.phone")
+            dial = _DIAL_CODES.get(f("identity.country").lower(), "")
+            national = re.sub(r"\D", "", phone)
+            if dial and national.startswith(dial):
+                return national[len(dial):].lstrip("0") or None
+            return None
+        if store.is_about_the_field(key):
+            if re.search(r"device\s*type|(?:phone|number)\s*type|type\s+of\s+(?:phone|number)", key):
+                return "Mobile"
+            if re.search(r"(?:email|address)\s*type|type\s+of\s+(?:email|address)", key):
+                return "Personal"
+            return None
         if has("email", "e mail"):
             return f("identity.email") or None
         if has("phone", "mobile", "telephone", "contact number"):
@@ -1155,6 +1277,23 @@ class Resolver:
             return f("education.field_of_study") or None
         if has("school", "university", "college", "institution", "alma mater", "educational establishment"):
             return f("education.school") or None
+        # "Do you hold a STEM degree?" is a yes/no about the degree, not a request for its name: answered
+        # "Bachelor's Degree", nothing on a Yes/No list matched and Mistral's form stopped to ask (app 217).
+        # Settled from the education block alone: a higher degree than the one held is a No, a degree of the
+        # kind held (bachelor's, STEM, computing, engineering, any university degree) a Yes.
+        if re.match(r"^(?:do|does|have|are)\s+you\s+(?:currently\s+)?(?:hold|have|possess|obtained|completed|earned|got)\b"
+                    r"|^(?:is|was)\s+your\s+degree\b", key) and "degree" in key:
+            held = (f("education.degree") + " " + f("education.field_of_study")).lower()
+            if not held.strip():
+                return None
+            higher = re.search(r"\b(?:master|msc|m sc|mba|phd|ph d|doctor|doctoral|postgraduate|graduate degree)\b", key)
+            if higher:
+                return "Yes" if re.search(r"master|phd|doctor|mba", held) else "No"
+            if re.search(r"\b(?:stem|computer|computing|engineering|technical|science|bachelor|undergraduate"
+                         r"|university|college|tertiary|relevant|related|4 year|four year)\b", key):
+                stem = bool(re.search(r"computer|engineering|science|math|physics|technology", held))
+                return "Yes" if (stem or not re.search(r"\b(?:stem|computer|computing|engineering|technical|science)\b", key)) else None
+            return None
         if has("degree", "qualification", "education level", "level of education", "highest education",
                "highest level"):
             return f("education.degree") or None

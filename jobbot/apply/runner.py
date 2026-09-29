@@ -33,7 +33,7 @@ from jobbot import answers as store
 from jobbot import config, db
 from jobbot.apply import common
 from jobbot.apply.base import AlreadyApplied, ApplyContext, ApplyError, NeedsHuman, get_adapter_for
-from jobbot.apply.resolver import Resolver, normalize_question
+from jobbot.apply.resolver import Resolver, is_source_question, normalize_question
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +102,10 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
         facts.yaml (name, email, phone), which needs no cache entry and only invites a fuzzy mis-hit later.
     """
     learned_facts: dict[str, str] = {}      # identity fact -> the label that already rewrote it here
+    # What each identity field held the first time it was reported on this application. A correction is a
+    # change: Just Eat's Country arrived as "United Kingdom" (the form's own pick from the job's location),
+    # was still that after a pause, and was written to identity.country as the candidate's (application 224).
+    first_identity: dict[str, str] = {}
 
     def seen(value: str, label: str = "", *, kind: str = "", options: list | None = None,
              default: bool = False, placeholder: bool = False) -> None:
@@ -128,12 +132,23 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
             return
         if normalize_question(label) in answered_here:
             return
+        if is_source_question(label):
+            # Policy answers "how did you hear about us" (preferences.job_source); whatever a form arrived
+            # holding there is its own default, and caching it taught "Heidi Website" as typed (app 199).
+            return
         # An identity field the user corrected in the window (a LinkedIn URL the form would not take, a
         # different email). answers.json is the wrong home for it: every adapter fills these from
         # facts.yaml and never looks at the cache, so a correction left in the cache would be replaced by
         # the rejected value on the very next form. Write it where it is read from instead.
         key = _identity_fact_key(label)
         if key:
+            norm = normalize_question(label)
+            if norm not in first_identity:
+                first_identity[norm] = str(value).strip()
+            elif first_identity[norm] == str(value).strip():
+                log.info("app %s: not writing %r to facts.yaml %s from %r: unchanged since the form first "
+                         "showed it", app_id, str(value)[:60], key, label)
+                return
             if not window_touched():
                 # Nobody has been near this window yet. On the first pass of a freshly opened form every
                 # filled control was filled by the page — a tenant's own default, or an ATS profile echoing
@@ -152,7 +167,7 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
                          "yet, so the form put it there", app_id, str(value)[:60], key, label)
                 return
             why = _not_a_correction(key, label, str(value).strip(),
-                                    resolver.fact_str(key), learned_facts)
+                                    resolver.fact_str(key), learned_facts, options)
             if why:
                 log.info("app %s: not writing %r to facts.yaml %s from %r: %s",
                          app_id, str(value)[:60], key, label, why)
@@ -171,7 +186,8 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
     return seen
 
 
-def _not_a_correction(key: str, label: str, value: str, held: str, learned: dict[str, str]) -> str:
+def _not_a_correction(key: str, label: str, value: str, held: str, learned: dict[str, str],
+                      options: list | tuple | None = None) -> str:
     """Why `value` in an identity field is the form's own doing rather than the candidate's — '' when it
     may be theirs and is safe to write to facts.yaml.
 
@@ -195,6 +211,13 @@ def _not_a_correction(key: str, label: str, value: str, held: str, learned: dict
     """
     if store.is_about_the_field(label):
         return "the label asks about the shape of the field, not for the detail itself"
+    if options and held and not any(held.lower() in str(o).lower() for o in options):
+        # A dropdown that cannot hold the fact at all. LinkedIn's Easy Apply "Email address" is a <select>
+        # of the addresses on the LinkedIn account; the apply mailbox is not one of them, so the control
+        # kept its own first option and that was read back as the candidate switching address -- which
+        # rewrote identity.email and cut the IMAP code reader off from its mailbox (application 178).
+        # The candidate cannot have chosen a value the control never offered our fact against.
+        return f"the control offers no option holding the {key} already held, so it chose for itself"
     if key == "identity.phone" and common.dial_code_only(value):
         return "a dial code is not a phone number"
     if key in ("identity.country", "identity.location") and common.is_dial_code(value):

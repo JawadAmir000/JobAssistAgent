@@ -96,6 +96,16 @@ class GreenhouseAdapter(Adapter):
         try:
             page.wait_for_selector(EMBED_IFRAME, state="attached", timeout=EMBED_WAIT)
         except Exception:
+            # A dead link is not a slow page: grnh.se/lv1el75lanz lands on "Sorry, but we can't find that
+            # page." and was reported three times as "never finished rendering; click Retry" (application 267).
+            try:
+                body = c.clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))[:400]
+            except Exception:  # noqa: BLE001
+                body = ""
+            if re.search(r"can'?t find that page|page (?:not found|doesn'?t exist)|job (?:is )?no longer (?:available|open)"
+                         r"|position (?:has been )?(?:filled|closed)|\b404\b", body, re.I):
+                raise ApplyError(f"This posting is not accepting applications: the link is dead ({body[:80]!r} "
+                                 f"at {page.url})") from None
             raise ApplyError(
                 f"No Greenhouse form or embed iframe appeared within {EMBED_WAIT // 1000}s at {page.url} — "
                 "the page probably never finished rendering; click Retry") from None

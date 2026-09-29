@@ -62,6 +62,8 @@ SIGN_IN_NAMES = ("Sign In", "Sign in", "Log In", "Log in", "Login", "Signin", "S
                  "Accedi", "Inloggen", "Entrar")
 CREATE_NAMES = ("Create Account", "Create an Account", "Create account", "Create an account",
                 "Create my account", "Create Profile", "Create profile", "Create your account",
+                # a signup that offers an emailed code first and a password second (Meta's Career Profile)
+                "Sign up with a password", "Sign up with password", "Create account with password",
                 "Register", "Sign Up", "Sign up", "Join now", "Registrieren", "Konto erstellen",
                 "Créer un compte", "S'inscrire", "Crear cuenta", "Registrarse", "Registrati",
                 "Registreren", "Criar conta")
@@ -87,7 +89,10 @@ THIRD_PARTY_RE = re.compile(r"linkedin|indeed|google|facebook|apple|seek\b|xing|
 # so an account on it is almost always one an earlier application created.
 ACCOUNT_EXISTS = re.compile(
     r"already\s+(?:been\s+)?(?:registered|regist|in\s+use|exists?|taken)"
-    r"|already\s+ha(?:ve|s)\s+an?\s+(?:account|profile)"
+    # With a subject: "You already have an account" is the refusal, while a bare "Already have an account?"
+    # is the log-in prompt every signup prints -- Meta's is a tab label, and matching it turned each signup
+    # attempt into a sign-in with no account behind it (applications 213-214).
+    r"|\b(?:you|user|e-?mail|address|this\s+\w+|it)\s+already\s+ha(?:ve|s)\s+an?\s+(?:\w+\s+)?(?:account|profile)"
     r"|(?:e-?mail|user\s*name|username)\s*(?:address)?\s*(?:is\s+)?already"
     r"|an?\s+account\s+(?:with|for)\s+th(?:is|at)\s+(?:e-?mail|address|user)", re.I)
 # ...and when it will not accept the credentials it was given.
@@ -171,10 +176,22 @@ _GATE_BUTTON_JS = "(names) => {" + _GATE_PRELUDE + r"""
     // In the caller's order, not the document's: the names are listed most specific first. An enabled
     // match wins over a disabled one of the same name; a disabled one is still returned when it is all
     // there is, so the caller can say the gate is holding its own button shut rather than say nothing.
+    // A control a click can actually land on. Meta's careers page opens "Sign up for Career Profile" as a
+    // modal over the application form, the form's own "Submit" matched a sign-in name, and the click spent
+    // five seconds being intercepted by the modal and crashed the run (application 213). A button under
+    // something else is not this gate's button, whatever it is called. Off-screen ones are given the
+    // benefit of the doubt: the caller scrolls before it clicks.
+    const reachable = el => {
+        const r = el.getBoundingClientRect();
+        const x = r.left + r.width / 2, y = r.top + r.height / 2;
+        if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+        const hit = document.elementFromPoint(x, y);
+        return !hit || el === hit || el.contains(hit) || hit.contains(el);
+    };
     let fallback = null;
     for (const wanted of names.want.map(norm)) {
         for (const el of buttons) {
-            if (!nameOf(el).some(t => t === wanted)) continue;
+            if (!nameOf(el).some(t => t === wanted) || !reachable(el)) continue;
             if (live(el)) return el;
             fallback = fallback || el;
         }
@@ -241,6 +258,9 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
     # generated password typed there is a failed login on their real Google/Microsoft account (see
     # common.detect_sso, which pauses for it instead).
     c.detect_sso(page)
+    if not at_gate(page) and not _email_first(ctx):
+        return False
+    page = ctx.page
     if not at_gate(page):
         return False
     email = ctx.fact("identity.email")
@@ -254,6 +274,7 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
     # no length rule, so account_password() cannot know the account behind it was made on a form that capped
     # the length (Globant: "Not be longer than 18 characters", on its signup wizard only).
     short = ""
+    pressed_nothing = 0
     for attempt in range(ATTEMPTS):
         c.require_open(page)
         kind = at_gate(page)
@@ -264,8 +285,17 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
         kind = _switch_view(page, "create" if creating else "sign_in") or kind
         signed_up = signed_up or kind == "create"
         ctx.step("Creating your account with this employer" if kind == "create" else "Signing in")
-        _submit_credentials(ctx, email, kind == "create", fill, password=short if kind == "sign_in" else "")
+        pressed = _submit_credentials(ctx, email, kind == "create", fill, password=short if kind == "sign_in" else "")
         page = ctx.page
+        if not pressed:
+            # Nothing was sent, so nothing on the page is an answer to it. Reading the page anyway is how a
+            # line of Meta's page copy was taken for "this address already has an account" and the run
+            # flipped to a sign-in it could not do either (application 213).
+            pressed_nothing += 1
+            if pressed_nothing >= 2:
+                break
+            creating = not creating
+            continue
 
         if not at_gate(page):
             log.info("account: %s succeeded on %s", "signup" if kind == "create" else "sign-in",
@@ -295,6 +325,92 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
         "Finish it in the browser window — sign in, or create the account by hand — then click Continue.")
 
 
+_EMAIL_FIRST_JS = r"""() => {
+    const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const inputs = [...document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio])'
+                                                + ':not([type=submit]):not([type=button]):not([type=search])')].filter(vis);
+    if (!inputs.length || inputs.length > 2) return false;
+    if (inputs.some(i => i.type === 'password')) return false;
+    const email = inputs.find(i => i.type === 'email' || /e-?mail/i.test((i.name || '') + ' ' + (i.id || '') + ' '
+        + (i.getAttribute('autocomplete') || '') + ' ' + (i.getAttribute('aria-label') || '') + ' '
+        + ((i.labels && i.labels[0] && i.labels[0].innerText) || '')));
+    if (!email) return false;
+    const text = (document.body.innerText || '').toLowerCase();
+    return /\b(sign in|log in|login|create an account|create account|register)\b/.test(text);
+}"""
+EMAIL_FIRST_NEXT = ("Continue", "Next", "Continue with email", "Sign in with email", "Submit", "Weiter", "Continuer")
+
+
+def _email_first(ctx: ApplyContext) -> bool:
+    """Get past an email-first sign-in: one Email box and Continue, the password (or the signup) only on
+    the step after. Lumen's careers modal is this shape -- no password box, so at_gate said "not a gate" and
+    the run stopped as "an account in a shape jobbot does not recognise yet" (application 225). True when
+    the address went in and the page moved on to something at_gate can read."""
+    page = ctx.page
+    try:
+        if not page.evaluate(_EMAIL_FIRST_JS):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    email = ctx.fact("identity.email")
+    if not email:
+        return False
+    box = page.locator("input[type=email]:visible, input[autocomplete*=email i]:visible, input[name*=email i]:visible, "
+                       "input[id*=email i]:visible").first
+    try:
+        if not box.count():
+            return False
+        box.fill(email, timeout=c.MEDIUM)
+    except Exception as e:  # noqa: BLE001
+        log.debug("account: email-first fill: %s", e)
+        return False
+    button = c.named_button(page, EMAIL_FIRST_NEXT)
+    if button is None:
+        return False
+    log.info("account: email-first sign-in; sending %s and reading the next step", email)
+    try:
+        button.click(timeout=c.MEDIUM)
+    except Exception as e:  # noqa: BLE001
+        log.debug("account: email-first press: %s", e)
+        return False
+    page.wait_for_timeout(SETTLE_MS)
+    _settle(page)
+    c.detect_captcha(page)
+    if not at_gate(page) and _UNKNOWN_EMAIL_RE.search(_text(page)):
+        # "We don't recognize this email. Create a new account" -- no account yet, so the signup is next.
+        link = c.named_button(page, _CREATE_LINKS) or _named_link(page, _CREATE_LINKS)
+        if link is not None:
+            log.info("account: the address has no account here; opening the signup")
+            try:
+                link.click(timeout=c.MEDIUM)
+                page.wait_for_timeout(SETTLE_MS)
+                _settle(page)
+            except Exception as e:  # noqa: BLE001
+                log.debug("account: signup link: %s", e)
+    return True
+
+
+_UNKNOWN_EMAIL_RE = re.compile(
+    r"(?:don'?t|do not|couldn'?t|could not|can'?t|cannot)\s+(?:recogni[sz]e|find)\s+(?:this|that|your|an?)\s+(?:e-?mail|account|user)"
+    r"|no account (?:found|exists|with)|(?:e-?mail|account)\s+(?:not found|does not exist|doesn'?t exist)"
+    r"|create a new account", re.I)
+_CREATE_LINKS = ("Create an account", "Create account", "Create a new account", "Create Account", "Sign up", "Sign Up",
+                 "Register", "Create profile", "Join now")
+
+
+def _named_link(page: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        try:
+            loc = page.get_by_role("link", name=re.compile(rf"^\s*{re.escape(name)}\s*$", re.I))
+            for i in range(min(loc.count(), 4)):
+                if c.is_visible_now(loc.nth(i)):
+                    return loc.nth(i)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _sign_in_refused(page: Any) -> bool:
     return bool(SIGN_IN_FAILED.search(" ; ".join(c.form_errors(page))) or SIGN_IN_FAILED.search(_text(page)))
 
@@ -311,8 +427,9 @@ def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool,
         raise NeedsHuman(
             f"This employer emailed a confirmation link to {email} and will not let the new account in until "
             "it has been opened. Click the link in that mail, then click Continue.")
-    if ACCOUNT_EXISTS.search(joined) or ACCOUNT_EXISTS.search(text):
-        log.info("account: %s already has an account here; signing in instead", email)
+    if (m := ACCOUNT_EXISTS.search(joined) or ACCOUNT_EXISTS.search(text)):
+        log.info("account: %s already has an account here (%r); signing in instead", email,
+                 m.string[max(0, m.start() - 60):m.end() + 40])
         return False
     if SIGN_IN_FAILED.search(joined) or SIGN_IN_FAILED.search(text):
         if creating:
@@ -382,9 +499,10 @@ def _switch_view(page: Any, want: str) -> str:
 
 
 def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Callable[[], None],
-                        password: str = "") -> None:
+                        password: str = "") -> bool:
     """Fill the gate and press its button. The order is the one the forms demand, not a tidy one.
-    `password` overrides the managed one the page's own length rule would pick."""
+    `password` overrides the managed one the page's own length rule would pick. True when a button was
+    actually pressed -- only then does anything on the page say how the attempt went."""
     page = ctx.page
     c.dismiss_cookie_banner(page)
     username, passwords = _credential_boxes(page)
@@ -421,21 +539,46 @@ def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Cal
     button = _gate_button(page, names)
     if button is None:
         log.info("account: no %s button on this gate", "create" if creating else "sign-in")
-        return
+        return False
     if not c.is_enabled_now(button):
         # The gate is holding its own button shut, which is how a modal says a box it wants is still empty.
         # Clicking anyway spends the five-second actionability wait and raises; saying so leaves the field
         # values in place for the next attempt, which fills whatever this pass missed.
         log.info("account: the %s button is still disabled — the gate wants more than was filled",
                  "create" if creating else "sign-in")
-        return
+        return False
     try:
         button.scroll_into_view_if_needed(timeout=c.SHORT)
     except Exception:  # noqa: BLE001
         pass
-    button.click(timeout=c.MEDIUM)
+    try:
+        button.click(timeout=c.MEDIUM)
+    except Exception as e:  # noqa: BLE001 - a click something else swallowed is a gate not passed, not a crash
+        log.info("account: the %s button would not take a click (%s)", "create" if creating else "sign-in",
+                 str(e).splitlines()[0][:120])
+        return False
     page.wait_for_timeout(SETTLE_MS)
     _settle(page)
+    _wait_while_busy(page, button)
+    return True
+
+
+def _wait_while_busy(page: Any, button: Any, limit_ms: int = 12000) -> None:
+    """Let an in-page submit finish. A modal signup (Meta's Career Profile) turns its button into a
+    spinner and posts in the background: no navigation, so load-state waits return at once, and the page
+    read straight after is the half-way state -- which the gate then misread (application 213)."""
+    waited = 0
+    while waited < limit_ms:
+        try:
+            busy = button.evaluate("b => b.isConnected && (b.disabled || b.getAttribute('aria-busy') === 'true'"
+                                   " || b.getAttribute('aria-disabled') === 'true'"
+                                   " || !!b.querySelector('[role=progressbar], svg circle, [class*=spinner i]'))")
+        except Exception:  # noqa: BLE001 - detached: the view moved on
+            return
+        if not busy:
+            return
+        page.wait_for_timeout(500)
+        waited += 500
 
 
 def _credential_boxes(page: Any) -> tuple[Any, list]:
@@ -486,7 +629,10 @@ def _accept_terms(page: Any) -> bool:
     """
     accepted = _tick_consent_boxes(page)
     try:
-        links = page.get_by_role("link", name=TERMS_VERB_RE)
+        # Not get_by_role("link"): an <a> with no href has no link role, and Taleo's "Read and accept the
+        # data privacy statement." is exactly that -- a script-driven anchor -- so the signup went round
+        # three times on "Terms of Use is required" (application 239).
+        links = page.locator("a, button, [role=link], [role=button], span[onclick]").filter(has_text=TERMS_VERB_RE)
         for i in range(min(links.count(), 6)):
             el = links.nth(i)
             if not c.is_visible_now(el):
