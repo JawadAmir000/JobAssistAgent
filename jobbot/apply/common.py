@@ -1279,6 +1279,12 @@ def _note_rejected_answer(label: str, value: str, why: str) -> None:
         rec = records.get(key)
         if rec is None or (rec.answer or "").strip() != value or not rec.usable:
             return
+        if rec.source == "rule" or store.normalize_question(why) == key:
+            # A rule's value is facts.yaml's, which the form cannot overrule from here. And a "complaint"
+            # that is only the field's own label is not a complaint: Greenhouse's newer board flags every
+            # field on a bounced submit, so a correct "Jawad" in Preferred First Name was marked rejected
+            # (application 182) because the textarea below it was empty.
+            return
         rec.confidence = "rejected"
         rec.note = f"the form refused it: {why[:120]}"
         config.save_answer_records({key: rec})
@@ -1341,7 +1347,7 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
         ans = ctx.answer(label, opts or None, kind)
         if not ans or ans == before:
             return False
-        return bool(choose_combobox(page, el, ans))
+        return bool(choose_combobox(page, el, ans, _answer_alternatives(ctx, label), allow_other=_other_ok(label)))
 
     # text / textarea / number
     if before and not has_suggestions(el):
@@ -1358,6 +1364,9 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
         return False
 
     ans = ctx.answer(label, None, "number" if kind == "number" else kind)
+    if ans == "" and kind in ("text", "textarea"):
+        ans = _NOT_APPLICABLE     # a skipped "If yes, …" box the form refused as empty; see _ask
+        log.info("repair %r: the form insists on a follow-up that does not apply; writing %r", label[:50], ans)
     if not ans:
         return False
     if has_suggestions(el):
@@ -2022,14 +2031,25 @@ def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
     return opts
 
 
-def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
+def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str, ...] | list[str] = (),
+                    *, allow_other: bool = False, seen: list[str] | None = None) -> bool:
     """Click the combobox, type the answer, pick the matching option.
 
     Exact match first; else the only option left after typing; else the first option that starts with
     the answer. A blind Enter used to take whatever react-select had highlighted, which on a list that did
     not filter ("Yes" typed into a list of countries) was the wrong answer written with no error. Returns
     True only when the control reads back a value afterwards.
+
+    When the whole answer finds nothing, shorter searches and the `alternatives` facts.yaml allows are tried
+    the way fill_from_suggestions does for a datalist box. Greenhouse's newer boards draw Discipline as a
+    react-select that fetches its options per search, and "Computer Science & Engineering" returns an empty
+    list there while "Computer Science" returns the option to take (application 182, Veeam). `allow_other`
+    lets a list's own "Other" stand in for an answer it lacks — education lists only, where that is what the
+    board expects; "Other" is never an acceptable stand-in for a pronoun or a visa answer. Every option text
+    seen along the way is added to `seen`, so a caller that has to ask can offer the list's real choices.
     """
+    if seen is None:
+        seen = []
     try:
         combo.click(timeout=SHORT)
         page.wait_for_timeout(200)
@@ -2041,6 +2061,7 @@ def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
         page.wait_for_timeout(600)
         items = page.locator("[role=option]:visible")
         texts = [option_text(items.nth(i)) for i in range(min(items.count(), 60))]
+        _note_seen(seen, texts)
         want = clean(answer).lower()
         pick = next((i for i, t in enumerate(texts) if t.lower() == want or same_option(t, answer)), None)
         if pick is None and len(texts) == 1 and want and want in texts[0].lower():
@@ -2060,6 +2081,7 @@ def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
         items = page.locator("[role=option]:visible")
         for i in range(min(items.count(), 60)):
             text = option_text(items.nth(i))
+            _note_seen(seen, [text])
             if text.lower() == want or same_option(text, answer):
                 items.nth(i).click(timeout=SHORT)
                 page.wait_for_timeout(300)
@@ -2068,11 +2090,84 @@ def choose_combobox(page: Any, combo: Any, answer: str) -> bool:
             page.keyboard.press("Escape")
         if combobox_value(combo):
             return True
-        _log_combo_miss(combo, answer, texts)
+        if _combobox_search(page, combo, answer, alternatives, allow_other, seen):
+            return True
+        _log_combo_miss(combo, answer, texts or seen)
         return False
     except Exception as e:
         log.debug("choose_combobox failed: %s", e)
         return False
+
+
+def _note_seen(seen: list[str], texts: list[str]) -> None:
+    for t in texts:
+        t = clean(t)
+        if t and t not in seen and not is_prompt_value(t) and len(seen) < 200:
+            seen.append(t)
+
+
+def _combobox_typed_options(page: Any, combo: Any, query: str) -> list[str]:
+    """Clear the box, type `query`, and read what the list offers for it (fetched lists refresh per key)."""
+    combo.click(timeout=SHORT)
+    page.wait_for_timeout(150)
+    try:
+        combo.fill("", timeout=SHORT)
+    except Exception:  # noqa: BLE001
+        pass
+    page.keyboard.type(query, delay=20)
+    page.wait_for_timeout(900)
+    items = page.locator("[role=option]:visible")
+    return [option_text(items.nth(i)) for i in range(min(items.count(), 60))]
+
+
+def _click_combobox_option(page: Any, combo: Any, pick: str) -> bool:
+    items = page.locator("[role=option]:visible")
+    for i in range(min(items.count(), 60)):
+        if option_text(items.nth(i)) == pick:
+            items.nth(i).click(timeout=SHORT)
+            page.wait_for_timeout(300)
+            return bool(combobox_value(combo))
+    return False
+
+
+def _combobox_search(page: Any, combo: Any, answer: str, alternatives: tuple[str, ...] | list[str],
+                     allow_other: bool, seen: list[str]) -> bool:
+    """The recovery fill_from_suggestions gives a datalist box, for a react-select that found nothing.
+
+    Prefixes of the answer, then the facts.yaml alternatives (see _suggestion_queries for why only prefixes),
+    each matched with _best_suggestion against the answer and then each alternative; last, the list's own
+    "Other" when `allow_other`. A one-word answer has no shorter search, so without alternatives or "Other"
+    there is nothing to try and the caller asks instead.
+    """
+    targets = [answer, *[a for a in alternatives if a]]
+    queries = [q for q in _suggestion_queries(answer, alternatives) if clean(q).lower() != clean(answer).lower()]
+    try:
+        for query in queries[:10]:
+            texts = _combobox_typed_options(page, combo, query)
+            _note_seen(seen, texts)
+            if not texts:
+                continue
+            for target in targets:
+                pick = _best_suggestion(texts, target)
+                if pick and _click_combobox_option(page, combo, pick):
+                    log.info("combobox: typed %r, took %r for %r", query, pick, answer)
+                    return True
+        if allow_other:
+            for query in ("Other", "Not listed"):
+                texts = _combobox_typed_options(page, combo, query)
+                _note_seen(seen, texts)
+                pick = next((t for t in texts if _OTHER_RE.match(clean(t))), "")
+                if pick and _click_combobox_option(page, combo, pick):
+                    log.info("combobox: %r is not on this list — falling back to %r", answer, pick)
+                    return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("_combobox_search(%r): %s", answer, e)
+    try:
+        page.keyboard.press("Escape")
+        combo.fill("", timeout=SHORT)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def _log_combo_miss(combo: Any, answer: str, typed_options: list[str]) -> None:
@@ -2371,6 +2466,12 @@ def dial_code_on_page(page: Any) -> str:
         return page.evaluate("() => {" + DEEP_JS + """
             const sel = %r;
             for (const el of deepAll(sel)) {
+                // innerText of a hidden node is its whole textContent, so a picker's closed country list
+                // (intl-tel-input keeps every row in the DOM, each with a .iti__dial-code span) read as
+                // holding its first row, Afghanistan's +93 (application 182, Veeam). A <select> is exempt:
+                // a native one is often hidden behind the widget that drives it and still holds the value.
+                if (el.tagName !== 'SELECT' && !(el.getClientRects().length
+                        && getComputedStyle(el).visibility !== 'hidden')) continue;
                 const shown = el.tagName === 'SELECT'
                     ? ((el.selectedOptions && el.selectedOptions[0]) ? el.selectedOptions[0].textContent : '')
                     : (el.innerText || el.value || '');
@@ -3076,11 +3177,53 @@ def _answer_alternatives(ctx: ApplyContext, label: str) -> list[str]:
     return [str(a) for a in alts if str(a).strip()]
 
 
+# Lists where the board's own "Other" is the expected answer when the real one is missing: a university
+# Greenhouse has never heard of, a degree subject worded differently. Nowhere else — "Other" is not a stand-in
+# for a pronoun, a salary band or a visa answer.
+_OTHER_OK_LABEL_RE = re.compile(r"school|universit|institution|college|\bdegree\b|qualification", re.I)
+
+
+def _other_ok(label: str) -> bool:
+    return bool(_OTHER_OK_LABEL_RE.search(label or "") or _FIELD_OF_STUDY_RE.search(label or ""))
+
+
+def _choice_miss(el: Any, label: str, ans: str, options: list[str] | None, kind: str,
+                 required_el: Any = None) -> None:
+    """An answer the control would not take. Ask about it, or leave an optional field be — never fail.
+
+    This used to be ApplyError, which ends the application as "failed" with nothing but Retry on its card:
+    no question, nothing learned, and the same miss on the next form ("Could not choose 'Computer Science &
+    Engineering' for 'Discipline'", seen 7 times, application 182). A question with the list's real options
+    goes to the card instead; the pick is learned as the candidate's answer to this label and the run carries
+    on in the same window. Modelled on the Workday list pick (workday.py), the one place that already did it.
+    """
+    if not is_required(required_el if required_el is not None else el):
+        log.info("leaving the optional %r blank: the form's list has nothing matching %r", label, ans)
+        return
+    offered = [o for o in (options or []) if clean(o) and not is_prompt_value(o)][:25]
+    raise NeedsHuman(
+        f"'{label}' has no option jobbot could match to {ans!r}"
+        + (f" (it offers: {', '.join(offered[:8])})" if offered else "")
+        + ". Pick the right one here, or choose it in the browser window and click Continue — "
+          "it is remembered for next time.",
+        question=label, options=offered or None, kind=kind)
+
+
+_NOT_APPLICABLE = "N/A"
+
+
 def _ask(ctx: ApplyContext, el: Any, label: str, options: list[str] | None, kind: str,
          required_el: Any = None):
     """The resolver's answer, or None when there is no answer and the form does not need one."""
     try:
-        return ctx.answer(label, options, kind)
+        ans = ctx.answer(label, options, kind)
+        if ans == "" and kind in ("text", "textarea") and is_required(required_el if required_el is not None else el):
+            # The resolver leaves an "If yes, please describe…" box empty when the answer above it was No.
+            # Some forms still star that box, and then refuse the whole submit over it (application 182,
+            # Veeam). An empty required box is never accepted; "N/A" is the honest answer to it.
+            log.info("%r does not apply but the form requires it; writing %r", label[:60], _NOT_APPLICABLE)
+            return _NOT_APPLICABLE
+        return ans
     except NeedsHuman:
         if is_required(required_el if required_el is not None else el):
             raise
@@ -3216,24 +3359,31 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             # and asking the user to pick the only option there is stops a run for nothing.
             log.info("select %r offers one option; taking %r", label, opts[0])
             if not choose_select(el, opts[0], opts):
-                raise ApplyError(f"Could not select {opts[0]!r} for {label!r}")
+                _choice_miss(el, label, opts[0], opts, kind)
             return
         ans = _ask(ctx, el, label, opts, kind)
         if ans is None:
             return
         if not choose_select(el, ans, opts):
-            raise ApplyError(f"Could not select {ans!r} for {label!r}")
+            _choice_miss(el, label, ans, opts, kind)
     elif kind == "combobox":
         existing = combobox_value(el)
         if existing:
             ctx.seen(existing, label, kind=kind, placeholder=combobox_is_placeholder(el))
             return
         opts = options if options is not None else combobox_options(page, el)
+        if options is None and len(opts) >= 60:
+            # combobox_options stops at 60: this is a searchable list cut short, not the list. Mapped against
+            # it, a school outside the first page (RUET on Greenhouse) read as "not an option" and the field
+            # was dropped. With no list the resolver gives the true answer, and choose_combobox searches for it.
+            opts = []
         ans = _ask(ctx, el, label, opts or None, kind)
         if ans is None:
             return
-        if not choose_combobox(page, el, ans):
-            raise ApplyError(f"Could not choose {ans!r} for {label!r}")
+        seen: list[str] = list(opts or [])
+        if not choose_combobox(page, el, ans, _answer_alternatives(ctx, label), allow_other=_other_ok(label),
+                               seen=seen):
+            _choice_miss(el, label, ans, seen, kind)
     elif kind in ("radio", "checkbox"):
         cont = container if container is not None else el
         if choice_checked(cont):
@@ -3245,7 +3395,7 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         if ans is None:
             return
         if not check_choice(cont, ans):
-            raise ApplyError(f"Could not tick {ans!r} for {label!r}")
+            _choice_miss(el, label, ans, opts, kind, cont)
     elif kind == "file":
         return  # the CV goes through upload_resume; the cover letter through fill_cover_letter
 

@@ -55,7 +55,9 @@ SETTLE_MS = 2500        # a gate answers a submit with a full page render, in it
 
 # What the button that ends a gate is called. The two lists are kept apart because which one is on the page
 # is how the gate says which of its two views it is showing.
+# "Log in with Email" is Globant's (career.globant.com): its gate went unrecognised twice on one job.
 SIGN_IN_NAMES = ("Sign In", "Sign in", "Log In", "Log in", "Login", "Signin", "Sign me in", "Submit",
+                 "Log in with Email", "Log in with email", "Sign in with Email", "Sign in with email",
                  "Se connecter", "Connexion", "Anmelden", "Einloggen", "Iniciar sesión", "Acceder",
                  "Accedi", "Inloggen", "Entrar")
 CREATE_NAMES = ("Create Account", "Create an Account", "Create account", "Create an account",
@@ -247,6 +249,11 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
                          "facts.yaml has no email address to create one with.")
 
     creating = True
+    signed_up = False       # whether a signup form was ever actually submitted, for the message at the end
+    # The short managed password, on the sign-in round after the primary was refused. A sign-in view prints
+    # no length rule, so account_password() cannot know the account behind it was made on a form that capped
+    # the length (Globant: "Not be longer than 18 characters", on its signup wizard only).
+    short = ""
     for attempt in range(ATTEMPTS):
         c.require_open(page)
         kind = at_gate(page)
@@ -255,8 +262,9 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
             ctx.step("Signed in — opening the application")
             return True
         kind = _switch_view(page, "create" if creating else "sign_in") or kind
+        signed_up = signed_up or kind == "create"
         ctx.step("Creating your account with this employer" if kind == "create" else "Signing in")
-        _submit_credentials(ctx, email, kind == "create", fill)
+        _submit_credentials(ctx, email, kind == "create", fill, password=short if kind == "sign_in" else "")
         page = ctx.page
 
         if not at_gate(page):
@@ -264,15 +272,35 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
                      (page.url or "")[:100])
             ctx.step("Signed in — opening the application")
             return True
-        creating = _read_refusal(ctx, page, email, creating)
+        if kind == "sign_in" and not short and _sign_in_refused(page):
+            short = credentials.stored_short_password()
+            if short and short != credentials.stored_password():
+                log.info("account: the sign-in refused the primary password; trying the short one")
+                creating = False
+                continue
+            short = ""
+        creating = _read_refusal(ctx, page, email, creating, short_tried=bool(short))
 
+    if not signed_up:
+        # Never reached a signup this module can fill — Globant's is a six-step wizard behind a "Join" tab —
+        # so saying it "tried creating an account" sends the user looking for an account that does not exist.
+        raise NeedsHuman(
+            f"jobbot could not sign in to this employer as {email}, and cannot fill its signup form. Create the "
+            f"account by hand in the browser window using the short password jobbot manages "
+            f"({credentials.location_hint(credentials.SHORT_LENGTH)}), then click Continue — jobbot signs in "
+            "by itself here from then on.")
     raise NeedsHuman(
         f"jobbot could not get past this employer's sign-in. It tried both creating an account for {email} "
         f"and signing in with the password it manages ({credentials.location_hint(c.password_max_length(page))}). "
         "Finish it in the browser window — sign in, or create the account by hand — then click Continue.")
 
 
-def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool) -> bool:
+def _sign_in_refused(page: Any) -> bool:
+    return bool(SIGN_IN_FAILED.search(" ; ".join(c.form_errors(page))) or SIGN_IN_FAILED.search(_text(page)))
+
+
+def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool,
+                  short_tried: bool = False) -> bool:
     """What the gate said about the attempt just made, and therefore what to try next. Returns the next
     `creating`. Raises when the site is saying something no further attempt can answer."""
     errors = c.form_errors(page)
@@ -289,12 +317,14 @@ def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool) -> b
     if SIGN_IN_FAILED.search(joined) or SIGN_IN_FAILED.search(text):
         if creating:
             return True     # a signup that failed a login check is still a signup; try it once more
-        cap = c.password_max_length(page)
+        # After the short password was refused too, point at the short one: it is the one that fits the
+        # capped forms, and a reset to the primary on one of those is refused all over again.
+        cap = credentials.SHORT_LENGTH if short_tried else c.password_max_length(page)
         raise NeedsHuman(
-            f"There is an account at this employer for {email}, and it does not take the password jobbot "
-            f"manages. Two ways on, both in the browser window that is open: sign in by hand, or use "
-            f"'Forgot your password?' and set it to the one in {credentials.location_hint(cap)} — that "
-            "second one means jobbot gets in by itself here from now on. Then click Continue.")
+            f"This employer refused jobbot's sign-in for {email} — either there is no account here yet, or it "
+            f"has a different password. In the browser window that is open: create the account, or use "
+            f"'Forgot your password?', with the password in {credentials.location_hint(cap)} — then jobbot "
+            "gets in by itself here from now on. Then click Continue.")
     # Only now, and only from the form's own error messages: the rules printed beside the box say
     # "Password must be…" on a page where nothing has gone wrong.
     rejected = [e for e in errors if PASSWORD_REJECTED.search(e)]
@@ -351,8 +381,10 @@ def _switch_view(page: Any, want: str) -> str:
     return showing
 
 
-def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Callable[[], None]) -> None:
-    """Fill the gate and press its button. The order is the one the forms demand, not a tidy one."""
+def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Callable[[], None],
+                        password: str = "") -> None:
+    """Fill the gate and press its button. The order is the one the forms demand, not a tidy one.
+    `password` overrides the managed one the page's own length rule would pick."""
     page = ctx.page
     c.dismiss_cookie_banner(page)
     username, passwords = _credential_boxes(page)
@@ -365,8 +397,16 @@ def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Cal
         # form may have kept them and this pass only writes into empty controls either way.
         fill()
 
-    cap = c.password_max_length(page)
-    password = credentials.account_password(cap)
+    if password:
+        # A retry with the other managed password: the box still holds the refused one, and
+        # fill_account_password only writes into empty boxes.
+        for box in passwords:
+            try:
+                box.fill("")
+            except Exception as e:  # noqa: BLE001
+                log.debug("account: clearing the password box: %s", e)
+    else:
+        password = credentials.account_password(c.password_max_length(page))
     if passwords:
         c.fill_account_password(page, password)
 

@@ -282,7 +282,10 @@ class AshbyAdapter(Adapter):
                 b.click(timeout=c.MEDIUM)
                 ctx.page.wait_for_timeout(200)
                 return
-        raise ApplyError(f"Could not pick {ans!r} for {label!r}")
+        # Asked rather than failed: see common._choice_miss.
+        raise NeedsHuman(f"'{label}' has no button jobbot could match to {ans!r} (it offers: {', '.join(opts[:8])}). "
+                         "Pick the right one here, or click it in the browser window and click Continue — "
+                         "it is remembered for next time.", question=label, options=list(opts)[:25], kind="radio")
 
     @staticmethod
     def _entry_label(entry) -> str:

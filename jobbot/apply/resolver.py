@@ -83,6 +83,11 @@ _ASKS_FOR_DETAIL_RE = re.compile(
 
 # A question asking what was studied. The same list as the one the suggestion-box filler in common.py
 # matches on, so a board that offers a dropdown and a board that offers a typeahead reach the same answer.
+# Education lists whose own "Other" is the answer when the real one is missing (Greenhouse offers "OTHER"
+# for a university it has never heard of, RUET included). Never used outside education.
+_OTHER_OK_KEY_RE = re.compile(r"school|universit|college|institution|alma mater|educational establishment")
+_OTHER_OPTION_RE = re.compile(r"^(other|others|not listed|other \(please specify\))$", re.I)
+
 _FIELD_OF_STUDY_KEY_RE = re.compile(
     r"field of (?:study|degree)|discipline|\bmajor\b|course of study|area of study|subject of study"
     r"|specialis|specializ|concentration")
@@ -969,6 +974,11 @@ class Resolver:
                 log.info("%r is not on this form's list; taking %r, which facts.yaml allows instead",
                          value, mapped)
                 return mapped
+        if _OTHER_OK_KEY_RE.search(key or "") or _FIELD_OF_STUDY_KEY_RE.search(key or ""):
+            other = next((o for o in options if _OTHER_OPTION_RE.match(str(o).strip())), None)
+            if other is not None:
+                log.info("%r is not on this form's list; taking its %r", value, other)
+                return other
         return None
 
     @staticmethod

@@ -608,14 +608,15 @@ def _serve(app_id: int, live: dict) -> None:
             if cmd[0] != "resume":
                 log.error("app %s: unknown command %r", app_id, cmd)
                 continue
-            _, question, answer = cmd
+            question, answer = cmd[1], cmd[2]
+            options = cmd[3] if len(cmd) > 3 else None
             # The user has now had this window in front of them: whatever they typed into it is
             # theirs, and from here on a filled control may be learned back into facts.yaml.
             live["human_touched"] = True
             if question and answer:
                 # Learned here rather than in the dispatcher so the resolver's dict is only ever touched by
                 # the thread that reads it.
-                live["resolver"].learn(question, answer)
+                live["resolver"].learn(question, answer, options=options or None)
             if live.get("ctx") is None or not common.page_alive(live.get("page")):
                 # The parked browser died while we waited (machine slept, user closed the window — a pause
                 # can last hours). The answer is cached, so a fresh run simply replays it.
@@ -826,6 +827,12 @@ def _resume_application(app_id: int, answer: str) -> None:
         return
     question = app["pending_question"] or ""
     answer = str(answer or "").strip()
+    # The list the question was asked from, kept with the answer: a pick from a board's own list is only
+    # meaningful next to that list, and a later form wording the same option differently is mapped by it.
+    try:
+        options = [str(o) for o in json.loads(app["pending_options"] or "[]") if str(o).strip()]
+    except Exception:  # noqa: BLE001
+        options = []
 
     with _LOCK:
         # Check-and-claim has to be atomic: two clicks on "Answer & continue" would otherwise queue two
@@ -846,7 +853,7 @@ def _resume_application(app_id: int, answer: str) -> None:
             return
         db.update_application(app_id, status="running", reason="", pending_question="", pending_options="",
                               step="Resuming")
-        live["queue"].put(("resume", question, answer))
+        live["queue"].put(("resume", question, answer, options))
         return
 
     # No usable owner: cache the answer here so the fresh run finds it, then run it on this thread.
@@ -856,7 +863,8 @@ def _resume_application(app_id: int, answer: str) -> None:
         log.info("app %s: no live browser, starting fresh", app_id)
     if question and answer:
         from jobbot.apply.resolver import Resolver as _Resolver   # re-imported: the resolver hot-reloads
-        _Resolver({}, {}, {}, False).learn(question, answer, source="human")
+        _Resolver({}, {}, {}, False).learn(question, answer, source="human",
+                                              options=options or None)
     db.update_application(app_id, status="running", reason="", pending_question="", pending_options="",
                           step="Resuming")
     _reload_before_a_fresh_start(app_id)
