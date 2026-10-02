@@ -495,3 +495,51 @@ onto the reloaded class (`resolver._adopt_live_resolvers`), so resolver fixes no
 **Still open:** a UI view of what the playbook has learned; `plan_fields` (the model mapping an unknown
 widget to a fact); diff-based learn-back (step 3); and model-only terminal verdicts are deliberately not
 remembered, because a wrong "closed" lesson would silently refuse good postings.
+
+## 9. What landed on 2026-10-01 (dropdowns built out of `<div>`s — application 274, Shopee)
+
+Shopee's form has 22 fields; the walker saw 8. Every list on it is a `div.shopee-select` with a hidden search
+`<input>` and `div.shopee-option` rows — no `<select>`, no `role=combobox` — so Education Level, School, Course
+of Study, Current Location, the phone's country code and "How did you know about this role?" did not exist as
+far as jobbot was concerned. `field_errors` then pinned each list's complaint on the nearest visible text box
+(CGPA, Website URL), "repaired" those, and marked the CGPA the candidate had just typed *rejected*.
+
+**Widgets, by shape (`common.WIDGET_JS`, `custom_widgets`)**: a visible box ≤120px tall whose class says
+select / dropdown / combobox / autocomplete / cascader / picker, holding no native control, at most one input
+and exactly one readable face. Stamped `data-jobbot-widget`, and from there a control like any other: labelled
+(`_LABEL_JS`), required (`is_required`), counted (`_COUNT_CONTROLS_JS`, observe), named in validation messages
+(`field_errors`), listed when the send button is greyed (`_empty_required`), asked about in `_questions`
+(`_widget_question`: label + the prompt it draws while empty, so two pickers under "Course Period" become
+"Course Period — Course Start Month" / "… End Month"). Driven through the existing combobox helpers, which now
+branch on `is_widget`: `open_widget` polls for the list (inside the root, else one that appeared since the
+click — never the page's header menu), `widget_type` types into the list's own search box, `popup_options`
+reads leaf rows, `choose_widget` tries exact → prefixes → comma parts ("Dhaka, Bangladesh" → "Bangladesh") →
+"Other"; `widget_options` returns [] for a searchable or scrolling list so the resolver never chooses among
+the 12 of 247 rows a virtual list renders. Month pickers: `pick_month` / `fill_date_widget` (year label → year
+table → decade arrows; an end-of-range panel that takes no click on its year is paged with its visible arrow).
+Consent lines with no checkbox at all (`tick_consent_clauses`, by sentence, clicked on the icon-sized box).
+
+**Phone pickers named nowhere**: `is_dial_control` also says yes for a list control standing right before the
+one phone box in its row; `dial_code_for_phone` now drives a picker still on "Select" and reads the code off
+the widget's face. "Contact Number" is `identity.phone`, and a box holding the whole international number
+beside a picker that now holds the code is rewritten to the national part.
+
+**Attribution and memory**: a flagged wrapper (`.shopee-form-item--error`) names the controls *inside* it and
+the complaint is its error leaf, not label+prompt+message run together. `_note_rejected_answer` never
+downgrades a human/typed answer. `_refresh_records` brings a paused run's answer memory up to date from disk on
+Retry. **Facts from answers** (step D of §4, first half): `resolver.FACT_SYNONYMS` maps question families to
+fact keys (gpa/cgpa → `education.gpa`, postcode → `address.postcode`, time zone, pronouns, …); a human answer to
+one is written to facts.yaml through `config.set_fact(create=True)` (new leaf at the end of its block, new block
+at the end of the file, re-parsed before writing) and read back by `_rule_answer`, so one answer covers every
+wording. New rules: GPA (shaped like the box's own example by `shape_gpa`), degree classification, course
+period start/end months, postcode, time zone, pronunciation. `gpa` / `cgpa` / `grade point` are facts-only.
+
+**Verified** with headless probes against the live Shopee form (no personal data entered, nothing submitted):
+all 14 widgets detected and labelled, dial picker → +880, each list chosen correctly (incl. School → Others,
+Course of Study → Computer Science, Classification → Others / Not Applicable, source → Shopee LinkedIn),
+both course-period months, the consent box (idempotent), and a submit on the otherwise empty form now
+attributes every message to its own control.
+
+**Still open:** `config.py` is not hot-reloaded, so `set_fact(create=True)` lands at the next server restart
+(until then a new fact is cached in answers.json only); multi-select widgets pick one value; day-level pickers
+in this shape (`shopee-date-table`) are not driven; the School list has no RUET and goes out as "Others".

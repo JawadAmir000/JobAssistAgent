@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 TEXT_CHARS = 1500
 
-_PAGE_JS = "() => {" + c.DEEP_JS + r"""
+_PAGE_JS = "() => {" + c.DEEP_JS + c.WIDGET_JS + r"""
     const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
         return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
     const heads = [];
@@ -43,6 +43,7 @@ _PAGE_JS = "() => {" + c.DEEP_JS + r"""
         if (['hidden', 'submit', 'button', 'image', 'reset', 'search'].includes(t)) continue;
         if (vis(el) || ((t === 'radio' || t === 'checkbox') && el.labels && el.labels.length && vis(el.labels[0]))) fields++;
     }
+    fields += widgetRoots('body').length;     // dropdowns built out of divs (common.WIDGET_JS)
     return {heads: heads, fields: fields,
             files: deepAll('input[type=file]').length,
             text: ((document.body && document.body.innerText) || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n')};

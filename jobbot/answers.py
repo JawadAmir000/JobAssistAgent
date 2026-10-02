@@ -111,6 +111,9 @@ EDUCATION_KEYWORDS: frozenset[str] = frozenset({
     "field of study", "field of degree", "discipline", "major", "course of study", "area of study",
     "subject of study", "school", "university", "college", "institution", "alma mater",
     "degree", "qualification", "education level", "level of education", "highest education",
+    # A grade is a fact of the transcript, never a guess: the CV does not carry it, the candidate gave it
+    # once (application 274, Shopee) and facts.yaml keeps it under education.gpa.
+    "gpa", "cgpa", "grade point",
 })
 
 # Declarations scoped to a country or a law. The answer changes with the employer, so a remembered one is

@@ -156,64 +156,88 @@ def load_facts() -> dict:
     return facts
 
 
-def set_fact(key: str, value: str) -> bool:
+def set_fact(key: str, value: str, create: bool = False) -> bool:
     """Write one dotted key back into facts.yaml, keeping the file's comments. True when it was written.
 
     A surgical line edit, not a re-dump: facts.yaml is hand-written and its comments are the record of why
     each value is what it is ("confirmed 2026-09-14: no sponsorship needed to work in Bangladesh"), and
-    yaml.safe_dump would throw all of them away. Only an existing leaf under an existing block is touched,
-    so this can add nothing and move nothing; anything else returns False and the caller falls back.
+    yaml.safe_dump would throw all of them away. By default only an existing leaf under an existing block
+    is touched, so this can add nothing and move nothing; with `create` a missing leaf is added at the end
+    of its block (and a missing block at the end of the file), each with a note saying where it came from —
+    that is how a fact the candidate states once in the UI (a CGPA, application 274) becomes a line every
+    later form reads. Anything else returns False and the caller falls back.
     """
     parts = [p for p in (key or "").split(".") if p]
     value = str(value or "").strip()
     if len(parts) != 2 or not value or "\n" in value or len(value) > 300 or not FACTS_PATH.exists():
         return False
     block, leaf = parts
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", block) or not re.fullmatch(r"[a-z][a-z0-9_]*", leaf):
+        return False
     try:
         lines = FACTS_PATH.read_text().splitlines(keepends=True)
     except OSError:
         return False
+    # Quoted unless the value is plainly a word or a URL. An unquoted "+8801XXXXXXXXX" is read back
+    # by YAML as the integer 8801XXXXXXXXX — the phone number silently loses its "+" and every form
+    # after that gets a number that is not the candidate's.
+    plain = bool(re.fullmatch(r"[A-Za-z][\w@:/.\-]*", value))
+    quoted = value if plain else '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     in_block = False
+    block_start = block_end = None      # the block's header line, and the line after its last content line
     for i, line in enumerate(lines):
         stripped = line.rstrip("\n")
         if re.match(rf"^{re.escape(block)}\s*:", stripped):
             in_block = True
+            block_start = i
+            block_end = i + 1
             continue
         if in_block and stripped and not stripped[0].isspace():
             break                      # the next top-level block started; the leaf is not in ours
         if not in_block:
             continue
+        if stripped.strip():
+            block_end = i + 1
         m = re.match(rf"^(\s+{re.escape(leaf)}\s*:\s*)(.*?)(\s+#.*)?$", stripped)
         if not m:
             continue
-        # Quoted unless the value is plainly a word or a URL. An unquoted "+8801XXXXXXXXX" is read back
-        # by YAML as the integer 8801XXXXXXXXX — the phone number silently loses its "+" and every form
-        # after that gets a number that is not the candidate's.
-        plain = bool(re.fullmatch(r"[A-Za-z][\w@:/.\-]*", value))
-        quoted = value if plain else '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         lines[i] = m.group(1) + quoted + (m.group(3) or "") + "\n"
-        original = FACTS_PATH.read_text()
-        candidate = "".join(lines)
-        try:
-            # Never leave the file in a state that does not read back as what was asked for: it is the
-            # source of every answer on every form, and a corrupted value is worse than no update at all.
-            parsed = yaml.safe_load(candidate) or {}
-            if str(((parsed.get(block) or {}) if isinstance(parsed.get(block), dict) else {}).get(leaf)) != value:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "not writing %s to facts.yaml: it would not read back as %r", key, value)
-                return False
-            FACTS_PATH.write_text(candidate)
-        except Exception as e:  # noqa: BLE001
-            import logging
-            logging.getLogger(__name__).warning("facts.yaml not updated (%s); leaving it as it was", e)
-            try:
-                FACTS_PATH.write_text(original)
-            except OSError:
-                pass
+        return _write_facts(lines, block, leaf, value, key)
+    if not create:
+        return False
+    from datetime import date
+    note = f"   # from your answer on a form, {date.today().isoformat()}"
+    if block_start is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines += ["\n", f"{block}:\n", f"  {leaf}: {quoted}{note}\n"]
+    else:
+        lines.insert(block_end, f"  {leaf}: {quoted}{note}\n")
+    return _write_facts(lines, block, leaf, value, key)
+
+
+def _write_facts(lines: list[str], block: str, leaf: str, value: str, key: str) -> bool:
+    """Write `lines` to facts.yaml only if they read back with `key` as `value`."""
+    import logging
+    original = FACTS_PATH.read_text()
+    candidate = "".join(lines)
+    try:
+        # Never leave the file in a state that does not read back as what was asked for: it is the
+        # source of every answer on every form, and a corrupted value is worse than no update at all.
+        parsed = yaml.safe_load(candidate) or {}
+        if str(((parsed.get(block) or {}) if isinstance(parsed.get(block), dict) else {}).get(leaf)) != value:
+            logging.getLogger(__name__).warning(
+                "not writing %s to facts.yaml: it would not read back as %r", key, value)
             return False
-        return True
-    return False
+        FACTS_PATH.write_text(candidate)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("facts.yaml not updated (%s); leaving it as it was", e)
+        try:
+            FACTS_PATH.write_text(original)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def load_answer_records() -> dict[str, "answers.AnswerRecord"]:

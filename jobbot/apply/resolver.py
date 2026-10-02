@@ -86,11 +86,43 @@ _ASKS_FOR_DETAIL_RE = re.compile(
 # Education lists whose own "Other" is the answer when the real one is missing (Greenhouse offers "OTHER"
 # for a university it has never heard of, RUET included). Never used outside education.
 _OTHER_OK_KEY_RE = re.compile(r"school|universit|college|institution|alma mater|educational establishment")
-_OTHER_OPTION_RE = re.compile(r"^(other|others|not listed|other \(please specify\))$", re.I)
+_OTHER_OPTION_RE = re.compile(r"^(?:other|others|not listed|not applicable|none of the above)(?:\s*[/(,:-].*)?$", re.I)
 
 _FIELD_OF_STUDY_KEY_RE = re.compile(
     r"field of (?:study|degree)|discipline|\bmajor\b|course of study|area of study|subject of study"
     r"|specialis|specializ|concentration")
+
+# Questions that are really a personal fact under another name. A human answer to one of these is written
+# to facts.yaml under the key on the right (Resolver._remember_fact), and _rule_answer reads it back from
+# there, so "CGPA", "Cumulative Grade Point Average" and "GPA (out of 4.0)" are one fact answered once —
+# not three cache entries, two of them never matching (application 274, Shopee). Only facts that are the
+# candidate's own and the same at every employer; nothing a law or an employer scopes (those stay in
+# FACTS_ONLY_KEYWORDS and are never derived from a form).
+FACT_SYNONYMS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\b(?:cumulative\s+)?(?:gpa|cgpa|grade\s+point)\b"), "education.gpa"),
+    (re.compile(r"\b(?:degree|grade|honou?rs)\s+classification\b|\bclass\s+of\s+(?:degree|honou?rs)\b"),
+     "education.degree_classification"),
+    (re.compile(r"\bgraduation\s+year\b|\byear\s+of\s+graduation\b"), "education.end_year"),
+    (re.compile(r"\bpronouns?\b"), "eeo.pronouns"),
+    (re.compile(r"\b(?:post(?:al)?\s*code|postcode|zip(?:\s*code)?)\b"), "address.postcode"),
+    (re.compile(r"\bstreet\s+address\b|\baddress\s+line\s*1\b|^\s*street\s*$"), "address.street"),
+    (re.compile(r"^\s*(?:city|town|suburb)\s*$"), "address.city"),
+    (re.compile(r"^\s*(?:state|province|region|county)\s*$"), "address.state"),
+    (re.compile(r"\btime\s*zone\b"), "identity.time_zone"),
+    (re.compile(r"\bpronunciation\b|\bpronounce\b|\bphonetic\b"), "identity.name_pronunciation"),
+)
+
+
+def fact_key_for(question: str) -> str:
+    """The facts.yaml key a question is really asking for, '' when it is not a plain personal fact."""
+    key = normalize_question(question)
+    if not key:
+        return ""
+    for pattern, fact in FACT_SYNONYMS:
+        if pattern.search(key):
+            return fact
+    return ""
+
 
 _YES_WORDS = {"yes", "y", "true"}
 
@@ -469,6 +501,11 @@ class Resolver:
         if is_one_time_secret(key):
             log.info("not caching a one-time code for %r", question)
             return
+        if source == "human":
+            # A personal fact the candidate has just stated (a CGPA, a postcode) is worth more than a
+            # remembered wording: written to facts.yaml under the key the rules read, it answers every
+            # later form however that form words the question. See FACT_SYNONYMS.
+            self._remember_fact(question, rec.answer)
         try:
             # Merged onto what is on disk, never written over it. This resolver holds the cache as it was
             # when its run started, and two applications run at once: saving its own map whole dropped
@@ -476,6 +513,29 @@ class Resolver:
             config.save_answer_records({key: rec})
         except Exception as e:  # pragma: no cover - disk issues shouldn't break an application run
             log.warning("could not save answers cache: %s", e)
+
+    def _remember_fact(self, question: str, answer: str) -> None:
+        key = fact_key_for(question)
+        ans = str(answer or "").strip()
+        if not key or not ans or _is_non_answer(ans) or store.is_placeholder(ans) or len(ans) > 120:
+            return
+        try:
+            try:
+                ok = config.set_fact(key, ans, create=True)
+            except TypeError:
+                # config is not hot-reloaded; a server started before `create` existed still writes an
+                # existing leaf and leaves a new one for the cache to carry until the next restart.
+                ok = config.set_fact(key, ans)
+        except Exception as e:  # noqa: BLE001 - the answer is cached either way
+            log.debug("could not write %s to facts.yaml: %s", key, e)
+            return
+        if ok:
+            try:
+                self.facts = config.load_facts()
+            except Exception:  # noqa: BLE001
+                pass
+            log.info("facts.yaml: %s = %r, from your answer to %r — every later form reads it from there",
+                     key, ans[:60], question[:60])
 
     def knows(self, question: str) -> bool:
         """True when the cache can already answer this, so a value seen on the form teaches nothing new."""
@@ -1191,7 +1251,8 @@ class Resolver:
         if has("last name", "surname", "family name"):
             return f("identity.last_name") or None
         if has("pronounce", "pronunciation", "phonetic"):
-            return None   # asks how to say the name, not what it is; the model renders it phonetically
+            # asks how to say the name, not what it is; facts.yaml if the candidate has said, else the model
+            return f("identity.name_pronunciation") or None
         if has("full name", "legal name", "your name", "preferred name") or key in ("name", "candidate name"):
             return f("identity.full_name") or (f("identity.first_name") + " " + f("identity.last_name")).strip() or None
         # The kind of a contact detail, not the detail: Workday's "Phone Device Type" (Landline / Mobile) got
@@ -1247,6 +1308,16 @@ class Resolver:
         # the country — a different question, and a false answer to it. "Country of residence" is untouched.
         if _RESIDENCY_STATUS_RE.search(key):
             return None
+        if has("postcode", "post code", "postal code", "zip code", " zip "):
+            return f("address.postcode") or None
+        if has("time zone", "timezone"):
+            return f("identity.time_zone") or None
+        if key in ("city", "town", "suburb") and f("address.city"):
+            return f("address.city")
+        if key in ("state", "province", "region", "county") and f("address.state"):
+            return f("address.state")
+        if has("street address", "address line 1") or key == "street":
+            return f("address.street") or None
         if has("country"):
             return f("identity.country") or None
         if has("city", " location", "where are you based", "where do you live", "where are you located", "reside"):
@@ -1294,6 +1365,31 @@ class Resolver:
                 stem = bool(re.search(r"computer|engineering|science|math|physics|technology", held))
                 return "Yes" if (stem or not re.search(r"\b(?:stem|computer|computing|engineering|technical|science)\b", key)) else None
             return None
+        # The transcript: a grade, its classification, and when the course ran. None of these is in the CV
+        # and none may be guessed, so facts.yaml alone answers them (education.gpa was given by the candidate
+        # on application 274 and written there through _remember_fact).
+        if has("gpa", "cgpa", "grade point", "cumulative grade"):
+            gpa = f("education.gpa")
+            if not gpa:
+                return None
+            scale = f("education.gpa_scale")
+            if scale and "/" not in gpa and re.search(r"\bout of\b|/|\bscale\b", key):
+                return f"{gpa}/{scale}"
+            return gpa
+        if has("classification", "honours", "honors", "class of degree"):
+            return f("education.degree_classification") or None
+        # "Course Period — Course Start Month", "Education start date", "Expected graduation date": the
+        # education block's months and years. Gated on an education word so an availability "start date"
+        # or an employment row's "end date" never lands here.
+        if (has("course", "study", "studies", "education", "school", "university", "college", "degree",
+                "academic", "graduat", "enrol")
+                and has("period", " start", " end", " from ", " to ", " date", " month", " year", "graduat", "complet")):
+            start = has(" start", " from ", " begin", " commence")
+            end = has(" end", " to ", "graduat", "complet", " finish", " until")
+            if start and not end:
+                return " ".join(x for x in (f("education.start_month"), f("education.start_year")) if x) or None
+            if end:
+                return " ".join(x for x in (f("education.end_month"), f("education.end_year")) if x) or None
         if has("degree", "qualification", "education level", "level of education", "highest education",
                "highest level"):
             return f("education.degree") or None
@@ -1432,9 +1528,36 @@ def _adopt_live_resolvers() -> int:
                 moved += 1
             except TypeError:       # a layout the new class cannot take; leave it on the old code
                 continue
+            _refresh_records(obj)
     if moved:
         log.info("resolver: %d running application(s) now answer with the reloaded rules", moved)
     return moved
+
+
+def _refresh_records(resolver: "Resolver") -> None:
+    """Bring a paused application's answer memory up to date with answers.json as it is on disk now.
+
+    The runner re-reads facts.yaml for a retry (an edit made while the window waited must land), but the
+    resolver's records were read once at the start of the run. An entry corrected in Settings — or a
+    record this very run wrongly marked rejected, as application 274 did to the CGPA the candidate had just
+    typed — therefore stayed as it was in memory, and the retry asked the question again. Newer wins, so a
+    one-time code learned this run (never written to disk) is kept.
+    """
+    try:
+        disk = config.load_answer_records()
+    except Exception as e:  # noqa: BLE001
+        log.debug("resolver: could not re-read answers.json: %s", e)
+        return
+    changed = 0
+    for key, rec in disk.items():
+        mine = resolver.records.get(key)
+        if mine is None or (rec.learned_at or "") >= (mine.learned_at or ""):
+            if mine is None or rec.to_json() != mine.to_json():
+                changed += 1
+            resolver.records[key] = rec
+    resolver.answers = store.text_view(resolver.records)
+    if changed:
+        log.info("resolver: %d answer record(s) refreshed from answers.json for the retry", changed)
 
 
 _adopt_live_resolvers()

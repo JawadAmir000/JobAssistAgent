@@ -176,6 +176,163 @@ DEEP_JS = r"""
     };
 """
 
+# ---------- dropdowns built out of <div>s ----------
+# A select the walker could not see at all. Shopee's careers site (application 274) draws every list as
+#
+#     <div class="shopee-select">                        <- the widget
+#       <div class="shopee-selector" tabindex="0">       <- what a person clicks
+#         <div class="shopee-selector__inner placeholder">Education Level</div>
+#       </div>
+#       <div class="shopee-popper" style="display:none">  <- the list, with its own search box
+#         <input class="shopee-input__input">            <- hidden until the list is open
+#         <div class="shopee-option">Bachelor's Degree</div> ...
+#
+# No <select>, no role=combobox, and the one <input> is invisible while the list is closed. Every walker
+# here is keyed on input / select / textarea / [role=combobox], so the page's nine dropdowns — Education
+# Level, School, Course of Study, Current Location, the phone's country code, "How did you know about this
+# role?" — were not on the form as far as jobbot was concerned. The resume parse filled some; the rest
+# stayed empty, and the submit bounced on all of them. Worse, field_errors attributes a complaint to the
+# nearest *fillable* control, so "Education Level: please select an option" was pinned on the CGPA text
+# box beside it, which was then "repaired" and its (correct, human-given) answer marked rejected.
+#
+# Element UI / Element Plus (el-select), iView (ivu-select), Vuetify, Semantic UI, Bootstrap-select, Select2
+# and Chosen are all built the same way, so this is keyed on the shape rather than on any vendor's class
+# names: a small, visible box whose class says select / dropdown / picker / combobox, holding at most one
+# text input and exactly one thing to click, and no native control that the walker already drives. The
+# widget's *root* is stamped `data-jobbot-widget` and from then on is a control like any other: it has a
+# label, a value, is required or not, is named in a validation message, and is driven through
+# open_widget / popup_options / choose_combobox below.
+WIDGET_ATTR = "data-jobbot-widget"
+POPUP_ATTR = "data-jobbot-popup"
+OPTION_ATTR = "data-jobbot-opt"
+FACE_ATTR = "data-jobbot-face"
+WIDGET_JS = r"""
+    const W_ROOT_SEL = '[class*="select" i]:not(select):not(option):not(optgroup):not(label), [class*="dropdown" i],'
+                     + ' [class*="combobox" i], [class*="autocomplete" i], [class*="cascader" i], [class*="picker" i]';
+    const W_NATIVE = 'select, textarea, [role=combobox], [role=listbox], input[list], input[type=checkbox],'
+                   + ' input[type=radio], input[type=file], input[type=submit], button[type=submit]';
+    const W_FACE = '[tabindex]:not([tabindex="-1"]), [role=button], button, [class*="selector" i], [class*="control" i],'
+                 + ' [class*="trigger" i], [class*="selection" i], [class*="toggle" i], [class*="inner" i]';
+    const W_POPUP = '[class*="popper" i], [class*="dropdown" i], [class*="popup" i], [class*="menu" i],'
+                  + ' [class*="options" i], [class*="panel" i], [role=listbox], [role=menu]';
+    const W_OPT = '[role=option], [role=menuitem], [role=treeitem], li, [class*="option" i], [class*="item" i]';
+    const W_ICON = '[class*="arrow" i], [class*="caret" i], [class*="chevron" i], [class*="suffix" i],'
+                 + ' [class*="indicator" i], svg, i';
+    const wVis = el => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; } catch (e) { return false; } };
+    const wClean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const wText = el => wClean(el.innerText || el.textContent);
+    const wPrompt = t => /^\s*(?:-+\s*)?(?:please\s+)?(?:select|choose|pick|search)(?:\s+(?:one|an?\s+option|an?\s+answer|an?\s+item|here))?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$/i.test(t || '');
+    const wPopupsIn = root => [...root.querySelectorAll(W_POPUP)];
+    const wCls = n => ((n && n.className && n.className.toString) ? n.className.toString() : '') + ' ' + ((n && n.id) || '');
+    // What the widget shows while closed: its text outside the popup, read from the visible text nodes.
+    const wFaceText = root => {
+        const pops = wPopupsIn(root);
+        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let out = '';
+        for (let n = w.nextNode(); n; n = w.nextNode()) {
+            const p = n.parentElement;
+            if (!p || pops.some(x => x.contains(n)) || !wVis(p)) continue;
+            out += ' ' + n.textContent;
+        }
+        return wClean(out);
+    };
+    const wIsRoot = el => {
+        if (!wVis(el)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.height > 120 || r.width < 40) return false;          // a control's size, never a section's
+        if (el.querySelector(W_NATIVE)) return false;               // wraps something the walker already drives
+        const inputs = [...el.querySelectorAll('input:not([type=hidden])')];
+        if (inputs.length > 1) return false;
+        const pops = wPopupsIn(el);
+        const hasIcon = !!el.querySelector(W_ICON);
+        // An ordinary text box inside a wrapper that merely says "select" in its class: visible, typeable,
+        // no list of its own and no arrow beside it. A filterable el-select has the arrow.
+        if (inputs.length === 1 && wVis(inputs[0]) && !inputs[0].readOnly && !pops.length && !hasIcon) return false;
+        const faces = [...el.querySelectorAll(W_FACE)].filter(f => wVis(f) && !pops.some(p => p.contains(f))
+                                                                && !f.matches('svg, i, [class*="icon" i]'));
+        // What a person could click and read: an arrow icon whose class happens to say "selector" is not
+        // a second face (Shopee's shopee-selector__suffix-icon).
+        const leaf = faces.filter(f => !faces.some(g => g !== f && f.contains(g))
+                                       && (wText(f) || f.matches('[tabindex], button, [role=button]')));
+        if (leaf.length > 1) return false;                          // a row holding two dropdowns
+        if (!leaf.length && !inputs.length && !hasIcon) return false;
+        return wFaceText(el).length <= 160;
+    };
+    const wKind = root => {
+        const around = wCls(root) + ' ' + wCls(root.parentElement) + ' ' + wCls(root.parentElement && root.parentElement.parentElement);
+        if (/date|month|calendar|\btime/i.test(around) || root.querySelector('[class*="calendar" i], [class*="month-table" i], [class*="date" i]')) return 'date';
+        if (/multi/i.test(wCls(root)) || root.querySelector('[class*="tag" i], [class*="chip" i], [class*="multi" i]')) return 'multiselect';
+        return 'select';
+    };
+    const wFace = root => {
+        const pops = wPopupsIn(root);
+        const faces = [...root.querySelectorAll(W_FACE)].filter(f => wVis(f) && !pops.some(p => p.contains(f)));
+        const outer = faces.filter(f => !faces.some(g => g !== f && g.contains(f)));
+        return outer[0] || root;                                    // the outermost face carries the click handler
+    };
+    const wPlaceholderText = root => {
+        const pops = wPopupsIn(root);
+        return wClean([...root.querySelectorAll('[class*="placeholder" i]')]
+            .filter(e => !pops.some(p => p.contains(e)) && wVis(e)).map(wText).join(' '));
+    };
+    const wValue = root => {
+        const pops = wPopupsIn(root);
+        const notPop = e => !pops.some(p => p.contains(e)) && wVis(e);
+        const tagEls = [...root.querySelectorAll('[class*="tag" i], [class*="chip" i], [class*="multi-value" i], [class*="selection-item" i]')]
+            .filter(notPop);
+        // the leaf-most: a tag's container is named "tags" and would read every tag a second time
+        const tags = tagEls.filter(t => !tagEls.some(u => u !== t && t.contains(u))).map(wText).filter(Boolean);
+        if (tags.length) return tags.join(', ');
+        const inp = root.querySelector('input:not([type=hidden])');
+        if (inp && notPop(inp) && wClean(inp.value)) return wClean(inp.value);
+        let t = wFaceText(root);
+        const ph = wPlaceholderText(root);
+        if (ph) t = wClean(t.replace(ph, ' '));
+        return (!t || wPrompt(t)) ? '' : t;
+    };
+    const widgetRoots = scope => {
+        const tops = (!scope || scope === 'body') ? [document.body] : deepAll(scope);
+        const out = [];
+        let n = document.querySelectorAll('[data-jobbot-widget]').length;
+        for (const top of tops) {
+            if (!top) continue;
+            for (const el of top.querySelectorAll(W_ROOT_SEL)) {
+                const stamped = el.closest('[data-jobbot-widget]');
+                if (stamped && stamped !== el) continue;             // inside a widget already found
+                if (stamped === el) { if (wVis(el)) out.push(el); continue; }
+                if (!wIsRoot(el)) continue;
+                el.setAttribute('data-jobbot-widget', 'w' + (n++));
+                out.push(el);
+            }
+        }
+        return out;
+    };
+    const wMarkSeenPopups = () => {
+        for (const p of document.querySelectorAll(W_POPUP)) {
+            if (wVis(p)) p.setAttribute('data-jobbot-popup-seen', '1'); else p.removeAttribute('data-jobbot-popup-seen');
+        }
+    };
+    // The list a widget opened: inside the widget when it is drawn there (Shopee), else the list that
+    // appeared on the page since the click (Element UI appends its dropdown to <body>).
+    const wPopupOf = root => {
+        const inside = wPopupsIn(root).filter(wVis);
+        if (inside.length) return inside[0];
+        const positioned = p => ['absolute', 'fixed'].includes(getComputedStyle(p).position);
+        const all = [...document.querySelectorAll(W_POPUP)].filter(p => wVis(p) && !root.contains(p) && !p.contains(root) && positioned(p));
+        const outer = ps => ps.filter(p => !ps.some(q => q !== p && q.contains(p)));
+        // Only a list that appeared since the click: the site's own header menu is a visible, positioned
+        // thing full of <li>s, and taken as "the list" it had no rows worth reading (application 274).
+        const fresh = outer(all.filter(p => !p.hasAttribute('data-jobbot-popup-seen')));
+        const withOpts = ps => ps.filter(p => p.querySelector(W_OPT));
+        return withOpts(fresh)[0] || fresh[0] || null;
+    };
+    const wOptions = popup => {
+        const all = [...popup.querySelectorAll(W_OPT)].filter(o => wVis(o) && wClean(o.innerText));
+        return all.filter(o => !all.some(x => x !== o && o.contains(x)));     // the leaf-most: one per row
+    };
+"""
+
 
 def clean(s: str | None) -> str:
     return _WS.sub(" ", (s or "").replace("\xa0", " ")).strip()
@@ -1139,9 +1296,14 @@ _FIELD_ERRORS_JS = """
         return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
       } catch (err) { return false; } };
     const NOT_ERR = /success|uploaded|saved\\b|complete[ds]?\\b|thank you|no errors/i;
-    const CTRL = "input,select,textarea,[role=combobox],[contenteditable='true']";
+    // Dropdowns built out of divs are controls here too (WIDGET_JS): a complaint about one used to land on
+    // the nearest text box instead -- Shopee's "Education Level: please select" on the CGPA box beside it.
+    widgetRoots('body');
+    const CTRL = "input,select,textarea,[role=combobox],[contenteditable='true'],[data-jobbot-widget]";
     const fillable = e => {
         if (!e || !e.matches || !e.matches(CTRL)) return false;
+        if (e.hasAttribute('data-jobbot-widget')) return vis(e);
+        if (e.closest('[data-jobbot-widget]')) return false;     // a widget's own search box: the widget is the control
         const t = (e.getAttribute('type') || '').toLowerCase();
         if (['hidden', 'submit', 'button', 'reset', 'image'].indexOf(t) >= 0) return false;
         if (e.disabled) return false;
@@ -1187,6 +1349,7 @@ _FIELD_ERRORS_JS = """
         return clean(e.getAttribute('placeholder') || e.getAttribute('name') || e.getAttribute('id'));
     };
     const kindOf = e => {
+        if (e.hasAttribute('data-jobbot-widget')) return wKind(e) === 'date' ? 'date' : 'combobox';
         const tag = e.tagName.toLowerCase();
         if (tag === 'select') return 'select';
         if (tag === 'textarea') return 'textarea';
@@ -1197,6 +1360,7 @@ _FIELD_ERRORS_JS = """
         return 'text';
     };
     const valueOf = e => {
+        if (e.hasAttribute('data-jobbot-widget')) return wValue(e);
         const tag = e.tagName.toLowerCase();
         if (tag === 'select') return clean(e.selectedIndex >= 0 && e.options[e.selectedIndex]
                                            ? e.options[e.selectedIndex].textContent : '');
@@ -1219,6 +1383,22 @@ _FIELD_ERRORS_JS = """
             }
         }
         const low = clean(msg).toLowerCase();
+        // A field's whole block flagged as erroneous (".shopee-form-item--error", ".has-error", ".is-invalid"
+        // on the wrapper) names the controls inside it. Walking *up* from such a block is what pinned one
+        // field's complaint on its neighbour (application 274): the block's own control was a div-built
+        // dropdown nothing counted, so the climb went on until it met the next text box.
+        const own = Array.prototype.filter.call(node.querySelectorAll(CTRL), fillable);
+        if (own.length) {
+            if (own.length <= 3) {
+                const bad = own.filter(e => e.getAttribute('aria-invalid') === 'true');
+                return bad.length ? bad : own;
+            }
+            const named = own.filter(e => {
+                const l = labelFor(e).toLowerCase().replace(/[*:]/g, '').trim();
+                return l.length > 2 && low.indexOf(l) >= 0;
+            });
+            return named.length ? named : [];
+        }
         let p = node.parentElement, hops = 0;
         while (p && hops++ < 5) {
             const inside = Array.prototype.filter.call(p.querySelectorAll(CTRL), fillable);
@@ -1260,10 +1440,32 @@ _FIELD_ERRORS_JS = """
                   + " [class*='warning' i], [id*='error' i], [id*='err' i]";
     // A page title read out by a route announcer is navigation, not a complaint (see form_errors).
     const announcer = el => !!deepClosest(el, 'next-route-announcer, [id*=announcer i], [class*=announcer i], [data-testid*=announcer i]') || clean(el.innerText || el.textContent) === clean(document.title);
+    // What a flagged block is complaining about. For a block that holds the field itself (label, control
+    // and message together) that is the marked line inside it, never the block's whole text: "Education
+    // Level* Education Level Please select an option" is three things run together, of which only the last
+    // is the complaint.
+    const ERR_LEAF = /error|invalid|message|explain|help|hint|feedback|warning|validation/i;
+    const errText = el => {
+        const inside = Array.prototype.filter.call(el.querySelectorAll(CTRL), fillable);
+        if (!inside.length) return el.innerText || el.textContent;
+        const leaves = Array.prototype.filter.call(el.querySelectorAll('*'), n => vis(n) && !n.matches(CTRL)
+            && !n.querySelector(CTRL) && ERR_LEAF.test((n.className || '').toString() + ' ' + (n.id || ''))
+            && clean(n.innerText || n.textContent));
+        const leaf = leaves.filter(n => !leaves.some(m => m !== n && n.contains(m)))[0];
+        if (leaf) return leaf.innerText || leaf.textContent;
+        let t = clean(el.innerText || el.textContent);
+        for (const c of inside) { const l = clean(labelFor(c)); if (l) t = t.split(l).join(' '); }
+        return clean(t);
+    };
     for (const el of deepAll(ERR_SEL)) {
         if (!vis(el) || announcer(el)) continue;
-        if (fillable(el)) continue;          // an input flagged invalid is picked up on its own below
-        const txt = el.innerText || el.textContent;
+        if (fillable(el)) {
+            // An input flagged invalid is picked up on its own below; a div-built dropdown carrying the
+            // error class on its root has no other way in.
+            if (el.hasAttribute('data-jobbot-widget')) add([el], 'the form marked this field invalid');
+            continue;
+        }
+        const txt = errText(el);
         add(ownersOf(el, txt), txt);
     }
     // An aria-errormessage reference is unambiguous, whatever the container is called.
@@ -1296,7 +1498,7 @@ def field_errors(page: Any) -> list[dict]:
     it from a label that may not be unique.
     """
     try:
-        found = page.evaluate("() => {" + DEEP_JS + _FIELD_ERRORS_JS)
+        found = page.evaluate("() => {" + DEEP_JS + WIDGET_JS + _FIELD_ERRORS_JS)
     except Exception as e:  # noqa: BLE001 - diagnosis must never become the failure
         log.debug("field_errors failed: %s", e)
         return []
@@ -1361,6 +1563,16 @@ def _note_rejected_answer(label: str, value: str, why: str) -> None:
             # field on a bounced submit, so a correct "Jawad" in Preferred First Name was marked rejected
             # (application 182) because the textarea below it was empty.
             return
+        if rec.trust >= store.TRUST["typed"]:
+            # The candidate's own answer, given in the UI or typed into the window, is not jobbot's to
+            # throw away on the strength of a validation message -- least of all one that may be about a
+            # different control: Shopee's "Education Level: please select an option" was attributed to the
+            # CGPA box beside it, and the CGPA the candidate had just supplied was marked rejected
+            # (application 274). The complaint is noted on the record and the answer stays in use.
+            rec.note = f"a form complained near it: {why[:120]}"
+            config.save_answer_records({key: rec})
+            log.info("answers.json: %r kept (your own answer) despite the form's complaint %r", key[:60], why[:60])
+            return
         rec.confidence = "rejected"
         rec.note = f"the form refused it: {why[:120]}"
         config.save_answer_records({key: rec})
@@ -1408,7 +1620,7 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
             return False
         return bool(tick(el))
 
-    if kind in ("radio", "file"):
+    if kind in ("radio", "file", "date"):
         return False        # the group container is not knowable from here; the broad refill handles these
 
     if kind == "select":
@@ -1479,6 +1691,8 @@ def repair_fields(ctx: ApplyContext, fields: list[dict]) -> list[str]:
             # field_errors names a control the quick way, which takes a list's own "Select" for its name;
             # the full reader finds the question written above it (application 175).
             f["label"] = get_label_for(el) or f["label"]
+        if f["kind"] in ("combobox", "select") and is_dial_control(el):
+            continue        # a phone's country code: the identity refill sets it from the number itself
         log.info("repairing %r (%s, holds %r): %s",
                  f["label"][:60], f["kind"], f["value"][:40], f["message"][:90])
         if not re.search(r"\w", f.get("label") or ""):
@@ -1631,8 +1845,10 @@ _LABEL_JS = """e => {
     // What a control shows while empty ("Select", "Search", "Choose…") names nothing.
     const prompt = t => /^\\s*(?:-+\\s*)?(?:please\\s+)?(?:select|search|choose|pick|type to search|start typing)\\b[\\s\\w]{0,20}?(?:\\.{3}|…)?\\s*(?:-+)?\\s*$/i.test(t || '')
                         && !/\\?/.test(t || '');
+    // A dropdown built out of divs (data-jobbot-widget, see WIDGET_JS) is a field like any other: without
+    // it here, the text drawn on one ("Course Start Month") read as the question of the picker after it.
     const CTRL = 'input:not([type=hidden]), textarea, select, button, [role=combobox], [role=radiogroup], '
-               + '[role=radio], [role=checkbox], [role=listbox], [role=switch], [contenteditable=true]';
+               + '[role=radio], [role=checkbox], [role=listbox], [role=switch], [contenteditable=true], [data-jobbot-widget]';
     const before = start => {
         const own = n => { let x = n; while (x.parentElement && !x.parentElement.contains(start)) x = x.parentElement; return x; };
         const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
@@ -1648,7 +1864,10 @@ _LABEL_JS = """e => {
             if (host.closest('script, style, noscript, [aria-hidden=true]')) continue;
             const branch = own(host);
             if (branch.matches(CTRL) || branch.querySelector(CTRL)) return '';   // the previous field's own text
-            const blk = host.closest('p, label, legend, h1, h2, h3, h4, h5, h6, li, dt, div, span') || host;
+            // The <label> itself when the text sits in one: Shopee writes the required star in a sibling
+            // <i> of the span holding the words, so the span alone reads "First Name" and the field looked
+            // optional (application 274).
+            const blk = host.closest('label, legend') || host.closest('p, h1, h2, h3, h4, h5, h6, li, dt, div, span') || host;
             if (!vis(blk)) continue;
             const t = tx(blk);
             if (!real(t) || prompt(t)) continue;
@@ -1704,7 +1923,11 @@ _LABEL_JS = """e => {
         // two fields lends each its own label rather than the first in the markup (see get_label_for).
         let above = '', below = '';
         for (const l of p.querySelectorAll('label, legend, .label, [class*="label" i], h3, h4, h5')) {
-            if (l.contains(e)) continue;
+            if (l.contains(e) || !vis(l)) continue;
+            // Another field's own words: the header labels inside the month picker before this one
+            // ("2020 – 2029") named the picker after it (application 274).
+            const owner = l.closest(CTRL);
+            if (owner && owner !== e && !owner.contains(e)) continue;
             const t = tx(l);
             if (!real(t)) continue;
             if (l.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING) above = t;
@@ -2134,6 +2357,8 @@ def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
     the dial-code picker, the one control known to need the whole list, reads its rows through _dial_rows
     so it can click one without closing the list first.
     """
+    if is_widget(combo):
+        return widget_options(page, combo)
     opts: list[str] = []
     try:
         combo.click(timeout=SHORT)
@@ -2171,6 +2396,8 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
     """
     if seen is None:
         seen = []
+    if is_widget(combo):
+        return choose_widget(page, combo, answer, alternatives, allow_other=allow_other, seen=seen)
     try:
         combo.click(timeout=SHORT)
         page.wait_for_timeout(200)
@@ -2304,6 +2531,503 @@ def _log_combo_miss(combo: Any, answer: str, typed_options: list[str]) -> None:
                 answer[:80], typed_options[:12], re.sub(r"\s+", " ", shape or "")[:1200])
 
 
+# ---------- driving a dropdown built out of <div>s (see WIDGET_JS) ----------
+_WIDGET_SCAN_JS = "(scope) => {" + DEEP_JS + WIDGET_JS + """
+    return widgetRoots(scope).map(r => ({id: r.getAttribute('data-jobbot-widget'), kind: wKind(r), value: wValue(r),
+                                         face: wFaceText(r), placeholder: wPlaceholderText(r)}));
+}"""
+
+
+def custom_widgets(page: Any, scope: str = "body") -> list[dict]:
+    """Every dropdown built out of divs under `scope`, stamped so it can be reached again by `widget()`.
+
+    Each entry: `id` (the stamp), `kind` ("select" / "multiselect" / "date"), `value` (what it shows, '' while
+    it only shows its prompt), `face` (all its visible text) and `placeholder` (the prompt it draws while
+    empty — "Course Start Month" — which is the half of the question its label does not carry).
+    """
+    try:
+        return [w for w in (page.evaluate(_WIDGET_SCAN_JS, scope) or []) if isinstance(w, dict) and w.get("id")]
+    except Exception as e:  # noqa: BLE001 - a page that cannot be scanned has no widgets to drive
+        log.debug("custom_widgets: %s", e)
+        return []
+
+
+def widget(page: Any, wid: str) -> Any:
+    return page.locator(f"[{WIDGET_ATTR}='{wid}']").first
+
+
+def is_widget(el: Any) -> bool:
+    try:
+        return bool(el.evaluate(f"e => e.hasAttribute('{WIDGET_ATTR}')"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def in_widget(el: Any) -> bool:
+    """True for a control that belongs to a widget: its search box, which the widget's own driver types into."""
+    try:
+        return bool(el.evaluate(f"e => !!e.closest('[{WIDGET_ATTR}]') && !e.hasAttribute('{WIDGET_ATTR}')"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def widget_value(root: Any) -> str:
+    try:
+        return clean(root.evaluate("e => {" + DEEP_JS + WIDGET_JS + " return wValue(e); }"))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def widget_kind(root: Any) -> str:
+    try:
+        return str(root.evaluate("e => {" + DEEP_JS + WIDGET_JS + " return wKind(e); }") or "select")
+    except Exception:  # noqa: BLE001
+        return "select"
+
+
+def open_widget(page: Any, root: Any) -> bool:
+    """Click the widget open and stamp the list it drew `data-jobbot-popup`. False when nothing opened."""
+    try:
+        root.evaluate("e => {" + DEEP_JS + WIDGET_JS + f"""
+            for (const old of document.querySelectorAll('[{FACE_ATTR}]')) old.removeAttribute('{FACE_ATTR}');
+            for (const old of document.querySelectorAll('[{POPUP_ATTR}]')) old.removeAttribute('{POPUP_ATTR}');
+            wMarkSeenPopups();
+            wFace(e).setAttribute('{FACE_ATTR}', '1'); }}""")
+        face = page.locator(f"[{FACE_ATTR}]").first
+        face.scroll_into_view_if_needed(timeout=SHORT)
+        face.click(timeout=MEDIUM)
+        # The list slides in: read too soon, a date picker's panel measured 0x0 and the page's header menu
+        # was taken for the list instead. Poll until something has really opened.
+        for _ in range(6):
+            page.wait_for_timeout(300)
+            found = root.evaluate("e => {" + DEEP_JS + WIDGET_JS + f"""
+                const p = wPopupOf(e);
+                if (!p) return false;
+                p.setAttribute('{POPUP_ATTR}', '1');
+                return true; }}""")
+            if found:
+                return True
+        log.debug("open_widget: nothing opened under the widget")
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.debug("open_widget: %s", e)
+        return False
+
+
+def widget_popup(page: Any) -> Any:
+    return page.locator(f"[{POPUP_ATTR}]").first
+
+
+def widget_filter(page: Any, root: Any) -> Any | None:
+    """The search box of an open widget — in its list (Shopee) or in its face (a filterable el-select)."""
+    for scope in (widget_popup(page), root):
+        try:
+            box = scope.locator("input:not([type=hidden]):not([readonly])")
+            for i in range(min(box.count(), 3)):
+                if is_visible_now(box.nth(i)):
+                    return box.nth(i)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def widget_type(page: Any, root: Any, text: str) -> bool:
+    """Put `text` in the open widget's search box; failing one, type at the widget, which some forward."""
+    box = widget_filter(page, root)
+    try:
+        if box is not None:
+            box.click(timeout=SHORT)
+            box.fill("", timeout=SHORT)
+            if text:
+                box.press_sequentially(text, delay=20, timeout=MEDIUM)
+            page.wait_for_timeout(700)      # a remote list refetches on every keystroke
+            return True
+        if text:
+            page.keyboard.type(text, delay=20)
+            page.wait_for_timeout(500)
+            return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("widget_type(%r): %s", text[:30], e)
+    return False
+
+
+def popup_options(page: Any, limit: int = 120) -> tuple[Any, list[str]]:
+    """(locator, texts) over the rows of whatever list is open: ARIA options where the page draws them, else
+    the leaf rows of the popup a widget opened (see WIDGET_JS). The locator and the texts are index-aligned."""
+    try:
+        items = page.locator("[role=option]:visible")
+        n = min(items.count(), limit)
+        if n:
+            return items, [option_text(items.nth(i)) for i in range(n)]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        texts = page.evaluate("() => {" + DEEP_JS + WIDGET_JS + f"""
+            for (const old of document.querySelectorAll('[{OPTION_ATTR}]')) old.removeAttribute('{OPTION_ATTR}');
+            const popup = document.querySelector('[{POPUP_ATTR}]');
+            if (!popup) return [];
+            const rows = wOptions(popup).slice(0, {limit});
+            rows.forEach((o, i) => o.setAttribute('{OPTION_ATTR}', String(i)));
+            return rows.map(wText); }}""") or []
+        return page.locator(f"[{OPTION_ATTR}]"), [clean(t) for t in texts]
+    except Exception as e:  # noqa: BLE001
+        log.debug("popup_options: %s", e)
+        return page.locator(f"[{OPTION_ATTR}]"), []
+
+
+def popup_is_complete(page: Any) -> bool:
+    """True when the open list shows every option it has: no search box to narrow it and nothing to scroll.
+    A virtualised list (Shopee renders 12 of 247 countries) or a searchable one is open-ended, and the
+    rows on screen must not be handed to the resolver as the whole list."""
+    try:
+        return bool(page.evaluate("() => {" + DEEP_JS + WIDGET_JS + f"""
+            const popup = document.querySelector('[{POPUP_ATTR}]');
+            if (!popup) return false;
+            if ([...popup.querySelectorAll('input:not([type=hidden])')].some(wVis)) return false;
+            for (const n of [popup, ...popup.querySelectorAll('*')]) {{
+                if (n.scrollHeight > n.clientHeight + 4 && getComputedStyle(n).overflowY !== 'visible' && n.querySelector(W_OPT)) return false;
+            }}
+            return true; }}"""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def close_popups(page: Any, root: Any | None = None) -> None:
+    """Shut whatever list is open. Escape first; a multi-select that ignores it is closed by clicking its own
+    face, and last by a click on the page's margin — an open list intercepts every later click (Shopee's
+    Skills list swallowed the click meant for the question below it)."""
+    def still_open() -> bool:
+        try:
+            return is_visible_now(widget_popup(page))
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(150)
+        if still_open() and root is not None:
+            page.locator(f"[{FACE_ATTR}]").first.click(timeout=SHORT)
+            page.wait_for_timeout(200)
+        if still_open():
+            page.mouse.click(2, 300)
+            page.wait_for_timeout(200)
+    except Exception as e:  # noqa: BLE001
+        log.debug("close_popups: %s", e)
+
+
+def _click_row(items: Any, texts: list[str], idx: int, page: Any) -> None:
+    items.nth(idx).click(timeout=SHORT)
+    page.wait_for_timeout(300)
+
+
+def _pick_row(items: Any, texts: list[str], answer: str, page: Any, seen: list[str]) -> bool:
+    """Click the row that is `answer`: exact, the same option differently punctuated, the one row left that
+    contains it, or the first that starts with it. Never a blind Enter."""
+    _note_seen(seen, texts)
+    want = clean(answer).lower()
+    if not want:
+        return False
+    pick = next((i for i, t in enumerate(texts) if t.lower() == want or same_option(t, answer)), None)
+    if pick is None and len(texts) == 1 and want in texts[0].lower():
+        pick = 0
+    if pick is None:
+        pick = next((i for i, t in enumerate(texts) if t.lower().startswith(want)), None)
+    if pick is None:
+        return False
+    _click_row(items, texts, pick, page)
+    return True
+
+
+def _comma_parts(value: str) -> list[str]:
+    """"Dhaka, Bangladesh" is also "Dhaka" and "Bangladesh": a list of countries holds the second."""
+    parts = [clean(p) for p in (value or "").split(",")]
+    return [p for p in parts if p and p.lower() != clean(value).lower()]
+
+
+def choose_widget(page: Any, root: Any, answer: str, alternatives: tuple[str, ...] | list[str] = (), *,
+                  allow_other: bool = False, seen: list[str] | None = None) -> bool:
+    """choose_combobox for a div-built dropdown: open it, search its own box, click the row, read it back."""
+    if seen is None:
+        seen = []
+    if not open_widget(page, root):
+        log.info("widget: could not open the list for %r", answer[:40])
+        return False
+    try:
+        targets = [answer, *[a for a in alternatives if a], *_comma_parts(answer)]
+        # The list as it opens — the whole of a short one, the first page of a long one.
+        items, texts = popup_options(page)
+        if _pick_row(items, texts, answer, page, seen) and widget_value(root):
+            return True
+        filterable = widget_filter(page, root) is not None
+        queries: list[str] = []
+        for q in [answer, *_suggestion_queries(answer, alternatives), *_comma_parts(answer)]:
+            if q and q not in queries:
+                queries.append(q)
+        for query in queries[:10] if filterable else []:
+            if not widget_type(page, root, query):
+                break
+            items, texts = popup_options(page)
+            _note_seen(seen, texts)
+            if not texts:
+                continue
+            for target in targets:
+                pick = _best_suggestion(texts, target)
+                if pick and pick in texts:
+                    _click_row(items, texts, texts.index(pick), page)
+                    if widget_value(root):
+                        log.info("widget: typed %r, took %r for %r", query, pick, answer)
+                        return True
+        if allow_other and filterable:
+            for query in ("Other", "Not listed", "Not applicable"):
+                if not widget_type(page, root, query):
+                    break
+                items, texts = popup_options(page)
+                _note_seen(seen, texts)
+                pick = next((t for t in texts if _OTHER_RE.match(clean(t))), "")
+                if pick:
+                    _click_row(items, texts, texts.index(pick), page)
+                    if widget_value(root):
+                        log.info("widget: %r is not on this list — falling back to %r", answer, pick)
+                        return True
+        # Nothing took. Show the caller the list's real rows rather than the empty result of a search.
+        if filterable:
+            widget_type(page, root, "")
+            _, texts = popup_options(page)
+            _note_seen(seen, texts)
+        _log_combo_miss(root, answer, seen)
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.debug("choose_widget(%r): %s", answer, e)
+        return False
+    finally:
+        close_popups(page, root)
+
+
+def widget_options(page: Any, root: Any) -> list[str]:
+    """The rows a div-built dropdown offers, when it shows all of them; [] for a searchable or scrolling list,
+    whose first page must not be mistaken for the whole (the resolver would pick among twelve of 247)."""
+    if not open_widget(page, root):
+        return []
+    try:
+        if not popup_is_complete(page):
+            return []
+        _, texts = popup_options(page)
+        return [t for t in texts if t and not is_prompt_value(t)]
+    finally:
+        close_popups(page, root)
+
+
+# ---------- month pickers ----------
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_PICKER_CELL_JS = "() => {" + DEEP_JS + WIDGET_JS + f"""
+    const popup = document.querySelector('[{POPUP_ATTR}]');
+    if (!popup) return null;
+    // Document-wide: the stamps left in the previous picker's (now hidden) panel were what a locator found
+    // first, so the end-of-range panel's "Jan" click landed on the start panel's invisible one.
+    for (const old of document.querySelectorAll('[data-jobbot-cell], [data-jobbot-head]')) {{
+        old.removeAttribute('data-jobbot-cell'); old.removeAttribute('data-jobbot-head'); }}
+    const cells = [...popup.querySelectorAll('td, [class*="col" i], [class*="cell" i], [class*="item" i], [role=gridcell], button')]
+        .filter(c => wVis(c) && wClean(c.innerText).length <= 12 && !c.querySelector('td, [class*="col" i], [class*="cell" i]'));
+    cells.forEach((c, i) => c.setAttribute('data-jobbot-cell', String(i)));
+    const heads = [...popup.querySelectorAll('[class*="header" i] *, [class*="title" i], [role=heading]')]
+        .filter(h => wVis(h) && !h.querySelector('*') || (h.children.length <= 2 && wVis(h)));
+    heads.forEach((h, i) => h.setAttribute('data-jobbot-head', String(i)));
+    const nav = sel => {{ const n = popup.querySelector(sel); return n && wVis(n); }};
+    return {{cells: cells.map(wText), heads: heads.map(wText),
+            prev: nav('[class*="prev" i], [aria-label*="previous" i]'), next: nav('[class*="next" i], [aria-label*="next" i]')}};
+}}"""
+
+
+def _month_index(text: str) -> int | None:
+    t = clean(text).lower()[:3]
+    return _MONTHS.index(t) + 1 if t in _MONTHS else None
+
+
+def pick_month(page: Any, root: Any, year: int, month: int) -> bool:
+    """Choose `month`/`year` in a div-built month picker: a year label to click, a table of years, a table
+    of months (Shopee's Course Period; Element UI's month picker is the same shape). True when the widget
+    reads back a value afterwards."""
+    if not open_widget(page, root):
+        return False
+    try:
+        label_tried = False
+        for step in range(40):
+            info = page.evaluate(_PICKER_CELL_JS)
+            if not info:
+                log.debug("pick_month: no open picker at step %d", step)
+                return False
+            cells, heads = info["cells"], info["heads"]
+            years = [i for i, t in enumerate(cells) if re.fullmatch(r"\d{4}", clean(t))]
+            months = [i for i, t in enumerate(cells) if _month_index(t)]
+            head_year = next((int(m.group(0)) for h in heads for m in [re.search(r"\b(19|20)\d{2}\b", h)] if m), None)
+            log.debug("pick_month step %d: heads=%s years=%s months=%d head_year=%s", step,
+                      [h for h in heads if h], [cells[i] for i in years], len(months), head_year)
+            if not years and not months and step < 4:
+                # The first picker opened on a page draws its panel a moment after the popup itself
+                # (Shopee's Course Period: an empty popper at first read, the month table on the next).
+                page.wait_for_timeout(400)
+                continue
+            if years and not months:
+                # A table of years: click ours, else page to the decade that holds it.
+                hit = next((i for i in years if int(cells[i]) == year), None)
+                if hit is not None:
+                    _click_picker(page, page.locator(f"[data-jobbot-cell='{hit}']").first)
+                    continue
+                shown = [int(cells[i]) for i in years]
+                arrow = "prev" if year < min(shown) else "next"
+                if not info.get(arrow):
+                    return False
+                target = _visible_arrow(widget_popup(page).locator(
+                    f"[class*='{arrow}' i], [aria-label*='{'previous' if arrow == 'prev' else 'next'}' i]"), prefer_last=False)
+                if target is None:
+                    return False
+                _click_picker(page, target)
+                continue
+            if months:
+                if head_year is not None and head_year != year:
+                    label = next((i for i, h in enumerate(heads) if re.fullmatch(r"\s*(19|20)\d{2}\s*", h)), None)
+                    if label is not None and not label_tried:
+                        # The year in the header opens a table of years on most pickers.
+                        label_tried = True
+                        _click_picker(page, page.locator(f"[data-jobbot-head='{label}']").first)
+                        continue
+                    # Not here it does not (the end-of-range panel on Shopee's Course Period takes no click
+                    # on its year): page a year at a time with the arrow nearest the header's labels.
+                    arrow = "prev" if year < head_year else "next"
+                    if not info.get(arrow):
+                        return False
+                    arrows = widget_popup(page).locator(
+                        f"[class*='{arrow}' i], [aria-label*='{'previous' if arrow == 'prev' else 'next'}' i]")
+                    target = _visible_arrow(arrows, prefer_last=(arrow == "prev"))
+                    if target is None:
+                        return False
+                    _click_picker(page, target)
+                    continue
+                hit = next((i for i in months if _month_index(cells[i]) == month), None)
+                if hit is None:
+                    return False
+                _click_picker(page, page.locator(f"[data-jobbot-cell='{hit}']").first)
+                page.wait_for_timeout(200)
+                got = widget_value(root)
+                log.debug("pick_month: clicked %r, widget now shows %r", cells[hit], got)
+                return bool(got)
+            log.debug("pick_month: neither months nor years on screen (cells=%s)", cells[:8])
+            return False
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.debug("pick_month: %s", e)
+        return False
+    finally:
+        close_popups(page, root)
+
+
+def _visible_arrow(arrows: Any, prefer_last: bool) -> Any | None:
+    """The arrow a person could press: a range picker's end panel keeps one of its two drawn and hides the
+    other, and a click aimed at the hidden one waits for ever."""
+    try:
+        shown = [arrows.nth(i) for i in range(min(arrows.count(), 6)) if is_visible_now(arrows.nth(i))]
+    except Exception:  # noqa: BLE001
+        return None
+    if not shown:
+        return None
+    return shown[-1] if prefer_last else shown[0]
+
+
+def _click_picker(page: Any, el: Any) -> None:
+    """Click a calendar cell or header. A real click first; when the previous picker's popup is still fading
+    out over it (Playwright then waits for the overlay for ever), the element's own click handler."""
+    try:
+        el.click(timeout=SHORT)
+    except Exception as e:  # noqa: BLE001
+        log.debug("picker click fell back to a scripted click: %s", str(e)[:80])
+        el.evaluate("e => e.click()")
+    page.wait_for_timeout(350)
+
+
+def fill_date_widget(page: Any, root: Any, answer: str) -> bool:
+    """Put a date answer ("January 2015", "2019-01", "Immediately") into a div-built date picker."""
+    from dateutil import parser as dateparser
+    text = clean(answer)
+    if not text:
+        return False
+    today = datetime.now().date()
+    try:
+        when = _target_date(text, today) if _SOON_RE.search(text) or _IN_RE.search(text) else \
+            dateparser.parse(text, fuzzy=True, default=datetime(today.year, 1, 1)).date()
+    except (ValueError, OverflowError):
+        return False
+    if when is None:
+        return False
+    return pick_month(page, root, when.year, when.month)
+
+
+# ---------- consent boxes drawn without an input ----------
+# "By proceeding, I confirm that I have carefully read and agree to the Terms of Service and Privacy Policy"
+# beside a small <div> that is the tick box — no <input>, no role, and on Shopee not even inside the <form>.
+# Nothing above can see it, and the submit is refused until it is ticked. Found by its sentence, which is the
+# one thing every consent line has; ticked by clicking the icon-sized element drawn before the sentence.
+_CONSENT_SCAN_JS = "() => {" + DEEP_JS + WIDGET_JS + r"""
+    const RE = /\bI\s+(?:confirm|agree|accept|acknowledge|consent|certify|declare|understand|have\s+read)\b[^.]{0,200}\b(?:terms|privacy|policy|conditions|consent|notice|agreement|accurate|true)\b/i;
+    for (const old of document.querySelectorAll('[data-jobbot-consent]')) old.removeAttribute('data-jobbot-consent');
+    const out = [];
+    let n = 0;
+    for (const el of deepAll('span, p, label, div, li')) {
+        if (!wVis(el) || el.children.length > 6) continue;
+        const t = wText(el);
+        if (t.length > 400 || !RE.test(t)) continue;
+        if ([...el.children].some(k => RE.test(wText(k)))) continue;                     // take the innermost block
+        const block = el.parentElement || el;
+        if (block.querySelector('input, [role=checkbox], [role=switch], [role=radio]')) continue;  // a real control draws this one
+        const small = e => { const r = e.getBoundingClientRect(); return r.width >= 8 && r.width <= 40 && r.height >= 8 && r.height <= 40; };
+        const box = [...block.children].find(k => k !== el && !k.contains(el) && !k.querySelector('a') && small(k)
+                                                  && (k.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+        if (!box) continue;      // a sentence with nothing to tick is prose; clicking it could follow its policy link
+        box.setAttribute('data-jobbot-consent', String(n));
+        out.push({id: String(n), text: t.slice(0, 160), box: true,
+                  state: (box.className || '').toString() + '|' + box.innerHTML.length});
+        n++;
+    }
+    return out;
+}"""
+
+
+def tick_consent_clauses(ctx: ApplyContext) -> int:
+    """Tick every consent line drawn without a checkbox input. Returns how many were ticked.
+
+    Idempotent across the re-passes a submit makes: what the box looked like untouched and ticked is kept
+    on ctx.extra, so a second pass neither unticks it nor clicks a box that is already on."""
+    page = ctx.page
+    try:
+        found = page.evaluate(_CONSENT_SCAN_JS) or []
+    except Exception as e:  # noqa: BLE001
+        log.debug("consent scan: %s", e)
+        return 0
+    states: dict = ctx.extra.setdefault("consent_states", {})
+    ticked = 0
+    for f in found:
+        key = f["text"][:80]
+        el = page.locator(f"[data-jobbot-consent='{f['id']}']").first
+        known = states.get(key)
+        if known and f["state"] == known.get("ticked"):
+            continue        # on, from an earlier pass
+        if re.search(r"\b(?:checked|active|selected|is-on|ticked)\b", f["state"].split("|")[0], re.I):
+            continue        # the page says it is on
+        try:
+            el.scroll_into_view_if_needed(timeout=SHORT)
+            el.click(timeout=MEDIUM)
+            page.wait_for_timeout(300)
+            after = el.evaluate("e => (e.className || '').toString() + '|' + e.innerHTML.length")
+        except Exception as e:  # noqa: BLE001
+            log.info("consent: could not click %r (%s)", f["text"][:60], str(e)[:80])
+            continue
+        if after == f["state"]:
+            log.info("consent: clicked %r but nothing changed; leaving it", f["text"][:60])
+            continue
+        states[key] = {"untouched": f["state"], "ticked": after}
+        ticked += 1
+        log.info("consent: ticked %r (drawn without a checkbox)", f["text"][:80])
+    return ticked
+
+
 # The words a list control shows while nothing is chosen. Rippling's eligibility question drew "Select" in a
 # <p>, which read back as the answer, so the question was reported as answered and never asked (application
 # 175); its Apply button stayed disabled over it.
@@ -2318,6 +3042,8 @@ def is_prompt_value(text: str) -> bool:
 
 def combobox_value(combo: Any) -> str:
     """What a combobox holds, '' while it only shows its prompt. See _combobox_shown for the reading."""
+    if is_widget(combo):
+        return widget_value(combo)
     shown = _combobox_shown(combo)
     if not shown or is_prompt_value(shown):
         return ""
@@ -2398,6 +3124,8 @@ def combobox_is_placeholder(combo: Any) -> bool:
     Unlike <select>, combobox_value() has no index to check: it reads whatever the widget renders, and a
     react-select drawing "Select..." or a locale list drawing its default looks exactly like an answer.
     """
+    if is_widget(combo):
+        return not widget_value(combo)
     shown = _combobox_shown(combo)
     if shown and not combobox_value(combo):
         return True
@@ -2539,7 +3267,34 @@ def is_dial_control(el: Any) -> bool:
                 if (/country.?code/i.test(ref)) return true;
                 const lbl = ref.split(/\\s+/).map(x => document.getElementById(x))
                               .filter(Boolean).map(x => x.textContent || '').join(' ');
-                return /\\b(country|dial(l?ing)?|area)\\s*code\\b/i.test(lbl);
+                if (/\\b(country|dial(l?ing)?|area)\\s*code\\b/i.test(lbl)) return true;
+                // Named nowhere at all: Shopee's picker is a div showing "Select" with no id, no aria and
+                // no telling class, beside a box whose placeholder says "Contact Number" (application 274).
+                // A list control that stands immediately before the one phone box in its row is the
+                // phone's country code -- unless its own prompt says it is a *type* of phone.
+                const isList = e.hasAttribute('data-jobbot-widget') || e.tagName === 'SELECT'
+                            || e.getAttribute('role') === 'combobox';
+                if (!isList) return false;
+                const own = (e.getAttribute('placeholder') || '') + ' ' + (e.getAttribute('aria-label') || '')
+                          + ' ' + (e.getAttribute('name') || '') + ' ' + (e.id || '');
+                if (/\\b(?:type|kind|method|preferred|device)\\b/i.test(own)) return false;
+                const vis = x => { const r = x.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+                const CTRL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]),'
+                           + ' textarea, select, [role=combobox], [data-jobbot-widget]';
+                for (let w = e.parentElement, i = 0; w && i < 4; w = w.parentElement, i++) {
+                    const others = [...w.querySelectorAll(CTRL)]
+                        .filter(x => x !== e && !e.contains(x) && !x.contains(e) && vis(x));
+                    if (!others.length) continue;
+                    if (others.length > 1) return false;
+                    const nb = others[0];
+                    if (!(e.compareDocumentPosition(nb) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+                    if (nb.tagName !== 'INPUT') return false;
+                    const about = [nb.getAttribute('placeholder'), nb.getAttribute('aria-label'), nb.getAttribute('name'),
+                                   nb.id, nb.labels && nb.labels[0] && nb.labels[0].innerText, w.innerText]
+                        .filter(Boolean).join(' ');
+                    return nb.type === 'tel' || /\\b(?:phone|mobile|telephone|cell|contact\\s*(?:number|no\\b)|tel)\\b/i.test(about);
+                }
+                return false;
             }""")) or _shows_dial_code(el)
     except Exception:  # noqa: BLE001
         return False
@@ -2584,7 +3339,7 @@ def dial_code_on_page(page: Any) -> str:
     the chosen one — a bare "+1" from Afghanistan-to-Zimbabwe order, whatever the form is actually holding.
     """
     try:
-        return page.evaluate("() => {" + DEEP_JS + """
+        held = page.evaluate("() => {" + DEEP_JS + """
             const sel = %r;
             for (const el of deepAll(sel)) {
                 // innerText of a hidden node is its whole textContent, so a picker's closed country list
@@ -2600,6 +3355,15 @@ def dial_code_on_page(page: Any) -> str:
                 if (m) return m[1];
             }
             return ''; }""" % _DIAL_SHOWN_SEL) or ""
+        if held:
+            return held
+        # A div-built picker showing its code on its face ("+65" on Shopee's). Only the pickers that stand
+        # beside a phone box are read, so a dropdown that happens to show "+1" for some other reason is not.
+        for w in custom_widgets(page):
+            code = dial_in(w.get("value") or "")
+            if code and is_dial_control(widget(page, w["id"])):
+                return code
+        return ""
     except Exception:  # noqa: BLE001
         return ""
 
@@ -2710,7 +3474,7 @@ def _click_dial_option(page: Any, combo: Any, code: str) -> bool:
     return False
 
 
-def set_dial_code(page: Any, phone: str) -> str:
+def set_dial_code(page: Any, phone: str, country: str = "") -> str:
     """Point the form's own country-code control at our number's country; the code it then holds, '' if not.
 
     Read the control's list, take the longest code that begins our digits, choose it, and the number box
@@ -2779,7 +3543,56 @@ def set_dial_code(page: Any, phone: str) -> str:
                      code, shown or "?")
         except Exception as e:  # noqa: BLE001
             log.debug("set_dial_code on control %d failed: %s", i, e)
+    # Pickers built out of divs, which no selector above names: told by where they stand (is_dial_control).
+    for w in custom_widgets(page):
+        root = widget(page, w["id"])
+        try:
+            if w.get("kind") == "date" or not is_dial_control(root):
+                continue
+            code = _set_dial_widget(page, root, digits, country)
+            if code:
+                log.info("country-code picker (div-built) set to +%s for the number in facts.yaml", code)
+                return code
+        except Exception as e:  # noqa: BLE001
+            log.debug("set_dial_code on widget %s failed: %s", w.get("id"), e)
     return ""
+
+
+def _set_dial_widget(page: Any, root: Any, digits: str, country: str = "") -> str:
+    """Point a div-built country-code picker at our number's country. The code it then shows, '' if not.
+
+    The list as it opens first (it may be the whole list), then its own search box with the code and with
+    the country's name: Shopee renders twelve of 247 rows until something is typed (application 274).
+    """
+    if not open_widget(page, root):
+        return ""
+    try:
+        items, texts = popup_options(page)
+        code, label = _dial_from_options(texts, digits)
+        if code:
+            _click_row(items, texts, texts.index(label), page)
+        elif widget_filter(page, root) is not None:
+            queries = [f"+{digits[:n]}" for n in (4, 3, 2, 1) if digits[:n]] + [digits[:4], digits[:3]]
+            if country and not is_dial_code(country):
+                queries.append(country)
+            for q in queries:
+                if not widget_type(page, root, q):
+                    break
+                items, texts = popup_options(page)
+                code, label = _dial_from_options(texts, digits)
+                if code:
+                    _click_row(items, texts, texts.index(label), page)
+                    break
+        if not code:
+            return ""
+        page.wait_for_timeout(300)
+        shown = dial_in(widget_value(root))
+        if shown != code:
+            log.info("country-code picker did not take +%s (it shows +%s)", code, shown or "?")
+            return ""
+        return code
+    finally:
+        close_popups(page, root)
 
 
 def dial_code_for_phone(page: Any, phone: str, country: str = "") -> str:
@@ -2796,10 +3609,13 @@ def dial_code_for_phone(page: Any, phone: str, country: str = "") -> str:
     """
     held = dial_code_on_page(page)
     if not held:
-        return ""
+        # Nothing shows a code yet. That is the ordinary single-box form -- and also a picker still on its
+        # "Select" prompt (Shopee, application 274), which set_dial_code tells apart from an ordinary list
+        # by its options and by where it stands, and drives; anything else it leaves alone.
+        return set_dial_code(page, phone, country) or ""
     if re.sub(r"\D", "", phone or "").startswith(held):
         return held     # already resting on our country — the Bangladeshi tenant of a Bangladeshi employer
-    return set_dial_code(page, phone) or select_dial_country(page, country, phone) or held
+    return set_dial_code(page, phone, country) or select_dial_country(page, country, phone) or held
 
 
 def select_dial_country(page: Any, country: str, phone: str = "") -> str:
@@ -2956,6 +3772,11 @@ def _suggestion_queries(value: str, alternatives: tuple[str, ...] | list[str] = 
             q = " ".join(words[:n]).strip(" ,&-")
             if q and q not in out:
                 out.append(q)
+    # Each part of a comma-separated answer on its own, broadest last: a list of countries answers
+    # "Dhaka, Bangladesh" with "Bangladesh" (Shopee's Current Location, application 274).
+    for part in _comma_parts(value):
+        if part not in out:
+            out.append(part)
     return out
 
 
@@ -2998,7 +3819,9 @@ def _best_suggestion(options: list[str], value: str) -> str:
     return ""
 
 
-_OTHER_RE = re.compile(r"^(other|others|not listed|n/?a)$", re.I)
+# "Other", "Others", "Other (please specify)", "Others / Not Applicable" — a list's own escape hatch, whatever
+# it hangs off the word.
+_OTHER_RE = re.compile(r"^(?:other|others|not listed|n/?a|not applicable|none of the above)(?:\s*[/(,:-].*)?$", re.I)
 
 
 def _commit_suggestion(page: Any, el: Any, pick: str) -> bool:
@@ -3412,8 +4235,16 @@ def is_required(el: Any) -> bool:
             if (by) for (const id of by.split(/\s+/)) {
                 const n = root.getElementById ? root.getElementById(id) : document.getElementById(id);
                 if (n && star(n.innerText)) return true; }
-            const wrap = e.closest("[data-automation-id^='formField'], [class*='field-wrapper' i], [class*='form-field' i], .field, fieldset, li, div");
-            const lab = wrap ? wrap.querySelector('label, legend, [class*="label" i]') : null;
+            // A dropdown built out of divs is its own nearest <div>, and the label-ish things inside it
+            // (a month picker's "October" header) are not its label: look outward from it, and only at
+            // label elements it does not contain.
+            const widget = e.hasAttribute('data-jobbot-widget');
+            const from = widget ? e.parentElement : e;
+            const wrap = from ? from.closest("[data-automation-id^='formField'], [class*='field-wrapper' i], [class*='form-field' i], .field, fieldset, li, div") : null;
+            const shown = x => { const r = x.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            const foreign = l => { const w = l.closest('[data-jobbot-widget]'); return !!w && w !== e; };
+            const lab = wrap ? Array.from(wrap.querySelectorAll('label, legend, [class*="label" i]'))
+                .find(l => shown(l) && !foreign(l) && !(widget && e.contains(l))) || null : null;
             if (lab && star(lab.innerText)) return true;
             // A star on the group rather than on the box. Greenhouse marks its education block that way:
             // "Field of study" carries no mark of its own, so the box read as optional, the question the
@@ -3455,6 +4286,24 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
     if is_verification_control(el, label):
         log.debug("skipping verification control %r; it is filled after submit", label)
         return
+    if kind == "date":
+        # A div-built date / month picker (Shopee's "Course Period", application 274): asked like any other
+        # question, and the answer clicked into its calendar rather than typed.
+        existing = combobox_value(el)
+        if existing:
+            ctx.seen(existing, label, kind="text")
+            return
+        ans = _ask(ctx, el, label, None, "text")
+        if ans is None:
+            return
+        if fill_date_widget(page, el, ans):
+            log.info("date picker %r -> %r", label[:60], ans)
+            return
+        if is_required(el):
+            raise NeedsHuman(f"'{label}' is a date picker jobbot could not set to {ans!r}. Pick it in the "
+                             "browser window, then click Continue.", question=label, kind="text")
+        log.info("leaving the optional date %r: the picker would not take %r", label[:60], ans)
+        return
     if kind == "text" or kind == "textarea":
         existing = current_value(el)
         if existing and looks_like_filename(existing) and not re.search(r"file|resume|résumé|\bcv\b|attach", label, re.I):
@@ -3484,6 +4333,12 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
                 log.info("%r asks for a count; rewriting %r as %r", label[:60], existing[:30], num)
                 fill_if_empty(el, num, clear=True)
                 return
+        if existing and kind == "text" and _GPA_LABEL_RE.search(label):
+            shaped = shape_gpa(ctx, el, existing)
+            if shaped != existing:
+                log.info("%r holds %r; the box's own example wants %r", label[:40], existing[:20], shaped)
+                fill_if_empty(el, shaped, clear=True)
+                return
         if existing:
             ctx.seen(existing, label, kind=kind, default=text_is_default(el) or _unchanged_identity(ctx, label, existing))
             return
@@ -3501,6 +4356,8 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         ans = _ask(ctx, el, label, None, kind)
         if ans is None:
             return
+        if kind == "text" and _GPA_LABEL_RE.search(label):
+            ans = shape_gpa(ctx, el, ans)
         if has_suggestions(el):
             # A box that only accepts what its own list offers. Typing the true answer at it is what fails:
             # Greenhouse refused "Computer Science & Engineering" with "Please select a school, degree, and
@@ -3578,6 +4435,27 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             _choice_miss(el, label, ans, opts, kind, cont)
     elif kind == "file":
         return  # the CV goes through upload_resume; the cover letter through fill_cover_letter
+
+
+_GPA_LABEL_RE = re.compile(r"\b(?:gpa|cgpa|grade\s+point)\b", re.I)
+
+
+def shape_gpa(ctx: ApplyContext, el: Any, value: str) -> str:
+    """"2.76" written the way the box's own example is written: "2.76/4.00" for a placeholder reading
+    "0.00 / 0.00 (e.g., 3.80/4.00)" (Shopee, application 274). The scale is facts.yaml's where it says one,
+    else the example's. A value that already carries its scale, or is not a bare number, is left alone."""
+    v = clean(value)
+    if not v or "/" in v or not re.fullmatch(r"\d+(?:\.\d+)?", v):
+        return v
+    try:
+        ph = el.get_attribute("placeholder") or ""
+    except Exception:  # noqa: BLE001
+        ph = ""
+    m = re.search(r"\d+(?:\.\d+)?\s*/\s*(\d+(?:\.\d+)?)", ph)
+    if not m:
+        return v
+    scale = clean(str(ctx.fact("education.gpa_scale") or "")) or m.group(1)
+    return f"{v}/{scale}"
 
 
 def _unchanged_identity(ctx: ApplyContext, label: str, value: str) -> bool:

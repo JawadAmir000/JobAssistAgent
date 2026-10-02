@@ -159,8 +159,11 @@ IDENTITY: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(full|your|candidate)\s*name\b|^\s*name\s*$|\bnom\s+complet\b|\bnombre\s+completo\b"
                 r"|\bnome\s+completo\b|\bvollst[äa]ndiger\s+name\b", re.I), "identity.full_name"),
     (re.compile(r"e-?mail|courriel|correo|adresse\s+[ée]lectronique|\bposta\s+elettronica\b", re.I), "identity.email"),
-    (re.compile(r"\b(phone|mobile|telephone|cell)\b|t[ée]l[ée]phone|\btelefon|\btel[ée]fono\b|\btelefoon\b|\bportable\b"
-                r"|\bhandy\b|\bcelular\b", re.I), "identity.phone"),
+    # "Contact Number" is the phone on Shopee's form (application 274); without it here the number went
+    # through the resolver as a question rather than through the phone block, which is what splits the
+    # country code off and sets the picker beside the box.
+    (re.compile(r"\b(phone|mobile|telephone|cell)\b|\bcontact\s*(?:number|no\.?|#)|t[ée]l[ée]phone|\btelefon"
+                r"|\btel[ée]fono\b|\btelefoon\b|\bportable\b|\bhandy\b|\bcelular\b", re.I), "identity.phone"),
     (re.compile(r"linked\s*in", re.I), "identity.linkedin"),
     (re.compile(r"git\s*hub", re.I), "identity.github"),
     (re.compile(r"portfolio|personal\s*(web)?site|\bwebsite\b|\bweb\s*page\b|\bsite\s+web\b|\bwebseite\b"
@@ -250,7 +253,7 @@ _JUNK_FORM_JS = r"""
 # The scope is applied as composed-tree containment rather than as a CSS descendant combinator, because a
 # control inside a component's shadow root has no `body`, `main` or `#content` ancestor within its own root
 # however plainly it sits inside one — see common.DEEP_JS for the board that made this necessary.
-_COUNT_CONTROLS_JS = "(scope) => {" + c.DEEP_JS + _JUNK_FORM_JS + r"""
+_COUNT_CONTROLS_JS = "(scope) => {" + c.DEEP_JS + c.WIDGET_JS + _JUNK_FORM_JS + r"""
     const sel = ['input:not([type=hidden]):not([type=submit]):not([type=button])',
                  'textarea', 'select', '[role=combobox]'].join(', ');
     const roots = scope === 'body' ? [document.body].filter(Boolean) : deepAll(scope);
@@ -260,6 +263,10 @@ _COUNT_CONTROLS_JS = "(scope) => {" + c.DEEP_JS + _JUNK_FORM_JS + r"""
         if (!vis(el) || isJunkForm(deepClosest(el, 'form'))) continue;
         if (!roots.some(r => deepContains(r, el))) continue;
         n++;
+    }
+    // Dropdowns built out of divs count too: a page whose every field is one is still an application form.
+    for (const w of widgetRoots(scope)) {
+        if (!isJunkForm(deepClosest(w, 'form'))) n++;
     }
     return n;
 }"""
@@ -565,6 +572,12 @@ class GenericFormAdapter(Adapter):
         if c.autofill_from_resume(page, ctx.cv_path):
             ctx.step("Autofilled from your CV")
 
+        # Stamp the dropdowns built out of divs before anything reads the controls, so the input walks
+        # below can tell a widget's own search box from a field (see common.WIDGET_JS).
+        widgets = c.custom_widgets(page, self.scope)
+        if widgets:
+            log.info("generic: %d dropdown(s) drawn without a <select> on this step", len(widgets))
+
         ctx.step("Filling your details")
         self._identity(ctx)
         # A signup the board puts in front of the form: the password is jobbot's own (see credentials.py),
@@ -600,6 +613,9 @@ class GenericFormAdapter(Adapter):
         self._toggle_groups(ctx)
         self._aria_radio_groups(ctx)
         c.fill_calendar(ctx)
+        # A consent line drawn with no checkbox input at all, and on Shopee not even inside the <form> --
+        # so it is looked for on the whole page, after everything the scoped walks could see.
+        c.tick_consent_clauses(ctx)
 
     # A question answered by pressing one of a row of buttons ("Yes" "No"), each an ARIA toggle
     # (aria-pressed) rather than a radio. Oracle Recruiting draws its Application Questions this way, and a
@@ -1165,6 +1181,15 @@ class GenericFormAdapter(Adapter):
                     # applications 135-138 did, and the widget answered by resetting itself to +971.
                     continue
                 value = phone_value     # the national part wherever the form holds the code itself
+                cur_digits = re.sub(r"\D", "", current)
+                if dial and cur_digits.startswith(dial) and cur_digits != re.sub(r"\D", "", value):
+                    # The whole international number in the box beside a picker that now holds the code:
+                    # sent like that the form reads +880 twice. That is exactly what the box held after
+                    # the first pass of application 274, whose picker nothing had set.
+                    log.info("phone field %r holds %r beside a +%s picker; writing the national part %r",
+                             label, current, dial, value)
+                    c.fill_if_empty(el, value, clear=True)
+                    continue
                 if current and value and current != value and c.error_for_field(errors, label):
                     # The right number in a shape the form refuses: AGF's Workday kept the CV parse's
                     # "+880 177 161 4053" beside its own country-code prompt and said "Enter a valid format
@@ -1313,9 +1338,18 @@ class GenericFormAdapter(Adapter):
             rows = page.locator("[role=option]:visible, [role=listbox] li:visible, .pac-item:visible, "
                                 "[class*='suggestion' i]:visible li, [class*='autocomplete' i] li:visible")
             n = min(rows.count(), 12)
-            if not n:
-                return
             words = [w for w in re.split(r"[\s,]+", value.lower()) if len(w) > 2]
+            if not n:
+                # A list drawn without ARIA roles (common.popup_options finds the popup by its shape).
+                items, texts = c.popup_options(page)
+                for i, text in enumerate(texts[:12]):
+                    if any(w in text.lower() for w in words):
+                        items.nth(i).click(timeout=c.SHORT)
+                        page.wait_for_timeout(300)
+                        return
+                if texts:
+                    page.keyboard.press("Escape")
+                return
             for i in range(n):
                 text = c.clean(rows.nth(i).inner_text()).lower()
                 if any(w in text for w in words):
@@ -1345,6 +1379,8 @@ class GenericFormAdapter(Adapter):
                     continue        # the CV goes through upload_resume, the letter through fill_cover_letter
                 if c.in_chat_widget(el):
                     continue        # a chatbot's reply box: typing there sends a message (see common)
+                if c.in_widget(el):
+                    continue        # a div-built dropdown's own search box; the widget pass below drives it
                 if typ in ("radio", "checkbox"):
                     self._choice(ctx, el, typ, handled_groups)
                     continue
@@ -1391,6 +1427,35 @@ class GenericFormAdapter(Adapter):
                 raise
             except Exception as e:  # noqa: BLE001 - one odd control must not lose the whole application
                 log.warning("generic: skipping control %d: %s", i, e)
+        # Dropdowns built out of <div>s (common.WIDGET_JS): invisible to the walk above, each is asked about
+        # by its label like any other control and driven through the combobox helpers. Shopee's form is
+        # nine of these and eight inputs (application 274).
+        for w in c.custom_widgets(page, self.scope):
+            try:
+                self._widget_question(ctx, c.widget(page, w["id"]), w)
+            except (NeedsHuman, c.ApplyError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("generic: skipping dropdown %s: %s", w.get("id"), e)
+
+    def _widget_question(self, ctx: ApplyContext, root, w: dict) -> None:
+        """Ask about one div-built dropdown and set it. `w` is its custom_widgets entry."""
+        label = c.strip_required(c.get_label_for(root))
+        placeholder = c.clean(w.get("placeholder") or "")
+        if not label and placeholder and not c.is_prompt_value(placeholder):
+            label = placeholder
+        if not label or c.is_furniture_label(label):
+            return
+        if self._identity_key(label) == "":
+            return          # a field to leave alone, whatever kind of control draws it
+        if w.get("kind") != "date" and c.is_dial_control(root):
+            return          # the phone's country code: _identity sets it from the number itself
+        question = label
+        if placeholder and not c.is_prompt_value(placeholder) and placeholder.lower() != label.lower():
+            # Two pickers under one label tell themselves apart by what they draw while empty:
+            # "Course Period — Course Start Month" and "Course Period — Course End Month".
+            question = f"{label} — {placeholder}"
+        c.answer_and_set(ctx, root, question, "date" if w.get("kind") == "date" else "combobox")
 
     def _choice(self, ctx: ApplyContext, el, typ: str, handled_groups: set[str]) -> None:
         """Radio groups and checkboxes, asked once per group rather than once per option."""
@@ -1619,6 +1684,18 @@ class GenericFormAdapter(Adapter):
                     missing.append(c.strip_required(label)[:90] or "an unnamed field")
             except Exception as e:  # noqa: BLE001
                 log.debug("generic: required check on control %d: %s", i, e)
+        for w in c.custom_widgets(page, self.scope):
+            if w.get("value"):
+                continue
+            try:
+                root = c.widget(page, w["id"])
+                label = c.get_label_for(root)
+                if not re.search(r"\*\s*$", label) or c.is_furniture_label(label) or c.is_dial_control(root):
+                    continue
+                ph = c.clean(w.get("placeholder") or "")
+                missing.append(c.strip_required(label)[:90] + (f" ({ph})" if ph and not c.is_prompt_value(ph) else ""))
+            except Exception as e:  # noqa: BLE001
+                log.debug("generic: required check on dropdown %s: %s", w.get("id"), e)
         return missing
 
     @staticmethod
@@ -1699,6 +1776,8 @@ class GenericFormAdapter(Adapter):
                 if (el.get_attribute("type") or "").lower() in ("file", "checkbox", "radio", "submit",
                                                                 "password"):
                     continue
+                if c.in_widget(el):
+                    continue        # a div-built dropdown's search box, not a field of its own
                 label = c.strip_required(c.get_label_for(el))
                 # Keyed on the label too, not just the type: SuccessFactors' "Show" button turns its
                 # password box into an ordinary text input, and a credential read out of one is a
