@@ -1,0 +1,33 @@
+{% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+{% if b['items'] %}
+{% set n = b['items']|length %}
+{% set done = b['items']|selectattr('status', 'in', ['submitted', 'needs_you', 'skipped'])|list|length %}
+{% set ok = b['items']|selectattr('status', 'equalto', 'submitted')|list|length %}
+{% set waiting = b['items']|selectattr('status', 'equalto', 'needs_you')|list|length %}
+{% set skipped = b['items']|selectattr('status', 'equalto', 'skipped')|list|length %}
+<div class="batch"
+     {% if b['running'] %}hx-get="/apply-all/status" hx-trigger="every 3s" hx-target="#batch-status" hx-swap="innerHTML"{% endif %}>
+  <div class="row between">
+    <div class="row">
+      <span class="status st-{{ 'running' if b['running'] else 'done' }}">apply all · {{ 'running' if b['running'] else 'done' }}</span>
+      {% if b['running'] %}<span class="spinner" aria-hidden="true"></span>{% endif %}
+      <span class="muted">{{ done }}/{{ n }} · {{ ok }} submitted · {{ waiting }} need you · {{ skipped }} skipped
+        · started {{ b['started_at'] }}{% if b['finished_at'] %} · finished {{ b['finished_at'] }}{% endif %}</span>
+    </div>
+    {% if b['running'] %}
+    <button class="btn quiet" hx-post="/apply-all/stop" hx-target="#batch-status" hx-swap="innerHTML"
+            title="finish nothing new; the application in progress keeps going">{{ 'Stopping…' if b['stop'] else 'Stop' }}</button>
+    {% endif %}
+  </div>
+  <ol class="batch-items">
+    {% for i in b['items'] %}
+    <li>
+      <span class="status st-{{ i['status'] }}">{{ i['status'].replace('_', ' ') }}{% if i['attempts'] > 1 %} · try {{ i['attempts'] }}{% endif %}</span>
+      <strong>{{ i['company'] }}</strong> — {{ i['title'] }}
+      {% if i['note'] %}<span class="muted"> · {{ i['note'] }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+  {% if waiting %}<p class="muted">Jobs that need you stay open in their windows — answer them in the Applications tab.</p>{% endif %}
+</div>
+{% endif %}

@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import replace
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from jobbot.apply import common as c, navigator
 from jobbot.apply.base import (Adapter, AlreadyApplied, ApplyContext, ApplyError, NeedsHuman, detect_ats,
@@ -30,6 +31,29 @@ log = logging.getLogger(__name__)
 
 NAV_TIMEOUT = 30000   # ms - explicit; the runner's 8s default is too tight for an ATS cold load
 POPUP_TIMEOUT = 12000
+EXTERNAL_SETTLE_S = 10.0   # how long the external-apply popup gets to leave linkedin.com on its own
+
+
+def _on_linkedin_url(url: str) -> bool:
+    try:
+        return "linkedin.com" in (urlparse(url or "").netloc or "").lower()
+    except Exception:
+        return False
+
+
+def _redirect_target(url: str) -> str:
+    """The employer's URL named inside one of LinkedIn's own redirect URLs, '' when this is not one."""
+    if not _on_linkedin_url(url):
+        return ""
+    try:
+        for key in ("url", "redirectUrl", "to"):
+            for v in parse_qs(urlparse(url).query).get(key, []):
+                v = unquote(v).strip()
+                if v.startswith("http") and not _on_linkedin_url(v):
+                    return v
+    except Exception:
+        pass
+    return ""
 
 # The visible Apply control is named by role; the elements carrying 'apply-link-*' tracking names are the
 # sign-in modal's own dismiss X and "Join now" link, which must never be clicked.
@@ -242,17 +266,57 @@ class LinkedInAdapter(Adapter):
                 btn.click(timeout=c.MEDIUM)
             tab = popup.value
             try:
-                tab.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-            except Exception:
-                pass
-            url = tab.url
-            tab.close()
+                url = self._leave_linkedin(tab)
+            finally:
+                tab.close()
         except Exception:
             url = page.url  # no popup: LinkedIn either navigated this tab or showed its sign-in wall
 
-        if not url or "linkedin.com" in (urlparse(url).netloc or ""):
-            raise NeedsHuman(SIGNED_OUT)
+        if not url or _on_linkedin_url(url):
+            if self._signed_out(page):
+                raise NeedsHuman(SIGNED_OUT)
+            # Signed in, Apply clicked, still on LinkedIn: not the wall, and telling the user to sign in
+            # to an account they are signed into sends them nowhere (application 277).
+            log.warning("linkedin: external Apply stayed on linkedin.com (%s)", url[:200])
+            raise NeedsHuman("LinkedIn did not hand over the employer's application link (the tab stayed on "
+                             f"{url[:120]}). Open the employer's form from the Apply button in the browser "
+                             "window, then click Continue.")
         return url
+
+    @staticmethod
+    def _leave_linkedin(tab) -> str:
+        """The employer's URL once the Apply popup has left linkedin.com.
+
+        The popup does not open on the employer's site. It opens on LinkedIn's own
+        `/jobs/view/externalApply/<id>?url=<employer>` redirect and sometimes stays there — a safety page
+        ("This link will take you to a page that's not on LinkedIn" / Continue) for a domain LinkedIn
+        does not vouch for. Read at domcontentloaded that URL is on linkedin.com, and application 277 was
+        told to sign in to an account it was signed into. The `url` parameter names the destination either
+        way, so it is taken from there when the redirect does not finish by itself.
+        """
+        try:
+            tab.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+        except Exception:
+            pass
+        deadline = time.monotonic() + EXTERNAL_SETTLE_S
+        clicked = False
+        while True:
+            url = tab.url or ""
+            if url and not _on_linkedin_url(url):
+                return url
+            if target := _redirect_target(url):
+                log.info("linkedin: external Apply left us on %s; following its url= to %s", url[:80], target[:120])
+                return target
+            if not clicked:
+                clicked = True
+                try:
+                    tab.locator("a, button").filter(
+                        has_text=re.compile(r"^\s*(continue|proceed)\b", re.I)).first.click(timeout=1500)
+                except Exception:
+                    pass
+            if time.monotonic() > deadline:
+                return url
+            tab.wait_for_timeout(500)
 
 
 def applied_notice(page) -> str:

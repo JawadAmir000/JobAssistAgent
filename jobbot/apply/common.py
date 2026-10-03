@@ -463,6 +463,26 @@ def asks_for_count(label: str) -> bool:
     return bool(_COUNT_QUESTION_RE.search(clean(label or "")))
 
 
+# LinkedIn draws a salary box the same way: type=text, digits only, "Invalid input" for anything else. The
+# salary rule's "Negotiable" is what it bounced on for "Salary Expectations in AED" (application 220,
+# spiderSilk) and "Expected Salary in THB (per month)" (application 278, Xponential). A pay question that
+# names a currency or a period is such a box. LinkedIn only: elsewhere a salary text box takes prose, and a
+# box that wants a figure says so with type=number.
+_PAY_QUESTION_RE = re.compile(r"salary|compensation|\bpay\b|\brate\b|wage|remuneration|\bctc\b", re.I)
+_PAY_UNIT_RE = re.compile(
+    r"\b(?:THB|USD|AUD|NZD|AED|SGD|EUR|GBP|INR|BDT|CAD|MYR|PHP|IDR|JPY|HKD|SAR|QAR|CHF|SEK|DKK|NOK|PLN|ZAR)\b"
+    r"|[$\u20ac\u00a3\u0e3f\u20b9]|\bper\s+(?:month|annum|year|hour|day|week)\b|\bmonthly\b|\bannual(?:ly)?\b", re.I)
+
+
+def asks_for_figure(ctx: Any, label: str) -> bool:
+    """A text box whose only honest answer is a number: a count on any board, a priced salary on LinkedIn."""
+    if asks_for_count(label):
+        return True
+    text = clean(label or "")
+    return ((ctx.job.get("ats") or "") == "linkedin" and bool(_PAY_QUESTION_RE.search(text))
+            and bool(_PAY_UNIT_RE.search(text)))
+
+
 def has_bad_input(el: Any) -> bool:
     """True when the control is holding something its type cannot represent — the stray "e" a text answer
     leaves in a number box. Nothing else notices it: .value reads '' and the box looks untouched."""
@@ -728,10 +748,57 @@ COOKIE_BUTTONS = ("Deny", "Reject all", "Reject", "Decline", "Only necessary", "
                   "Accept all", "Accept")
 
 
+# True when the button's nearest banner/dialog talks about cookies and says nothing destructive.
+_COOKIE_CONTEXT_JS = r"""e => {
+    let n = e;
+    for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
+        const t = (n.innerText || '').slice(0, 4000);
+        if (/\b(delete|permanently|withdraw|close (your|my) account)\b/i.test(t)) return false;
+        if (/cookie/i.test(t)) return true;
+        if (n.matches && n.matches('[role=dialog], dialog, [aria-modal=true]')) return false;
+    }
+    return false;
+}"""
+
+
+def _cancel_destructive_dialog(page: Any) -> None:
+    """Press Cancel/No on an open dialog that warns of deleting or withdrawing anything. Never the action."""
+    try:
+        dlg = page.locator("[role=dialog], dialog, [aria-modal=true], .ui-dialog, .modal").filter(
+            has_text=re.compile(r"permanently delete|delete all data|delete your account", re.I))
+        for i in range(min(dlg.count(), 3)):
+            d = dlg.nth(i)
+            # The warning itself, not a privacy notice that merely mentions deletion rights further down:
+            # this guard closed EY's Privacy Notice before it could be acknowledged (application 288).
+            if not d.is_visible() or len(c_text(d)) > 600:
+                continue
+            btn = d.get_by_role("button", name=re.compile(r"^\s*(cancel|no|close|keep)\b", re.I))
+            if btn.count():
+                btn.first.click(timeout=SHORT)
+                page.wait_for_timeout(500)
+                log.warning("closed a destructive dialog (%r) with Cancel", c_text(d)[:80])
+    except Exception as e:  # noqa: BLE001
+        log.debug("destructive dialog check: %s", e)
+
+
+def c_text(el: Any) -> str:
+    try:
+        return clean(el.inner_text() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def dismiss_cookie_banner(page: Any) -> bool:
     """Close a cookie consent bar. These are fixed to the bottom of the page and sit over the submit button
     (Palantir's Lever board is one), so leaving one up can make the final click land on the banner instead.
-    Refusal options are tried before acceptance."""
+    Refusal options are tried before acceptance.
+
+    Only inside something that is about cookies. EY's SuccessFactors signup opens a "Privacy Notice" dialog
+    with Acknowledge / Decline, and pressing that Decline (taken for a cookie refusal) opened "Delete All
+    Data -- this action will permanently delete your account" (application 288). A button whose nearest
+    banner does not mention cookies is somebody else's question, and one near "delete" is never pressed.
+    """
+    _cancel_destructive_dialog(page)
     for label in COOKIE_BUTTONS:
         # Starts-with, not exact: EY's SuccessFactors wall says "Reject All Cookies", and an exact match on
         # "Reject" left it standing over the Apply button — which the run then reported as "no application
@@ -742,6 +809,9 @@ def dismiss_cookie_banner(page: Any) -> bool:
             try:
                 btn = page.get_by_role(role, name=pattern)
                 if not visible(btn, 600):
+                    continue
+                if not btn.first.evaluate(_COOKIE_CONTEXT_JS):
+                    log.info("not pressing %r: what it sits in is not a cookie banner", label)
                     continue
                 btn.first.click(timeout=SHORT)
                 page.wait_for_timeout(500)
@@ -1883,6 +1953,13 @@ _LABEL_JS = """e => {
     const root = e.getRootNode();
     const byId = id => (root.getElementById ? root.getElementById(id) : document.getElementById(id));
     if (al) { const t = al.split(/\\s+/).map(id => { const n = byId(id); return n ? (n.innerText || n.textContent) : ''; }).join(' '); if (real(clean(t))) return clean(t); }
+    // A tick box whose words are only its description: EY's signup draws "Receive new job posting
+    // notifications" in an aria-describedby span, and the scan below lent it "Email Address:" from the row
+    // above, so the opt-in was asked as a contact question (application 288).
+    if (e.type === 'checkbox' || e.getAttribute('role') === 'checkbox') {
+        const ad = e.getAttribute('aria-describedby');
+        if (ad) { const t = ad.split(/\\s+/).map(id => { const n = byId(id); return n ? (n.innerText || n.textContent) : ''; }).join(' '); if (real(clean(t))) return clean(t); }
+    }
     // A radio whose aria-label is shared with the other options of its group is labelled with the group's
     // *question*, not with its own option. LinkedIn's native-<dialog> Easy Apply does this: every radio of
     // "Have you built…?" carries that question as aria-label, beside an empty <label> and a <p>Yes</p>, so
@@ -4202,6 +4279,17 @@ def _ask(ctx: ApplyContext, el: Any, label: str, options: list[str] | None, kind
         return ans
     except NeedsHuman:
         if is_required(required_el if required_el is not None else el):
+            if options:
+                # What the pause was asked about, for the log: a question offered with a list is a label
+                # read off the page, and when that label is the wrong one (EY's create-account page
+                # asked "Email Address:" with the options "Notification:" / "Hear more about career
+                # opportunities", application 288) the markup is the only way to see why.
+                try:
+                    log.info("asking %r from a control: %s", label[:60], el.evaluate(
+                        "e => { const p = e.parentElement, g = p && p.parentElement;"
+                        " return ((g || p || e).outerHTML || '').replace(/\\s+/g, ' ').slice(0, 1200); }"))
+                except Exception:  # noqa: BLE001
+                    pass
             raise
         log.info("leaving the optional %r blank: nothing in facts.yaml or the CV answers it", label)
         return None
@@ -4324,15 +4412,20 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
                 log.info("%r holds %r; writing today's date %s", label[:40], existing[:20], today)
                 fill_if_empty(el, today, clear=True)
                 return
-        if existing and kind == "text" and asks_for_count(label) and not _PLAIN_NUMBER_RE.match(existing):
+        if existing and kind == "text" and asks_for_figure(ctx, label) and not _PLAIN_NUMBER_RE.match(existing):
             # "10+" in a box that asks "how many": LinkedIn answers it with "Invalid input" and nothing else,
             # and every retry read "10+" back as the answer already given (application 178).
             from jobbot.apply.resolver import as_number
             num = as_number(existing, label)
-            if num is not None:
-                log.info("%r asks for a count; rewriting %r as %r", label[:60], existing[:30], num)
-                fill_if_empty(el, num, clear=True)
-                return
+            if num is None:
+                # "Negotiable" names no figure, so what is in the box is what the step keeps bouncing on.
+                # Asked as a number the resolver ignores that prose and asks the user once for the figure.
+                num = _ask(ctx, el, label, None, "number")
+                if num is None:
+                    return
+            log.info("%r asks for a figure; rewriting %r as %r", label[:60], existing[:30], num)
+            fill_if_empty(el, num, clear=True)
+            return
         if existing and kind == "text" and _GPA_LABEL_RE.search(label):
             shaped = shape_gpa(ctx, el, existing)
             if shaped != existing:
@@ -4347,7 +4440,7 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             if letter:
                 fill_if_empty(el, letter)
                 return
-        if kind == "text" and (is_number_box(el) or asks_for_count(label)):
+        if kind == "text" and (is_number_box(el) or asks_for_figure(ctx, label)):
             # The control decides the shape of the answer: "Negotiable" is a fine answer to a salary box and
             # no answer at all to a salary *number* box. The resolver turns what it knows into a number where
             # it honestly can ("None" notice period -> 0 weeks) and asks the user where it cannot.
@@ -4427,6 +4520,11 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             ctx.seen(checked_choice_label(cont), label, kind=kind, options=options or choice_options(cont),
                      default=choice_is_default(cont))
             return
+        if kind == "checkbox" and _tick_agreeable_boxes(cont):
+            # The boxes' own words are opt-ins or consents, whatever the group around them is called: EY's
+            # "Receive new job posting notifications" sits under "Email Address:" and was asked as a contact
+            # question four times (application 288). Consent policy: every such box is ticked.
+            return
         opts = options or choice_options(cont)
         ans = _ask(ctx, el, label, opts, kind, cont)
         if ans is None:
@@ -4435,6 +4533,33 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             _choice_miss(el, label, ans, opts, kind, cont)
     elif kind == "file":
         return  # the CV goes through upload_resume; the cover letter through fill_cover_letter
+
+
+def _tick_agreeable_boxes(cont: Any) -> bool:
+    """Tick every checkbox in `cont` (or `cont` itself) whose own label is an opt-in or a consent.
+    True when at least one was ticked and none of the boxes is anything else."""
+    from jobbot.apply.resolver import is_agreeable, normalize_question
+    try:
+        is_box = (cont.evaluate("e => e.type === 'checkbox' || e.getAttribute('role') === 'checkbox'"))
+        boxes = [cont] if is_box else [cont.locator("input[type=checkbox]").nth(i)
+                                       for i in range(min(cont.locator("input[type=checkbox]").count(), 8))]
+        # A <label> may be only the row's heading ("Notification:") with the box's words in its
+        # aria-describedby text, so both are read.
+        labels = [clean(get_label_for(b) + " " + (b.evaluate(
+            "e => (e.getAttribute('aria-describedby') || '').split(/\\s+/).map(i => { const n = i && document.getElementById(i);"
+            " return n ? n.innerText : ''; }).join(' ')") or "")) for b in boxes]
+        log.info("checkbox group: own labels %s", [l[:60] for l in labels])
+        if not boxes or not all(l and is_agreeable(normalize_question(l)) for l in labels):
+            return False
+        done = 0
+        for b, l in zip(boxes, labels):
+            if tick(b):
+                done += 1
+                log.info("ticked %r (its own label is an opt-in)", l[:80])
+        return done > 0
+    except Exception as e:  # noqa: BLE001
+        log.debug("agreeable boxes: %s", e)
+        return False
 
 
 _GPA_LABEL_RE = re.compile(r"\b(?:gpa|cgpa|grade\s+point)\b", re.I)
@@ -5269,6 +5394,15 @@ def confirmation_showing(page: Any) -> bool:
         return False
 
 
+def _submit_key(url: str) -> str:
+    """Which page a submit was pressed on: host and path, without the query a board rewrites per visit."""
+    try:
+        u = urlparse(url or "")
+        return (u.netloc + u.path).lower()
+    except Exception:  # noqa: BLE001
+        return url or ""
+
+
 def _guard_uncertain_submit(ctx: ApplyContext, page: Any) -> bool:
     """Stand between a form jobbot already sent once and a second press of its Submit button.
 
@@ -5277,7 +5411,15 @@ def _guard_uncertain_submit(ctx: ApplyContext, page: Any) -> bool:
     ways. Sending it again would put a duplicate application in front of a real employer, so from here on
     that decision is the candidate's. Returns True when the application turns out to be in already.
     """
-    if not ctx.extra.get("submit_uncertain"):
+    where = ctx.extra.get("submit_uncertain")
+    if not where:
+        return False
+    pressed_on = where.get("url", "") if isinstance(where, dict) else ""
+    if pressed_on and _submit_key(pressed_on) != _submit_key(getattr(page, "url", "") or ""):
+        # The uncertain press was on another page -- a posting's own Apply button taken for a submit (EY
+        # and BCG, applications 288 and 289) -- and this is the form it led to, which has not been sent.
+        ctx.extra.pop("submit_uncertain", None)
+        log.info("the uncertain submit was on %s, not this page; sending this form normally", pressed_on[:120])
         return False
     applied = already_applied_message(page)
     if applied:

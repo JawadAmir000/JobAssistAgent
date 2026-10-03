@@ -59,7 +59,9 @@ _DECLINE_RE = re.compile(
 
 _RESIDENCY_STATUS_RE = re.compile(r"\bresidenc(?:y|e)\s+status\b|\bresident\s+status\b"
                                   r"|\bstatus\s+of\s+residenc")
-_AUTH_QUESTION_RE = re.compile(r"\bsponsor|\bauthori[sz]|\bwork permit\b|\bright to work\b|\beligible to work\b|\blegally\b|\bvisa\b"
+_JOB_COUNTRY_Q_RE = re.compile(r"country (?:where|in which) the (?:job|position|role) is (?:located|based)"
+                               r"|country of the (?:job|position|role)|job location country")
+_AUTH_QUESTION_RE = re.compile(r"\bsponsor|\bauthori[sz]|\bwork permit\b|\bright to work\b|\beligib\w* to work\b|\blegally\b|\bvisa\b"
                                r"|\bwork(?:ing)?\s+rights?\b|\bimmigration\s+status\b|\bpermitted\s+to\s+work\b")
 # The same subject asked as an open question ("What are your working rights in Australia?"). The answer is
 # not a word but a statement of the facts, composed from facts.yaml — never from the model, which is not
@@ -88,6 +90,7 @@ _ASKS_FOR_DETAIL_RE = re.compile(
 _OTHER_OK_KEY_RE = re.compile(r"school|universit|college|institution|alma mater|educational establishment")
 _OTHER_OPTION_RE = re.compile(r"^(?:other|others|not listed|not applicable|none of the above)(?:\s*[/(,:-].*)?$", re.I)
 
+_DEGREE_LEVEL_KEY_RE = re.compile(r"\bdegree\b|level of education|education level|highest (?:level of )?education")
 _FIELD_OF_STUDY_KEY_RE = re.compile(
     r"field of (?:study|degree)|discipline|\bmajor\b|course of study|area of study|subject of study"
     r"|specialis|specializ|concentration")
@@ -131,6 +134,9 @@ _YES_WORDS = {"yes", "y", "true"}
 # "terms" ("Describe the terms of your notice period") is not swept up.
 _CONSENT_RE = re.compile(
     r"^\s*i\s+(?:accept|agree|acknowledge|consent|confirm|certify|declare|understand|have\s+read|authori[sz]e)\b"
+    # PDPA-style gates worded as a noun phrase: "Consent to collect, use and disclose your personal data for
+    # the purpose of recruiting..." (LINE MAN Wongnai, application 277)
+    r"|\bconsent\b.{0,80}\bpersonal\s+(?:data|information)\b|\bpersonal\s+(?:data|information)\b.{0,80}\bconsent\b|\bpdpa\b"
     r"|\b(?:accept|agree\s+to|acknowledge|consent\s+to|read\s+and\s+(?:understood|agree))\b.{0,60}"
     r"\b(?:terms|conditions|privacy|policy|notice|gdpr|data\s+(?:processing|transfer|protection|privacy)|consent)\b"
     r"|\b(?:privacy\s+(?:notice|policy|statement)|terms\s+(?:and|&)\s+conditions|point\s+of\s+data\s+transfer"
@@ -146,7 +152,8 @@ _OPT_IN_RE = re.compile(
     r"|\bkeep\s+(?:me|my\s+\w+|your\s+\w+)\b.{0,30}\bon\s+file\b|\bon\s+file\s+for\b"
     r"|\bmarketing\b|\bnewsletter\b|\bmailing\s+list\b"
     r"|\b(?:receive|send\s+me|notify\s+me|keep\s+me\s+informed)\b.{0,40}"
-    r"\b(?:updates|emails|e-mails|alerts|news|opportunities|jobs)\b", re.I)
+    r"\b(?:updates|emails|e-mails|alerts|news|opportunities|jobs|notifications?|postings?)\b"
+    r"|\bhear\s+more\s+about\b", re.I)
 
 # "Tick this box if you do NOT wish to…" — the meaning inverts, so the rule must not fire. Ticking an
 # opt-out is the opposite of what the setting above asks for, and there is no way to tell which from a
@@ -402,6 +409,22 @@ def _is_decline_option(opt: str) -> bool:
     return bool(_DECLINE_RE.search((opt or "").replace("’", "'").replace("ʼ", "'")))
 
 
+_NEGATED_OPTION_RE = re.compile(r"\b(?:not|no|never|decline|refuse|disagree|don'?t)\b", re.I)
+
+
+# What may follow an answer inside a longer option without changing it: "(BD)", "+ years", "and engineering",
+# a short code. "management" after "engineering" is a different subject, not noise.
+_TRAILING_NOISE_RE = re.compile(r"^\s*(?:[(\[+&/-]|and\b|or\b|years?\b|yrs?\b|months?\b|[a-z0-9]{1,3}\s*$)")
+
+
+def _extends_cleanly(value: str, option: str) -> bool:
+    """True when `option` (normalized) is `value` plus trailing noise."""
+    if not value or not option.startswith(value):
+        return False
+    rem = option[len(value):]
+    return not rem.strip() or bool(_TRAILING_NOISE_RE.match(rem))
+
+
 def _yes_no_option(options: list[str], want_yes: bool) -> str | None:
     words = _YES_WORDS if want_yes else _NO_WORDS
     for o in options:
@@ -411,6 +434,12 @@ def _yes_no_option(options: list[str], want_yes: bool) -> str | None:
         first = normalize_question(o).split(" ")[:1]
         if first and first[0] in words:
             return o
+    # A pair worded as sentences, one of them negated: "I have read the terms and hereby give my consent" /
+    # "I do not give consent" (application 277). Yes is the one that is not.
+    if len(options) == 2:
+        negated = [bool(_NEGATED_OPTION_RE.search(o.replace("\u2019", "'"))) for o in options]
+        if negated.count(True) == 1:
+            return options[negated.index(not want_yes)]
     return None
 
 
@@ -739,7 +768,10 @@ class Resolver:
                               round because the salary rule ends in a "Negotiable" fallback, which is a
                               default and not something they ever said.
         """
-        facts_only = is_facts_only(key)
+        # A consent gate is the price of submitting, not a fact about the candidate, and is_agreeable already
+        # keeps claims of fact out: "Consent to collect, use and disclose your personal data ... individuals
+        # with appropriate qualifications" was stopped here on the word "qualifications" (application 277).
+        facts_only = is_facts_only(key) and not is_agreeable(key)
         if not facts_only and not is_reusable_protected(key):
             return None
         stopped = f"Needs your answer (protected question): {question}"
@@ -752,6 +784,19 @@ class Resolver:
             if picked is not None:
                 return picked
             raise NeedsHuman(stopped, question=question, options=options, kind=kind)
+
+        # Workday's two-level "select the country where the job is located and indicate your eligibility":
+        # the first level is a country list, and it is the job's country, not the candidate's -- AIA's form
+        # was searched for "Bangladesh" (application 283). The second level, the eligibility sentences,
+        # falls through to the authorisation rules below.
+        if _JOB_COUNTRY_Q_RE.search(key):
+            country = self._job_country()
+            if country:
+                if not options:
+                    return country
+                picked = self._map_to_options(country, options)
+                if picked is not None:
+                    return picked
 
         # Work authorisation depends on where the job is, so an answer cached at one employer is wrong at
         # the next: "Yes, I am currently authorized to work; I will need sponsorship in future" was learned
@@ -850,8 +895,11 @@ class Resolver:
                 continue
             score = 0
             says_sponsor = "sponsor" in low
+            # "No, I will require sponsorship to work in this country" (AIA's Workday, application 283): the
+            # "No" answers "are you eligible", it does not negate the sponsorship, so it is not read as one.
+            body = re.sub(r"^\s*(?:yes|no)\b[\s,:-]*", " ", low.strip())
             sponsor_negated = bool(re.search(r"\b(?:not|no|never|without)\b[^.]{0,40}sponsor|sponsor[^.]{0,30}\b(?:not|no)\b"
-                                             r"|will not require|do not require|don t require|dont require|not need", low))
+                                             r"|will not require|do not require|don t require|dont require|not need", body))
             if says_sponsor:
                 score += 2 if (not sponsor_negated) == needs_sponsorship else -3
             # A claim about being authorised ("I am (not) currently authorized", "citizen, permanent
@@ -989,6 +1037,13 @@ class Resolver:
         # veteran / disability: the stated value is yes or no, the options are sentences
         if vl in _YES_WORDS or vl in _NO_WORDS:
             return self._pick_eeo_polarity(options, affirmative=vl in _YES_WORDS)
+        # A list scoped to the employer's country -- "Chinese (Thailand) / Others (Thailand) / Thai
+        # (Thailand)" (Lumentum, application 285) -- names no group the stated "Asian" could be; its own
+        # "Others" is then the one true entry. Only when nothing above matched, and only for ethnicity.
+        if "ethnic" in key or "race" in key:
+            for o in options:
+                if _OTHER_OPTION_RE.match(re.sub(r"\s*\([^)]*\)\s*$", "", str(o).strip())):
+                    return o
         return None
 
     @classmethod
@@ -1012,10 +1067,16 @@ class Resolver:
         eeo = self.fact("eeo", {}) or {}
         k = f" {key} "
         has = lambda *terms: any(t in k for t in terms)  # noqa: E731
-        if has("veteran", "military service", "armed forces", "protected veteran"):
+        if has("military status", "military service"):
+            # Thai boards ask this of everyone ("Exempted / Conscripted / No military service"): a question
+            # about national service, not about US protected-veteran status, so it has a fact of its own.
+            return str(eeo.get("military_service") or eeo.get("veteran_status") or "").strip()
+        if has("veteran", "armed forces", "protected veteran"):
             return str(eeo.get("veteran_status") or "").strip()
         if has("disabilit", "disabled"):
             return str(eeo.get("disability_status") or "").strip()
+        if has("religion", "religious", "faith"):
+            return str(eeo.get("religion") or "").strip()
         if has("race", "ethnic", "hispanic", "latino"):
             return str(eeo.get("race_ethnicity") or "").strip()
         # Pronouns are their own fact, never read off gender: "Male" is not an option on a pronoun list
@@ -1036,9 +1097,14 @@ class Resolver:
         board's list offers "Computer Science". Naming the substitutes in facts.yaml keeps the decision the
         candidate's rather than a fuzzy match's.
         """
-        if not _FIELD_OF_STUDY_KEY_RE.search(key or ""):
+        if _FIELD_OF_STUDY_KEY_RE.search(key or ""):
+            alts = self.fact("education.field_of_study_alternatives", []) or []
+        elif _DEGREE_LEVEL_KEY_RE.search(key or "") and "classification" not in (key or ""):
+            # The degree too: "Bachelor's Degree" is on no list that spells out "Bachelor of Science (B.S)"
+            # beside "Bachelor of Engineering" and "Bachelor of Arts (B.A)" (Lumentum's Workday, application 285).
+            alts = self.fact("education.degree_alternatives", []) or []
+        else:
             return []
-        alts = self.fact("education.field_of_study_alternatives", []) or []
         return [str(a).strip() for a in alts if str(a).strip()]
 
     def _map_answer(self, key: str, value: str, options: list[str]) -> str | None:
@@ -1084,6 +1150,10 @@ class Resolver:
         for o in options:
             if normalize_question(o) == nv:
                 return o
+        # A list that tags every entry with the employer's country: "Muslim (Thailand)", "Others (Thailand)".
+        for o in options:
+            if normalize_question(re.sub(r"\s*\([^)]*\)\s*$", "", str(o))) == nv:
+                return o
         # A numbered list ("5 - Bachelors") and a degree named by its level: AGF's Workday "Degree" list did
         # not match "Bachelor's Degree" and stopped to ask (application 251).
         unnum = {re.sub(r"^\s*\d+\s*[-.):]?\s*", "", normalize_question(o)): o for o in options}
@@ -1102,7 +1172,14 @@ class Resolver:
         # fuzzy option match (e.g. "5" vs "5+ years", "Bangladesh" vs "Bangladesh (BD)")
         best, best_score = None, 0
         for o in options:
-            s = fuzz.token_set_ratio(nv, normalize_question(o))
+            no = normalize_question(o)
+            s = fuzz.token_set_ratio(nv, no)
+            # token_set_ratio scores a subset as a perfect match, which "Bangladesh (BD)" and "5+ years"
+            # need -- and which landed "Engineering" on "Aerospace Engineering" (Lumentum's Workday,
+            # application 285). Extra words may only trail the answer as noise, never change its meaning.
+            if s >= 95 and nv != no and not (_extends_cleanly(nv, no) or _extends_cleanly(no, nv)
+                                             or fuzz.ratio(nv, no) >= 90):
+                continue
             if s > best_score:
                 best, best_score = o, s
         if best is not None and best_score >= 95:
@@ -1136,6 +1213,14 @@ class Resolver:
         has = lambda *terms: any(t in k for t in terms)  # noqa: E731
         f = self.fact_str
         auth = self.fact("authorization", {}) or {}
+
+        # --- the job's country, not the candidate's ---
+        # "Select the name of the country where the job is located..." (AIA's Workday, application 283) fell
+        # to the identity rule below and was searched for Bangladesh. Ahead of everything else on purpose.
+        if _JOB_COUNTRY_Q_RE.search(key):
+            country = self._job_country()
+            if country:
+                return country
 
         # --- legal age ---
         # "Are you over the age of 18?" -- facts.yaml keeps no date of birth, only identity.over_18 (derived from
@@ -1198,6 +1283,13 @@ class Resolver:
             if req is None:
                 return None
             return "Yes" if bool(req) else "No"
+        # "Do you require a visa to work in the location you are applying to?" (AIA's Workday, application
+        # 283): "visa" makes the question protected, and nothing here answered it. The candidate's side of the
+        # sponsorship fact: no visa where they may already work, one everywhere else.
+        if has("visa") and has("require", "need"):
+            here = self._authorized_here(key)
+            if here is not None:
+                return "No" if here else "Yes"
         if has("authoriz", "authoris", "legally", "right to work", "eligible to work", "work permit", "permitted to work"):
             countries = [str(c).lower() for c in (auth.get("authorized_countries") or [])]
             # A country named anywhere, not only after "in"/"for": "authorized under UK laws to work for Janus
@@ -1393,6 +1485,20 @@ class Resolver:
         if has("degree", "qualification", "education level", "level of education", "highest education",
                "highest level"):
             return f("education.degree") or None
+
+        # --- religion (Thai boards ask it; answered only from facts.yaml) ---
+        if has("religion", "religious"):
+            rel = str((self.fact("eeo", {}) or {}).get("religion") or "").strip()
+            if rel:
+                return rel
+
+        # --- languages ---
+        # "What is your level of proficiency in Thai?" (SKY ICT, application 281). Only a language the facts
+        # name is answered; one they do not is asked, because these lists offer no honest "none".
+        if has("proficien", "fluen", "language"):
+            for name, level in (self.fact("languages", {}) or {}).items():
+                if re.search(rf"\b{re.escape(str(name).lower())}\b", key):
+                    return str(level)
 
         # --- preferences ---
         if has("salary", "compensation", "pay expectation", "expected pay", "rate expectation"):

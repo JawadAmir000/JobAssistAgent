@@ -108,6 +108,17 @@ FALLBACK_SUBMIT_NAMES = SUBMIT_NAMES
 FORM_FIELDS = ("form input:not([type=hidden]):not([type=submit]):not([type=button]):visible, "
                "form textarea:visible, form select:visible")
 FORM_FILE = "form input[type=file]"
+# A careers portal's own search box: the one thing its home and job-search pages have that a form does not.
+PORTAL_SEARCH = ("input[type=search]:visible, input[name*='search' i]:visible, input[id*='search' i]:visible, "
+                 "input[placeholder*='search' i]:visible, [role=search] input:visible, input[name*='query' i]:visible")
+# What an application form has and a job page's stray upload widget does not: who the candidate is.
+# Visible ones only: EY's and BCG's job pages both carry a hidden talent-community form with a name and an
+# email box, which counted as the candidate's details on the first version of this test.
+IDENTITY_FIELDS = ", ".join(sel + ":visible" for sel in (
+    "input[type=email]", "input[autocomplete=email]", "input[name*='email' i]", "input[id*='email' i]",
+    "input[type=tel]", "input[autocomplete=tel]", "input[name*='phone' i]",
+    "input[autocomplete='given-name']", "input[autocomplete='family-name']",
+    "input[name*='first' i]", "input[name*='last' i]", "input[id*='firstname' i]", "input[id*='lastname' i]"))
 MIN_FIELDS = 3
 
 # What opens the form when the page shows a teaser instead. Matched on the accessible name, in the
@@ -121,6 +132,11 @@ OPEN_NAMES = re.compile(
     r"|(?:jetzt\s+)?bewerben|solicitar(?:\s+empleo)?|aplicar|candidatar(?:-se)?|candidatura|solliciteer)"
     r"(?!\s*(?:with|via|using|through|by|avec|mit|con|com|met)\b)", re.I)
 THIRD_PARTY_RE = re.compile(r"linkedin|indeed|google|facebook|apple|seek\b|xing|microsoft|dropbox", re.I)
+# Pages and frames that are advertising plumbing, never part of an application.
+TRACKING_URL_RE = re.compile(
+    r"doubleclick\.net|googleadservices|googlesyndication|google-analytics|googletagmanager|facebook\.com/tr\b"
+    r"|adsrvr\.org|bat\.bing\.com|linkedin\.com/px|adnxs\.com|demdex\.net|omtrdc\.net|criteo|hotjar|clarity\.ms",
+    re.I)
 
 # Sites that cannot be driven: they gate the application behind a national identity login or a hardware
 # token. Stopping with the reason beats "could not find an application form", which sent the user hunting
@@ -534,6 +550,8 @@ class GenericFormAdapter(Adapter):
         try:
             if _flow_key(ctx.page.url) != want:
                 return False    # the window moved on while it waited; find the form the usual way
+            if self._stray_form(ctx.page) or self._is_portal_search(ctx.page):
+                return False    # what was walked was the posting or the portal's search, not the form
             root = self._form_root(ctx.page)
             return self._application_controls(root, self._detect_scope(root) or self.fallback_scope) > 0
         except Exception as e:  # noqa: BLE001 - a window that cannot be measured is one to re-open
@@ -819,6 +837,10 @@ class GenericFormAdapter(Adapter):
         """
         page = ctx.page
         self._refuse_redirect_home(ctx)
+        # A window parked on the portal's job search (BCG's Career Hub after its sign-in, application 289):
+        # its search form passes every form test below, and the walker searched it for the job title.
+        if self._back_to_the_job(ctx):
+            page = ctx.page
         # A challenge page in place of the job (DataDome's slider, a Cloudflare turnstile) has no form and
         # no Apply control; without this it read as "could not find an application form".
         c.detect_captcha(page)
@@ -831,6 +853,8 @@ class GenericFormAdapter(Adapter):
         if self._pass_account_gate(ctx):
             page = ctx.page
             c.require_open(page)
+            if self._back_to_the_job(ctx):
+                page = ctx.page
         if self._form_visible(page, c.SHORT) or self._form_in_frame(page):
             return
         if self._adopt_existing_application_page(ctx):
@@ -855,6 +879,8 @@ class GenericFormAdapter(Adapter):
                 if self._pass_account_gate(ctx):
                     page = ctx.page
                     c.require_open(page)
+                    if self._back_to_the_job(ctx):
+                        page = ctx.page
                 has_opener = self._has_opener(page)
                 if self._form_visible(page, c.SHORT if has_opener else FORM_WAIT):
                     return
@@ -928,6 +954,15 @@ class GenericFormAdapter(Adapter):
             try:
                 if candidate is current or candidate.is_closed() or not (candidate.url or "").startswith("http"):
                     continue
+                if TRACKING_URL_RE.search(candidate.url or ""):
+                    # Opened by the posting's own scripts, not by any Apply: BCG's DoubleClick "activityi"
+                    # popup was adopted here as the handoff, twice (application 289).
+                    log.info("generic: ignoring tracking page %s", (candidate.url or "")[:100])
+                    try:
+                        candidate.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
                 # Every context belongs to one application. Its newest non-posting HTTP page is therefore
                 # the application handoff even while it still shows only a loader.
                 self._switch_context_page(ctx, candidate)
@@ -953,9 +988,25 @@ class GenericFormAdapter(Adapter):
                       if page not in pages_before and not page.is_closed()]
         except Exception:
             return False
-        if not opened:
+        real = []
+        for extra in opened:
+            try:
+                url = extra.url or ""
+            except Exception:  # noqa: BLE001
+                url = ""
+            if TRACKING_URL_RE.search(url):
+                # An ad-tracking popup is not a step of anything: BCG's Phenom site fires a DoubleClick
+                # "activityi" page on Apply, and adopting it ended application 289 on a blank page.
+                log.info("generic: ignoring tracking popup %s", url[:100])
+                try:
+                    extra.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            real.append(extra)
+        if not real:
             return False
-        cls._switch_context_page(ctx, opened[-1])
+        cls._switch_context_page(ctx, real[-1])
         return True
 
     @staticmethod
@@ -1019,6 +1070,11 @@ class GenericFormAdapter(Adapter):
                     try:
                         pages_before = self._context_pages(page)
                         url_before = page.url
+                        # A scope the posting already had (its search box and alert form make one) is not
+                        # the form appearing: counting it ended the wait 340ms after the press, before the
+                        # dropdown the press opened was looked at (EY, application 288).
+                        scope_before = self._detect_scope(page)
+                        self._mark_visible_openers(page)
                         ctx.step(f"Pressing '{name[:40] or 'Apply'}'")
                         el.click(timeout=c.MEDIUM)
                         elapsed = 0
@@ -1032,11 +1088,77 @@ class GenericFormAdapter(Adapter):
                                 except Exception:
                                     pass
                                 return True
-                            if page.url != url_before or self._detect_scope(page) is not None:
+                            if page.url != url_before or (scope_before is None and self._detect_scope(page) is not None):
                                 return True
+                        # Nothing moved: the control may have been a menu toggle. EY's SuccessFactors site
+                        # draws "Apply now" as a dropdown whose own "Apply Now" item is the real opener, and
+                        # pressing the toggle again only closes it -- application 288 pressed it five times.
+                        # Press whatever apply-named control the click has just revealed.
+                        if self._press_revealed_opener(ctx, page, url_before, pages_before):
+                            return True
                         return True
                     except Exception as e:  # noqa: BLE001 - a dead opener is not a reason to give up on the page
                         log.debug("generic: apply control did not click: %s", e)
+        return False
+
+    _SEEN_OPENER = "data-jobbot-opener-seen"
+
+    def _mark_visible_openers(self, page) -> None:
+        """Stamp every apply-named control that is visible now, so a newly revealed one can be told apart.
+
+        Earlier stamps are cleared first: a retry on the same window found EY's "Apply Now" item still
+        carrying the stamp from a pass that had left the menu open, and skipped it as already seen.
+        """
+        try:
+            page.evaluate("(a) => document.querySelectorAll('[' + a + ']').forEach(e => e.removeAttribute(a))",
+                          self._SEEN_OPENER)
+        except Exception:  # noqa: BLE001
+            pass
+        for role in ("button", "link", "menuitem"):
+            try:
+                found = page.get_by_role(role, name=OPEN_NAMES)
+                for i in range(min(found.count(), 8)):
+                    el = found.nth(i)
+                    if c.is_visible_now(el):
+                        el.evaluate("(e, a) => e.setAttribute(a, '1')", self._SEEN_OPENER)
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _press_revealed_opener(self, ctx: ApplyContext, page, url_before: str, pages_before) -> bool:
+        """Press an apply-named control that became visible after the last press (a dropdown's own item)."""
+        for role in ("menuitem", "link", "button"):
+            try:
+                found = page.get_by_role(role, name=OPEN_NAMES)
+                n = min(found.count(), 8)
+            except Exception:  # noqa: BLE001
+                continue
+            for i in range(n):
+                el = found.nth(i)
+                try:
+                    if not c.is_visible_now(el) or el.get_attribute(self._SEEN_OPENER):
+                        continue
+                    name = c.clean(el.inner_text() or el.get_attribute("aria-label") or "")
+                    if THIRD_PARTY_RE.search(name):
+                        continue
+                    ctx.step(f"Pressing '{name[:40] or 'Apply'}' (revealed by the last press)")
+                    el.click(timeout=c.MEDIUM)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("generic: revealed opener did not click: %s", e)
+                    continue
+                elapsed = 0
+                while elapsed < OPENER_SETTLE_MS:
+                    wait_ms = min(OPENER_POLL_MS, OPENER_SETTLE_MS - elapsed)
+                    page.wait_for_timeout(wait_ms)
+                    elapsed += wait_ms
+                    if self._adopt_page_opened_since(ctx, pages_before):
+                        try:
+                            ctx.page.wait_for_load_state("domcontentloaded", timeout=c.MEDIUM)
+                        except Exception:
+                            pass
+                        return True
+                    if page.url != url_before:
+                        return True
+                return True
         return False
 
     @classmethod
@@ -1055,12 +1177,19 @@ class GenericFormAdapter(Adapter):
             return False
         while True:
             try:
+                if cls._stray_form(page):
+                    return False      # the posting itself, with its Apply still to press
                 if cls._detect_scope(page) is not None:
                     return True
                 # A CV upload plus something to type in is still an application. The file input alone is
                 # not: boards keep one in the page before the form opens, so it must have company.
                 fields = page.locator(FORM_FIELDS).count()
                 if page.locator(FORM_FILE).count() and fields >= 1:
+                    # ...unless the upload is the job page's own widget -- "Search with resume" beside a
+                    # keyword box (BCG's Phenom site), a job-alert or talent-community form (EY's
+                    # SuccessFactors site) -- with the real Apply button still on screen. Applications 284
+                    # and 286 filled the posting, pressed its Apply button as a submit and waited for a
+                    # confirmation. The application form names the candidate; those widgets do not.
                     return True
             except Exception as e:  # noqa: BLE001
                 log.debug("generic: counting form fields: %s", e)
@@ -1072,6 +1201,20 @@ class GenericFormAdapter(Adapter):
                 page.wait_for_timeout(min(250, remaining_ms))
             except Exception:
                 return False
+
+    @classmethod
+    def _stray_form(cls, page) -> bool:
+        """True when the page's only form-like thing is a job page's own widget and its Apply is still there.
+
+        Not keyed on _detect_scope: a posting's search box, job-alert form and language menu are enough for
+        it to find a '[role=main]' or a 'form' scope (EY, BCG -- applications 288 and 289 on their retries),
+        and the walker then filled the posting again. What a form has and a posting does not is the
+        candidate's own details; what a posting has and a form does not is the Apply button.
+        """
+        try:
+            return page.locator(IDENTITY_FIELDS).count() < 2 and cls._has_opener(page)
+        except Exception:  # noqa: BLE001
+            return False
 
     @classmethod
     def _form_in_frame(cls, page, settle_ms: int = 2500) -> bool:
@@ -1105,6 +1248,8 @@ class GenericFormAdapter(Adapter):
                 url = frame.url or ""
                 if not url.startswith("http") or (urlparse(url).netloc or "").lower() == host:
                     continue        # a same-site frame is filled in place (see _form_root), never hopped to
+                if TRACKING_URL_RE.search(url):
+                    continue        # advertising plumbing (BCG's DoubleClick frame, application 289)
                 try:
                     if frame.locator(cls._controls_selector("body", extra=True, visible=True)).count() >= MIN_FIELDS:
                         target = url
@@ -1115,8 +1260,13 @@ class GenericFormAdapter(Adapter):
                     continue
             if not target:
                 frames = page.locator("iframe[src*='apply'], iframe[src*='job'], iframe[src*='career']")
-                if frames.count():
-                    target = frames.first.get_attribute("src") or ""
+                for i in range(min(frames.count(), 6)):
+                    src = frames.nth(i).get_attribute("src") or ""
+                    # "activityi;...;src=14914172;typ=job..." is DoubleClick's, and it was the frame this
+                    # selector found on BCG's posting (application 289).
+                    if src and not TRACKING_URL_RE.search(src):
+                        target = src
+                        break
             if not target or target.split("#")[0] == (page.url or "").split("#")[0]:
                 return False
             ctx.step("Opening the embedded form")
@@ -1605,6 +1755,48 @@ class GenericFormAdapter(Adapter):
         for needle, why in MANUAL_HOSTS:
             if needle in host:
                 raise NeedsHuman(why)
+
+    def _back_to_the_job(self, ctx: ApplyContext) -> bool:
+        """After an account gate, a portal that lands on its own home or job search instead of the form.
+
+        BCG's Phenom site verified the new account's email and then opened "Jobs | Experienced" with a
+        search box, and the walker searched it for the job title (application 289). The posting is where
+        Apply is, so go back there, signed in this time. True when it navigated.
+        """
+        page = ctx.page
+        job_url = str(ctx.job.get("url") or "")
+        if not job_url.startswith("http"):
+            return False
+        try:
+            if _flow_key(page.url) == _flow_key(job_url):
+                return False
+            if not self._is_portal_search(page):
+                return False
+            ctx.step("This is the portal's job search; going back to the job posting")
+            page.goto(job_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            page.wait_for_timeout(1500)
+            c.dismiss_cookie_banner(page)
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: back to the job: %s", e)
+            return False
+        return True
+
+    @classmethod
+    def _is_portal_search(cls, page) -> bool:
+        """A careers portal's own search page: a search box, nobody's details, no Apply and no framed form.
+
+        Narrow on purpose -- a wizard step resumed on a URL of its own must never be mistaken for one. Not
+        keyed on a file input: the search page keeps a hidden "upload your resume to search" input, which
+        is what kept BCG's Career Hub looking like a form (application 289).
+        """
+        try:
+            identity, search = page.locator(IDENTITY_FIELDS).count(), page.locator(PORTAL_SEARCH).count()
+            if identity >= 2 or not search or cls._has_opener(page) or cls._form_in_frame(page):
+                log.info("generic: not a portal search page (identity=%d search=%d)", identity, search)
+                return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     @staticmethod
     def _refuse_redirect_home(ctx: ApplyContext) -> None:

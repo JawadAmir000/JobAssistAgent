@@ -118,7 +118,8 @@ NEEDS_MAIL = re.compile(
 TERMS_VERB_RE = re.compile(r"\b(?:accept|agree|acknowledge|consent)\b", re.I)
 TERMS_SUBJECT_RE = re.compile(r"privacy|terms|conditions|statement|policy|data\s+protection|agreement", re.I)
 ACCEPT_NAMES = ("Accept", "I Accept", "I accept", "Accept and continue", "Accept and Continue", "I Agree",
-                "I agree", "Agree", "I acknowledge", "Confirm", "OK", "Ok", "Yes", "Continue",
+                "I agree", "Agree", "I acknowledge", "Acknowledge", "Acknowledge/Consent", "Acknowledge and Consent",
+                "I consent", "Consent", "Confirm", "OK", "Ok", "Yes", "Continue",
                 "Akzeptieren", "Ich stimme zu", "Accepter", "J'accepte", "Aceptar", "Acepto", "Accetto",
                 "Accepteren")
 
@@ -682,7 +683,12 @@ def _tick_consent_boxes(page: Any) -> bool:
 def _accept_in_dialog(page: Any) -> bool:
     """Press Accept in the terms dialog that has just opened. False when no dialog appeared — which is what
     SuccessFactors does when the form behind it does not yet validate."""
-    button = c.named_button(page, ACCEPT_NAMES)
+    button = None
+    for _ in range(8):      # SuccessFactors draws its Privacy Notice dialog a second or two after the click (EY, 288)
+        button = c.named_button(page, ACCEPT_NAMES)
+        if button is not None:
+            break
+        page.wait_for_timeout(500)
     if button is None:
         log.info("account: the terms link opened no dialog to accept (the form may not validate yet)")
         return False

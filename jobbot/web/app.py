@@ -168,6 +168,39 @@ def apply_job(request: Request, job_id: str):
     return _partial(request, "partials/application_card.html", **_app_ctx(app_id))
 
 
+# ---------- apply all ----------
+@app.post("/apply-all", response_class=HTMLResponse)
+def apply_all(request: Request, search_id: str = Form(""), q: str = Form(""), low: str | None = Form(None)):
+    """Queue every job the list is showing that has no application yet, and work through them in order."""
+    from jobbot.web import batch
+    sid = h.parse_search_id(search_id)
+    search = db.get_search(sid) if sid else None
+    err = None
+    if search is None or not search["has_snapshot"]:
+        err = "Run a search first."
+    else:
+        jobs = [j for j in db.list_jobs(min_score=1 if low else 3, query=q or None, search_id=sid, limit=500)
+                if not j["app_status"]]
+        if not jobs:
+            err = "Nothing to apply to: every job shown already has an application."
+        elif not batch.start(jobs):
+            err = "Apply all is already running."
+    return _partial(request, "partials/batch_status.html", b=batch.snapshot(), error=err)
+
+
+@app.get("/apply-all/status", response_class=HTMLResponse)
+def apply_all_status(request: Request):
+    from jobbot.web import batch
+    return _partial(request, "partials/batch_status.html", b=batch.snapshot(), error=None)
+
+
+@app.post("/apply-all/stop", response_class=HTMLResponse)
+def apply_all_stop(request: Request):
+    from jobbot.web import batch
+    batch.stop()
+    return _partial(request, "partials/batch_status.html", b=batch.snapshot(), error=None)
+
+
 def _safe_run(fn, app_id: int, *args) -> None:
     try:
         fn(app_id, *args)

@@ -89,6 +89,7 @@ DROPZONE_TEXT = re.compile(r"drop files?\s+here", re.I)
 ATTACHED = "[data-automation-id='file-upload-item'], [data-automation-id='deleteFile'], " \
            "[data-automation-id='filename']"
 PROMPT_WAIT = 1200        # ms - Workday renders the option list in a portal a beat after the click
+SEARCH_POLLS = 6          # x PROMPT_WAIT: how long a typed search gets to replace the list it opened on
 
 # data-automation-id is Workday's own contract with its test suite, so these are the stable selectors.
 AID = "[data-automation-id='{}']"
@@ -154,6 +155,16 @@ class WorkdayAdapter(Adapter):
     def apply(self, ctx: ApplyContext) -> None:
         page = ctx.page
         c.require_open(page)
+        if self._server_error(page):
+            # A resume that lands on Workday's "Something went wrong / refresh the page" panel (AIA,
+            # application 283): the draft is saved, and the posting is not closed just because the panel
+            # has no Apply button on it. Reload, then start from wherever Workday puts us.
+            ctx.step("Workday showed an error page; reloading it")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2500)
+            except Exception as e:  # noqa: BLE001
+                log.debug("workday: reload after error page: %s", e)
 
         self._dismiss_legal(page)
         c.raise_if_already_applied(page)
@@ -449,6 +460,18 @@ class WorkdayAdapter(Adapter):
 
             before = self._state(page)
             if not self._click_first(page, NEXT):
+                # Workday's own error page in place of the step -- "Something went wrong. Please refresh the
+                # page and then try again. Error Code: VPS|..." (AIA, application 283, on Voluntary
+                # Disclosures). It says what to do and the draft is saved, so do it, once per step.
+                if self._server_error(page) and ctx.extra.get("wd_reloaded") != heading:
+                    ctx.extra["wd_reloaded"] = heading
+                    ctx.step("Workday showed an error page; reloading it")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2500)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("workday: reload after error page: %s", e)
+                    continue
                 # The step may simply not have finished drawing — the Review page arrives as an empty panel
                 # and fills in a beat later, which read as "this step has no Next button" on the very last
                 # screen of a completed application. Give it another look before giving up on it.
@@ -464,6 +487,18 @@ class WorkdayAdapter(Adapter):
                             f"jobbot filled the '{heading or 'current'}' step but found no Next button. "
                             "Continue in the browser window, then click Continue here.")
 
+            if not self._wait_for_move(page, before) and self._server_error(page) \
+                    and ctx.extra.get("wd_reloaded") != heading:
+                # Not the form refusing a field: Workday itself failed ("Error - Page Error - Error Code:
+                # VPS|..."), which a reload clears. Once per step, like the error panel above.
+                ctx.extra["wd_reloaded"] = heading
+                ctx.step("Workday showed a page error; reloading it")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("workday: reload after page error: %s", e)
+                continue
             if not self._wait_for_move(page, before):
                 # Next did not move: Workday rendered a validation error in place. Before handing it back,
                 # fill the step once more — the error names a field that was left empty, and a second pass
@@ -490,6 +525,26 @@ class WorkdayAdapter(Adapter):
             seen_headings.append(heading)
 
         raise ApplyError(f"Workday application did not finish in {MAX_STEPS} steps ({seen_headings}).")
+
+    @staticmethod
+    def _is_input(box) -> bool:
+        """True for a prompt that can be typed into (the search prompts), not a Select One button."""
+        try:
+            return str(box.evaluate("e => e.tagName")).lower() == "input"
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _server_error(page) -> bool:
+        """True when Workday has drawn its "Something went wrong / refresh the page" panel instead of a step."""
+        try:
+            text = c.clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))
+        except Exception:  # noqa: BLE001
+            return False
+        # "Something went wrong / Please refresh the page" (AIA, 283) and the "Errors Found: Error - Page
+        # Error - Error Code: VPS|..." list Lumentum's step drew eight of (285): both are Workday's, not
+        # the form's, and both clear on a reload.
+        return bool(re.search(r"something went wrong.{0,120}refresh the page|error code:?\s*vps\|", text, re.I | re.S))
 
     def _state(self, page) -> str:
         """A fingerprint of the screen, for deciding whether a step moved on.
@@ -627,7 +682,7 @@ class WorkdayAdapter(Adapter):
                         continue
                     label = self._field_label(el)
                     if answered(el):
-                        if not self._wrong_source(ctx, el, label):
+                        if not (self._wrong_source(ctx, el, label) or self._wrong_education(ctx, el, label)):
                             continue
                         ctx.step(f"Correcting '{label}'")
                         self._clear_prompt(page, el)
@@ -663,10 +718,68 @@ class WorkdayAdapter(Adapter):
         return source.lower().replace(" ", "") not in holder.lower().replace(" ", "")
 
     @staticmethod
+    def _wrong_education(ctx: ApplyContext, el, label: str) -> bool:
+        """True when a Field of Study / Degree control holds something the education facts do not name.
+
+        The one other filled control worth second-guessing, for the same reason as the source: the value is
+        jobbot's own, not the employer's. Lumentum's "Field of Study" came to hold "Aerospace Engineering"
+        (application 285) because an alternative wording, "Engineering", fuzzy-matched it. The match is
+        fixed, but the window kept open for the retry still shows the pick, and a resume that trusts every
+        filled control would submit it.
+        """
+        from jobbot.apply.resolver import (_DEGREE_LEVEL_KEY_RE, _FIELD_OF_STUDY_KEY_RE, _extends_cleanly,
+                                           normalize_question)
+        key = normalize_question(label or "")
+        if not key or "classification" in key:
+            return False
+        # Read fresh rather than from ctx.facts: that is the snapshot taken when the application started, and
+        # an alternative added to facts.yaml during a pause (degree_alternatives, 285) was invisible to it,
+        # so a value the file now names was "corrected" to itself on every resume.
+        from jobbot import config
+        edu = (config.load_facts() or {}).get("education") or {}   # the raw block: ctx.fact() renders a list as text
+        if _FIELD_OF_STUDY_KEY_RE.search(key):
+            want = [edu.get("field_of_study")] + list(edu.get("field_of_study_alternatives") or [])
+        elif _DEGREE_LEVEL_KEY_RE.search(key):
+            want = [edu.get("degree")] + list(edu.get("degree_alternatives") or [])
+        else:
+            return False
+        want = [normalize_question(str(w)) for w in want if w and str(w).strip()]
+        holder = c.clean(WorkdayAdapter._selected_text(el))
+        if not holder:
+            try:
+                holder = c.clean(el.inner_text() or "")
+            except Exception:  # noqa: BLE001
+                return False
+        held = normalize_question(holder)
+        if not want or not held or PLACEHOLDER_RE.match(holder):
+            return False
+        if any(held == w or _extends_cleanly(w, held) for w in want):
+            return False
+        log.info("workday: %r holds %r, which the education facts do not name; correcting it", label, holder)
+        return True
+
+    @staticmethod
     def _clear_prompt(page, el) -> None:
-        """Empty a prompt so it can be answered again. Workday's chip says how: press delete in the box."""
+        """Empty a prompt so it can be answered again.
+
+        Each chosen value is a chip with its own x (DELETE_charm); Delete in the box did not remove the
+        "Aerospace Engineering" chip (application 285), so the x is pressed first and Backspace -- which
+        takes the last chip in an empty box -- second.
+        """
+        try:
+            wrapper = el.locator("xpath=ancestor::*[starts-with(@data-automation-id,'formField')][1]")
+            charms = wrapper.locator("[data-automation-id='DELETE_charm'], [data-automation-id='selectedItem'] [role=button]")
+            for _ in range(min(charms.count(), 10)):
+                try:
+                    charms.nth(0).click(timeout=c.SHORT)
+                    page.wait_for_timeout(300)
+                except Exception:  # noqa: BLE001
+                    break
+        except Exception as e:  # noqa: BLE001
+            log.debug("workday: chip charms: %s", e)
         try:
             el.click(timeout=c.SHORT)
+            page.keyboard.press("Backspace")
             page.keyboard.press("Delete")
             page.wait_for_timeout(600)
         except Exception as e:  # noqa: BLE001
@@ -731,12 +844,26 @@ class WorkdayAdapter(Adapter):
             except _SkillsAdded:
                 return
         seen: list[str] = []
+        searched = False
         for _ in range(PROMPT_LEVELS):
             if not options:
                 break
             texts = [text for text, _ in options]
             seen = texts
-            answer = ctx.answer(label, texts, "select")
+            try:
+                answer = ctx.answer(label, texts, "select")
+            except NeedsHuman:
+                # A long list opens on its alphabetical head: Lumentum's "Field of Study" showed
+                # "Accounting ... Agricultural Engineering", and Computer Science was a hundred rows down
+                # (application 285). Such a box also filters on what is typed, so type the answer before
+                # asking the user to scroll for it. Once: a search that finds nothing is a real miss.
+                if searched or not self._is_input(box):
+                    raise
+                searched = True
+                options = self._search_prompt(ctx, page, box, label)
+                if not options:
+                    raise
+                continue
             match = self._match_option(options, answer)
             log.info("workday: %r offered %s -> %r%s", label, texts[:8], answer,
                      "" if match else " (no option matches)")
@@ -801,11 +928,30 @@ class WorkdayAdapter(Adapter):
             except Exception as e:      # noqa: BLE001
                 log.debug("workday: typing %r into %r: %s", term, label, e)
                 continue
-            page.wait_for_timeout(PROMPT_WAIT)
-            options = self._prompt_options(page)
-            log.info("workday: %r lists nothing until typed; %r offered %d option(s)",
-                     label, term, len(options))
-            if options:
+            # The catalogue prompts ("Field of Study", the country list) search on Enter, not as you type:
+            # without it the list stayed on its alphabetical head and the typed query changed nothing
+            # (Lumentum and AIA, applications 285 and 283). _search_skills has always pressed it.
+            before = [t for t, _ in self._prompt_options(page)]
+            try:
+                box.press("Enter", timeout=c.SHORT)
+            except Exception as e:  # noqa: BLE001
+                log.debug("workday: Enter in %r: %s", label, e)
+            # The search takes Workday a few seconds; read too soon and the list is still the alphabetical
+            # head it opened on (both prompts above read 12 of "Accounting, Actuarial Science, ..." for a
+            # query of "Computer Science & Engineering"). Wait for the list to change.
+            options = []
+            for _ in range(SEARCH_POLLS):
+                page.wait_for_timeout(PROMPT_WAIT)
+                options = self._prompt_options(page)
+                if options and [t for t, _ in options] != before:
+                    break
+            changed = bool(options) and [t for t, _ in options] != before
+            log.info("workday: %r lists nothing until typed; %r offered %d option(s)%s",
+                     label, term, len(options), "" if changed else " (the list did not change)")
+            # "No matches found" leaves the catalogue it opened on under the message, and that catalogue
+            # was returned as the search result for "Computer Science & Engineering" (application 285),
+            # so the shorter query was never tried. An unchanged list is no result.
+            if options and (changed or not before):
                 return options
         return []
 
@@ -858,6 +1004,15 @@ class WorkdayAdapter(Adapter):
         an empty page. Pressing the box again (or the down arrow, which is what its aria hint tells a
         keyboard user to do) is cheaper than treating a slow popup as an unanswerable question.
         """
+        # Whatever popup is still open belongs to some other control: a pause raised from inside _fill_prompt
+        # leaves that control's list on screen, and on the retry the next prompt read it as its own -- Lumentum's
+        # "Field of Study" was offered the Degree list (application 285). Escape closes it; it is harmless when
+        # nothing is open.
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+        except Exception as e:  # noqa: BLE001
+            log.debug("workday: closing a stray popup: %s", e)
         for attempt in (1, 2):
             try:
                 box.click(timeout=c.MEDIUM)

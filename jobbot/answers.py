@@ -120,7 +120,7 @@ EDUCATION_KEYWORDS: frozenset[str] = frozenset({
 # worse than no answer at all: "No" to the right to work in Australia is not an answer about Canada.
 FACTS_ONLY_KEYWORDS: frozenset[str] = frozenset({
     "authoriz", "authoris", "visa", "sponsor", "citizen", "clearance", "work permit", "right to work",
-    "legally", "immigration", "eligible to work", "working rights", "work rights",
+    "legally", "immigration", "eligible to work", "eligibility to work", "working rights", "work rights",
     # "residency status" and "permanent resident" are the same declaration in other words. Deliberately not
     # "residence", which is where somebody lives: "Country/Region of residence" is an address field, and
     # answering it from the facts file is right.

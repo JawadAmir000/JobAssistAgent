@@ -154,3 +154,9 @@ th { font-size: .78rem; color: var(--muted); font-weight: 600; text-transform: u
   .topbar { padding: .6rem .8rem; }
   .tabs { padding: .3rem .5rem 0; }
 }
+
+/* apply all */
+.batch { margin: .9rem 0; display: flex; flex-direction: column; gap: .5rem; }
+.batch-items { margin: 0; padding-left: 1.4rem; max-height: 16rem; overflow: auto; font-size: .85rem; display: flex; flex-direction: column; gap: .3rem; }
+.batch-items .status { margin-right: .4rem; }
+.filter .btn { margin-left: .5rem; }
