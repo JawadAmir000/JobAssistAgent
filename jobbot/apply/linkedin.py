@@ -121,6 +121,13 @@ class LinkedInAdapter(Adapter):
             raise AlreadyApplied(f"LinkedIn says this application is already in ({notice}).")
 
         if self._is_easy_apply(page):
+            # LinkedIn caps Easy Apply submissions per day. Once the cap is hit every attempt walks the whole
+            # form only to be refused at Submit, so the user switches it off (Settings key
+            # linkedin_easy_apply_paused = 1) and Easy Apply listings are passed over until it is cleared.
+            from jobbot import config
+            if (config.get_setting("linkedin_easy_apply_paused") or "0").strip() == "1":
+                raise ApplyError("Skipped: LinkedIn Easy Apply is paused (daily Easy Apply limit reached). "
+                                 "Retry once the limit resets.")
             EasyApplyWalker().apply(ctx)
             return
 
@@ -137,6 +144,15 @@ class LinkedInAdapter(Adapter):
     def _delegate(self, ctx: ApplyContext, target: str, *, navigate: bool) -> None:
         """Hand the application to the adapter for `target`. `navigate` is False when the page is already
         there — a resume — so a half-filled form is never reloaded out from under the user."""
+        if (target or "").startswith("chrome-error://"):
+            # The Apply link was followed and the employer's site failed to load (application 305, after a
+            # retry): Chrome's error page is not a destination, and goto() on it crashes. Reload it the way
+            # the planner does; only a site that keeps failing ends the run, and as a retryable failure.
+            from jobbot.apply.planner import recover_network_error
+            if not recover_network_error(ctx.page) or (ctx.page.url or "").startswith("chrome-error://"):
+                raise ApplyError("The employer's site did not load (network error after the Apply link). "
+                                 "Click Retry in a minute.")
+            target, navigate = ctx.page.url, False
         ats = detect_ats(target)
         adapter = get_adapter_for(ats)
         if adapter is None:
@@ -188,6 +204,15 @@ class LinkedInAdapter(Adapter):
     @staticmethod
     def _closed(page) -> str:
         """The phrase LinkedIn used, '' when the posting is open."""
+        # A removed posting is not shown as closed: signed in, /jobs/view/<id> redirects to the feed or the
+        # notifications page, which has no Apply button, and the run asked the user to "apply in the window"
+        # on a page with no job on it (application 337, Newbridge — 13 times across runs).
+        try:
+            path = urlparse(page.url).path.lower()
+        except Exception:  # noqa: BLE001
+            path = ""
+        if path and "/jobs/" not in path and re.match(r"^/(?:feed|notifications|mynetwork|home)?/?$|^/(?:feed|notifications)/", path):
+            return f"the job link now opens {path}, so LinkedIn has taken the posting down"
         try:
             text = (page.inner_text("body") or "").lower()
         except Exception as e:  # noqa: BLE001
@@ -271,6 +296,21 @@ class LinkedInAdapter(Adapter):
                 tab.close()
         except Exception:
             url = page.url  # no popup: LinkedIn either navigated this tab or showed its sign-in wall
+            # LinkedIn's "Job search safety reminder" modal sits between Apply and the employer's site, and the
+            # popup only opens from its "Continue applying" button (Google, application 355).
+            if _on_linkedin_url(url) and (gate := self._safety_reminder(page)) is not None:
+                log.info("linkedin: safety reminder after Apply; pressing Continue applying")
+                try:
+                    with page.expect_popup(timeout=POPUP_TIMEOUT) as popup:
+                        gate.click(timeout=c.MEDIUM)
+                    tab = popup.value
+                    try:
+                        url = self._leave_linkedin(tab)
+                    finally:
+                        tab.close()
+                except Exception as e:  # noqa: BLE001
+                    log.info("linkedin: Continue applying opened no popup (%s)", str(e)[:100])
+                    url = page.url
 
         if not url or _on_linkedin_url(url):
             if self._signed_out(page):
@@ -282,6 +322,16 @@ class LinkedInAdapter(Adapter):
                              f"{url[:120]}). Open the employer's form from the Apply button in the browser "
                              "window, then click Continue.")
         return url
+
+    @staticmethod
+    def _safety_reminder(page):
+        """The "Continue applying" button of LinkedIn's job-search safety modal, or None."""
+        try:
+            btn = page.locator("[role=dialog] a, [role=dialog] button, dialog a, dialog button").filter(
+                has_text=re.compile(r"^\s*continue applying\b", re.I))
+            return btn.first if btn.count() and c.is_visible_now(btn.first) else None
+        except Exception:  # noqa: BLE001
+            return None
 
     @staticmethod
     def _leave_linkedin(tab) -> str:

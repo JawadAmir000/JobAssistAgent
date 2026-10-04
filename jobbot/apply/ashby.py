@@ -229,7 +229,7 @@ class AshbyAdapter(Adapter):
                             (x.type === 'checkbox' || x.type === 'radio') ? x.checked
                           : x.type === 'file' ? (x.files && x.files.length) : !!x.value)
                         || !!en.querySelector('button[aria-pressed=true],button[aria-checked=true]')
-                        || /\.(pdf|docx?|rtf|txt)\b/i.test(en.innerText);
+                        || /\.(pdf|docx?|rtf|txt)\\b/i.test(en.innerText);
                     return !has; })
                 .map(en => en.querySelector('.ashby-application-form-question-title, :scope > label, :scope > legend').innerText.trim().replace(/\*$/, '').trim())""") or []
         except Exception:

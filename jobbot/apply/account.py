@@ -43,7 +43,7 @@ from typing import Any, Callable
 
 from jobbot import credentials
 from jobbot.apply import common as c
-from jobbot.apply.base import ApplyContext, NeedsHuman
+from jobbot.apply.base import ApplyContext, ApplyError, NeedsHuman
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +79,9 @@ TO_CREATE_RE = re.compile(
 TO_SIGN_IN_RE = re.compile(
     r"(?:already|please)\s+sign\s+in|sign\s+in\s+(?:here|instead)|^\s*(?:please\s+)?sign\s+in\s*$"
     r"|^\s*log\s*in\s*$|existing\s+user|already\s+(?:have|a\s+registered|registered)"
-    r"|d[ée]j[àa]\s+inscrit|bereits\s+registriert", re.I)
+    r"|d[ée]j[àa]\s+inscrit|bereits\s+registriert"
+    # Taleo's refusal of a second signup offers only "Back to login page" (application 305)
+    r"|back\s+to\s+(?:the\s+)?(?:log\s*in|sign[\s-]*in)(?:\s+page)?|returning\s+(?:user|candidate)", re.I)
 # Never pressed: these hand the employer's board a login it was never meant to have, and on a headless run
 # they open a popup nobody can complete. Mirrors generic.THIRD_PARTY_RE.
 THIRD_PARTY_RE = re.compile(r"linkedin|indeed|google|facebook|apple|seek\b|xing|microsoft|dropbox|sso"
@@ -94,7 +96,10 @@ ACCOUNT_EXISTS = re.compile(
     # attempt into a sign-in with no account behind it (applications 213-214).
     r"|\b(?:you|user|e-?mail|address|this\s+\w+|it)\s+already\s+ha(?:ve|s)\s+an?\s+(?:\w+\s+)?(?:account|profile)"
     r"|(?:e-?mail|user\s*name|username)\s*(?:address)?\s*(?:is\s+)?already"
-    r"|an?\s+account\s+(?:with|for)\s+th(?:is|at)\s+(?:e-?mail|address|user)", re.I)
+    r"|an?\s+account\s+(?:with|for)\s+th(?:is|at)\s+(?:e-?mail|address|user)"
+    # Taleo: "This user name cannot be used to create a new candidate record … sign in as a returning user"
+    r"|cannot\s+be\s+used\s+to\s+create\s+a\s+new\s+(?:candidate\s+)?(?:record|account|profile)"
+    r"|sign\s+in\s+as\s+a\s+returning\s+user", re.I)
 # ...and when it will not accept the credentials it was given.
 SIGN_IN_FAILED = re.compile(
     r"(?:invalid|incorrect|wrong|unrecognis?zed)\s+(?:user\s*name|username|e-?mail|login|password|credentials)"
@@ -131,7 +136,15 @@ _GATE_PRELUDE = c.DEEP_JS + r"""
     const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
         return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
     const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const nameOf = el => [deepText(el), el.value, deepAttr(el, 'aria-label')].map(norm).filter(Boolean);
+    // "Sign in with Talentmate" (application 307): a first-party sign-in button in a wording no list holds.
+    // Read as plain "sign in" unless what follows "with" is somebody else's login.
+    const firstPartySignIn = t => /^(?:sign|log)\s*-?\s*in\b/.test(t) && !/\bwith\s+(?:linked\s*in|indeed|google|facebook|apple|seek|xing|microsoft|github|sso|okta|azure|otp|a\s+code|email\s+code)\b|single\s+sign|\botp\b/.test(t);
+    // ...and "Signup With Talentmate" for the other view (the same application, its signup page).
+    const thirdParty = t => /\bwith\s+(?:linked\s*in|indeed|google|facebook|apple|seek|xing|microsoft|github|sso|okta|azure)\b|single\s+sign/.test(t);
+    const firstPartySignUp = t => /^(?:sign\s*-?\s*up|register|create\s+(?:an?\s+|my\s+|your\s+)?account)\b/.test(t) && !thirdParty(t);
+    const nameOf = el => { const ns = [deepText(el), el.value, deepAttr(el, 'aria-label')].map(norm).filter(Boolean);
+        if (ns.some(firstPartySignUp)) return ns.concat(['sign up']);
+        return ns.some(firstPartySignIn) ? ns.concat(['sign in']) : ns; };
     const live = el => el.disabled !== true && el.getAttribute('aria-disabled') !== 'true';
     // A tab is a way of choosing a view, never the control that sends one.
     const isTab = el => el.getAttribute('role') === 'tab' || !!deepClosest(el, '[role=tablist]');
@@ -421,8 +434,10 @@ def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool,
     """What the gate said about the attempt just made, and therefore what to try next. Returns the next
     `creating`. Raises when the site is saying something no further attempt can answer."""
     errors = c.form_errors(page)
-    joined = " ; ".join(errors)
     text = _text(page)
+    if not errors:
+        errors = [m.group(0).strip() for m in _PAGE_COMPLAINT_RE.finditer(text)][:3]
+    joined = " ; ".join(errors)
 
     if NEEDS_MAIL.search(joined) or NEEDS_MAIL.search(text):
         raise NeedsHuman(
@@ -443,6 +458,12 @@ def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool,
             f"has a different password. In the browser window that is open: create the account, or use "
             f"'Forgot your password?', with the password in {credentials.location_hint(cap)} — then jobbot "
             "gets in by itself here from now on. Then click Continue.")
+    if creating and re.search(r"phone|mobile", joined, re.I) and (only := _foreign_only_dial_code(page, ctx)):
+        # The site's country-code list holds one code and it is not the candidate's: TalentMate's UAE signup
+        # offers only 971 beside a "Current Location" of only the UAE (application 307). No refill fixes
+        # that, and a UAE number would be invented. Say so once instead of three identical bounces.
+        raise ApplyError(f"This site only registers phone numbers with the +{only} country code (its location "
+                         f"list is limited the same way), so an account cannot be made with your real number.")
     # Only now, and only from the form's own error messages: the rules printed beside the box say
     # "Password must be…" on a page where nothing has gone wrong.
     rejected = [e for e in errors if PASSWORD_REJECTED.search(e)]
@@ -465,6 +486,23 @@ def _read_refusal(ctx: ApplyContext, page: Any, email: str, creating: bool,
     log.info("account: the gate refused without saying why; trying the %s route",
              "sign-in" if creating else "signup")
     return not creating
+
+
+def _foreign_only_dial_code(page: Any, ctx: ApplyContext) -> str:
+    """The one dial code a form's code list allows, when it allows only one and it is not ours; else ''."""
+    ours = re.sub(r"\D", "", ctx.fact("identity.phone") or "")
+    try:
+        # A dial-code list shows codes ("971", "+880"); a location list whose values happen to be numbers
+        # ("1" = United Arab Emirates) shows names, and is not one.
+        lists = page.evaluate("""() => [...document.querySelectorAll('select')].map(s =>
+            [...s.options].map(o => (o.text || '').trim()).filter(t => /^\\(?\\+?\\d{1,4}\\)?$/.test(t))
+                .map(t => t.replace(/\\D/g, '')))""")
+    except Exception:  # noqa: BLE001
+        return ""
+    for codes in lists or []:
+        if len(codes) == 1 and 1 <= len(codes[0]) <= 4 and ours and not ours.startswith(codes[0]):
+            return codes[0]
+    return ""
 
 
 def _switch_view(page: Any, want: str) -> str:
@@ -515,6 +553,7 @@ def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Cal
         # caller already knows how to fill one from facts.yaml. Before the passwords, because a bounced
         # form may have kept them and this pass only writes into empty controls either way.
         fill()
+        _fill_username(page, email)
 
     if password:
         # A retry with the other managed password: the box still holds the refused one, and
@@ -562,6 +601,46 @@ def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Cal
     _settle(page)
     _wait_while_busy(page, button)
     return True
+
+
+# A signup's own login name, beside the email rather than instead of it. Taleo's "New User Registration"
+# (Cognizant, application 305) has User Name above Password and Email; the form fill knows no such field,
+# so it stayed empty and every submit bounced. The email is the name: unique, already the sign-in everywhere
+# else, and inside every such rule seen so far (Taleo bars only accents, spaces and :><()).
+_USERNAME_LABEL_RE = re.compile(r"^\W*(?:user\s*-?\s*name|user\s*id|login(?:\s*(?:name|id))?|sign[\s-]*in\s*name)\W*$",
+                                re.I)
+
+
+def _fill_username(page: Any, email: str) -> None:
+    try:
+        boxes = page.locator("input[type=text], input:not([type])")
+        for i in range(min(boxes.count(), 20)):
+            box = boxes.nth(i)
+            if not c.is_visible_now(box):
+                continue
+            current = c.current_value(box)
+            if current == email:
+                continue
+            label = box.evaluate("""e => {
+                const l = (e.labels && e.labels[0]) || (e.id && document.querySelector(`label[for="${e.id}"]`));
+                return ((l && l.innerText) || e.getAttribute('aria-label') || e.placeholder || e.name || '').trim();
+            }""") or ""
+            # First line only: Taleo's label reads "User Name\n.\nRequired".
+            first = next((ln for ln in label.replace("*", " ").splitlines() if ln.strip()), "")
+            if _USERNAME_LABEL_RE.match(first):
+                # Over whatever is there: the form fill reads "User Name" as a name and types "Jawad Amir",
+                # whose space Taleo refuses — that, not an empty box, is what bounced application 305.
+                c.fill_if_empty(box, email, clear=True)
+                log.info("account: put the email in the signup's %r box (it held %r)", first.strip(), current)
+    except Exception as e:  # noqa: BLE001
+        log.debug("account: user name box: %s", e)
+
+
+# A complaint printed once at the top of the page instead of beside its box — Taleo's yellow "The value
+# entered in the field "User Name" is invalid" (application 305). form_errors looks for per-field markup and
+# found none, so the gate read the bounce as silence and flipped between its two views until it gave up.
+_PAGE_COMPLAINT_RE = re.compile(r"[^.\n]*(?:the value entered in the field|\bis invalid\b|\bis required\b"
+                                r"|must contain between)[^.\n]*", re.I)
 
 
 def _wait_while_busy(page: Any, button: Any, limit_ms: int = 12000) -> None:
@@ -629,6 +708,7 @@ def _accept_terms(page: Any) -> bool:
     cannot be found says so through its own validation, which is a better message than any guess here.
     """
     accepted = _tick_consent_boxes(page)
+    accepted = c.tick_consent_boxes(page) > 0 or accepted     # the boxes drawn in shapes the scan above skips
     try:
         # Not get_by_role("link"): an <a> with no href has no link role, and Taleo's "Read and accept the
         # data privacy statement." is exactly that -- a script-driven anchor -- so the signup went round

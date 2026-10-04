@@ -42,6 +42,11 @@ SUBMIT_INFLIGHT_MAX_S = 75  # how long a form that still says "Submitting..." is
 CAPTCHA_MSG = ("Captcha on this form. Solve it in the Chromium window that is already open (it has been "
                "brought to the front), then click Continue here. Solving it once per company is usually "
                "enough — the clearance cookie is reused for that board's later applications.")
+# A tick-box sitting at the foot of the form (JazzHR's applytojob.com): nothing to clear before filling, and
+# every form needs its own tick, so the clearance-cookie advice above does not apply.
+CHECKBOX_MSG = ("The form is filled in; only its \"I'm not a robot\" tick is left. Tick it in the Chromium "
+                "window (it has been brought to the front), then click Continue here — jobbot sends it from "
+                "there. Do it within two minutes: the tick expires.")
 # Greenhouse will not accept a submission until a code it mails to the candidate is typed back into the form.
 VERIFY_MSG = ("The form wants the verification code emailed to {to}. Paste the code here, or set an app "
               "password in Settings so it is fetched automatically next time.")
@@ -69,7 +74,21 @@ CONFIRM_TEXTS = (
     # an adverb in the middle: Rippling's "You have successfully applied to Forward Deployed Engineer"
     # matched none of the above, so its confirmation page was taken for a bounced form (application 175)
     "successfully applied", "applied successfully", "application was successful", "application is complete",
+    # a noun in the middle: Taleo's "Thank you for your job application" under "Process completed"
+    # (Cognizant, application 305) — sent, and reported as unconfirmed
+    "thank you for your job application", "thanks for your job application", "thank you for submitting your",
+    "your job application has been", "process completed",
 )
+# Phrases a page also uses BEFORE anything is sent: Avanade's "Thank you for your interest in Avanade - you will
+# now be redirected to our application page" was read as a confirmation and two applications that were never
+# made were recorded as already sent (338, 350); OutSystems' form says "thank you for your interest" above its
+# fields (341). They confirm only right after a submit press, never from a page judged on its own.
+WEAK_CONFIRM_TEXTS = frozenset({"thank you for your interest", "you're all set", "you are all set", "has been sent to",
+                                "process completed",
+                                # "…requirements of the role you have applied to" in Accenture's AI-screening
+                                # notice, on a form not yet sent (application 382)
+                                "you have applied", "you've applied"})
+STRONG_CONFIRM_TEXTS = tuple(t for t in CONFIRM_TEXTS if t not in WEAK_CONFIRM_TEXTS)
 FORM_GONE_GRACE_S = 4.0     # a form that vanished after Submit must stay gone this long to count as sent
 CONFIRM_URL_HINTS = ("confirmation", "thanks", "thank-you", "thankyou", "submitted", "success", "applied")
 # The hints above, as words of the URL's path and query -- never its host. "career5.successfactors.eu"
@@ -77,7 +96,9 @@ CONFIRM_URL_HINTS = ("confirmation", "thanks", "thank-you", "thankyou", "submitt
 # recorded as applied from a "Loading..." screen (application 215). Word-bounded for the same reason:
 # "/successfactors/", "?unapplied=" and "/applied-ai-engineer" are not confirmations either.
 _CONFIRM_URL_RE = re.compile(
-    r"(?<![a-z0-9])(?:confirm(?:ation|ed)?|thanks|thank-?you|submitted|success(?:ful(?:ly)?)?|applied)"
+    # Not after a hyphenated word either: Coveo's job lives under /customer-management/technical-success/
+    # (application 373), and "customer-success" teams are everywhere.
+    r"(?<![a-z0-9])(?<!technical-)(?<!customer-)(?<!client-)(?<!partner-)(?<!student-)(?:confirm(?:ation|ed)?|thanks|thank-?you|submitted|success(?:ful(?:ly)?)?|applied)"
     r"(?![a-z0-9]|-(?:ai|ml|data|science|scientist|engineer|research))", re.I)
 
 
@@ -235,13 +256,22 @@ WIDGET_JS = r"""
             if (!p || pops.some(x => x.contains(n)) || !wVis(p)) continue;
             out += ' ' + n.textContent;
         }
-        return wClean(out);
+        // A select2 / react-select clear button is a bare "×" beside the value: "US Dollar ×" was learned as
+        // the answer to Lenovo's currency question (application 336).
+        return wClean(wClean(out).replace(/(^|\s)[×✕✖⨯](?=\s|$)/g, ' '));
     };
     const wIsRoot = el => {
         if (!wVis(el)) return false;
         const r = el.getBoundingClientRect();
         if (r.height > 120 || r.width < 40) return false;          // a control's size, never a section's
         if (el.querySelector(W_NATIVE)) return false;               // wraps something the walker already drives
+        // A part of a control the walker already drives: react-select's indicator box (clear "×" + arrow)
+        // sits beside its role=combobox input, and taken for a dropdown of its own it was asked the
+        // question, chosen into, then read back empty — the value is drawn in the sibling, so "No" was
+        // reported as not chosen while the box showed it (Smartcat/Greenhouse, application 356).
+        const par = el.parentElement;
+        if (par && [...par.querySelectorAll('input[role=combobox], [role=combobox] input')].some(i => !el.contains(i))
+            && !el.querySelector('input:not([type=hidden])')) return false;
         const inputs = [...el.querySelectorAll('input:not([type=hidden])')];
         if (inputs.length > 1) return false;
         const pops = wPopupsIn(el);
@@ -300,7 +330,13 @@ WIDGET_JS = r"""
             for (const el of top.querySelectorAll(W_ROOT_SEL)) {
                 const stamped = el.closest('[data-jobbot-widget]');
                 if (stamped && stamped !== el) continue;             // inside a widget already found
-                if (stamped === el) { if (wVis(el)) out.push(el); continue; }
+                if (stamped === el) {
+                    // Re-judged, not trusted: a stamp left by an older rule (or a page that changed under it)
+                    // kept a react-select's indicator box a "widget" after the rule excluding it landed.
+                    if (!wIsRoot(el)) { el.removeAttribute('data-jobbot-widget'); continue; }
+                    if (wVis(el)) out.push(el);
+                    continue;
+                }
                 if (!wIsRoot(el)) continue;
                 el.setAttribute('data-jobbot-widget', 'w' + (n++));
                 out.push(el);
@@ -562,7 +598,14 @@ def fill_if_empty(el: Any, value: str, *, clear: bool = False) -> bool:
         cur = current_value(el)
         if cur and not clear:
             return False
-        el.click(timeout=SHORT)
+        try:
+            el.click(timeout=SHORT)
+        except Exception as e:  # noqa: BLE001
+            # Something drawn over the box takes the click — TalentMate's floating labels sit on top of its
+            # email boxes, so both stayed empty through three signups (application 307). Focus is what the
+            # click was for; typing works the same once the box has it.
+            log.debug("fill_if_empty: click intercepted (%s); focusing instead", str(e).splitlines()[0][:80])
+            el.focus(timeout=SHORT)
         _type_value(el, value)
         return True
     except Exception as e:
@@ -574,6 +617,22 @@ def upload_resume(page: Any, cv_path: str, file_input: Any | None = None) -> boo
     """Set the CV on a file input if none is attached yet. Picks the first visible-or-hidden file input near 'Resume/CV'."""
     if not cv_path:
         return False
+    # Already on the page under its own name: a board that renders an upload as a list row and leaves its
+    # file input empty afterwards (Workday's Resume/CV dropzone) looks exactly like an untouched form to the
+    # loop below, so every re-walk of the step attached one more copy -- OCBC's application was carrying
+    # three identical CVs, one per pass. The same check already existed as a fallback *after* the loop, for
+    # a board that removes the input entirely; it has to run before the loop to stop the second upload.
+    if file_input is not None:
+        # The caller named the field, so judge that field alone: Ashby's "Autofill from resume" box shows the
+        # file name too, and the page-wide look below took that for the Resume field and left the real one
+        # empty — "Required fields still empty: Resume" (Brain Co., application 312).
+        if _field_holds_file(file_input, cv_path):
+            log.info("resume: %s is already in this field; not uploading it again", os.path.basename(str(cv_path)))
+            return True
+    elif file_listed(page, cv_path):
+        log.info("resume: %s is already listed on this page; not uploading it again",
+                 os.path.basename(str(cv_path)))
+        return True
     candidates = []
     if file_input is not None:
         candidates.append(file_input)
@@ -613,14 +672,21 @@ def upload_resume(page: Any, cv_path: str, file_input: Any | None = None) -> boo
                 el.set_input_files(cv_path, timeout=MEDIUM)
                 page.wait_for_timeout(1200)
                 attached = True
+                try:
+                    held = el.evaluate("e => [e.id || e.name, e.disabled, e.files ? e.files.length : -1].join('/')")
+                except Exception:  # noqa: BLE001 - detached by the board's own re-render
+                    held = "detached"
+                log.info("resume: set %s on a file input (id/disabled/files: %s)", os.path.basename(str(cv_path)), held)
             else:
                 continue
             if not _wants_cv(el) and attached:
                 # nothing names a CV beside this one; a second file input here is "other documents"
                 pass
         except Exception as e:
-            log.debug("resume upload attempt failed: %s", e)
+            log.info("resume: a file input refused the CV: %s", str(e).splitlines()[0][:160])
     if attached:
+        return True
+    if not candidates and _upload_through_chooser(page, cv_path):
         return True
     # Greenhouse swaps the file input for a filename chip once a file is chosen, so on an idempotent re-run
     # there is no input left to find. The CV is attached; don't report that as a failure.
@@ -629,6 +695,131 @@ def upload_resume(page: Any, cv_path: str, file_input: Any | None = None) -> boo
         if name and page.get_by_text(name, exact=False).count():
             return True
     except Exception:
+        pass
+    return False
+
+
+def follow_control_href(page: Any, el: Any, url_before: str) -> bool:
+    """Open the URL a non-link control carries when pressing it went nowhere.
+
+    TalentMate's "Apply Job" is a <button href="…/candidate/job-applications/apply/…"> wired to a modal
+    that never opens: a button's href means nothing to the browser, so three presses and the planner's
+    fourth all stayed on the posting (application 307, seen 12 times). The URL is the site's own, on
+    the control the walk already chose to press, so following it is that press finished by hand.
+    """
+    try:
+        href = el.evaluate("""e => { const v = e.getAttribute('href') || e.getAttribute('data-href')
+                                   || e.getAttribute('data-url') || e.getAttribute('data-link') || '';
+                                   if (!v || /^(#|javascript:)/i.test(v)) return '';
+                                   try { return new URL(v, location.href).href; } catch (_) { return ''; } }""")
+    except Exception:  # noqa: BLE001
+        return False
+    if not href or href == url_before or not href.startswith("http"):
+        return False
+    log.info("the press went nowhere; opening the URL the control carries: %s", href[:120])
+    try:
+        page.goto(href, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1500)
+    except Exception as e:  # noqa: BLE001
+        log.info("that URL would not open: %s", str(e).splitlines()[0][:120])
+        return False
+    return page.url != url_before
+
+
+def click_reachable(el: Any) -> bool:
+    """False when another element covers this control's centre, so a click would land on that instead.
+
+    Taraki's application opens as a modal over the posting, and the posting's own "Apply" button, still
+    visible behind the modal's backdrop, was taken as the form's submit: the click waited five seconds on the
+    backdrop and crashed the run (application 308). Off-screen controls are given the benefit of the doubt —
+    the caller scrolls before it clicks — and so is anything this cannot measure.
+    """
+    try:
+        return bool(el.evaluate("""e => {
+            const r = e.getBoundingClientRect();
+            const x = r.left + r.width / 2, y = r.top + r.height / 2;
+            if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+            const hit = document.elementFromPoint(x, y);
+            return !hit || e === hit || e.contains(hit) || hit.contains(e);
+        }"""))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+_DROPZONE_RE = re.compile(r"drop\s+(?:your\s+)?files?|click\s+to\s+(?:browse|upload)|browse\s+files?|choose\s+(?:a\s+)?file"
+                          r"|upload\s+(?:a\s+|your\s+)?(?:file|resume|cv|r[ée]sum[ée])|attach\s+(?:a\s+|your\s+)?(?:file|resume|cv)"
+                          r"|^\s*(?:upload|attach|browse)\s*$", re.I)
+
+
+def _upload_through_chooser(page: Any, cv_path: str) -> bool:
+    """Attach the CV where the page has no file input at all until its drop zone is clicked.
+
+    Airtable's form (Musly Club, application 311) asks "Please upload your resume" above a "Drop files here or
+    click to browse" box, and creates its file input only inside the click — so upload_resume found nothing
+    and the application went in without a CV. Clicking the zone that sits under CV wording, with Playwright
+    holding the file chooser it opens, is the same thing a person does.
+    """
+    try:
+        zones = page.get_by_text(_DROPZONE_RE)
+        for i in range(min(zones.count(), 6)):
+            zone = zones.nth(i)
+            if not is_visible_now(zone) or re.match(r"^\s*(?:please\s+)?upload\s+your\s+(?:resume|cv)\b",
+                                                    zone.inner_text() or "", re.I):
+                continue    # the question above the zone ("Please upload your resume"), not the zone
+            near = zone.evaluate("""e => { let p = e; for (let i = 0; i < 15 && p; i++, p = p.parentElement) {
+                    const t = (p.innerText || '').slice(0, 400); if (/\\b(cv|resume|résumé|curriculum)\\b/i.test(t)) return t; }
+                    return ''; }""")
+            if not near or re.search(r"\bcover\s+letter\b", near, re.I) and not re.search(r"\b(?:cv|resume)\b", near, re.I):
+                continue
+            before = page.locator("input[type=file]").count()
+            try:
+                with page.expect_file_chooser(timeout=SHORT) as fc:
+                    zone.click(timeout=SHORT)
+                fc.value.set_files(cv_path)
+            except Exception:  # noqa: BLE001 - no native picker: the click drew the site's own upload panel
+                # Airtable's click opens a panel ("Local Files, Link, Webcam, Google Drive…") and adds the
+                # file inputs then; its own "Upload 1 file" button sends what was chosen.
+                inputs = page.locator("input[type=file]")
+                if inputs.count() <= before and not inputs.count():
+                    continue
+                inputs.first.set_input_files(cv_path, timeout=MEDIUM)
+                page.wait_for_timeout(2000)
+                send = page.get_by_role("button", name=re.compile(r"^\s*upload\b", re.I))
+                if send.count() and is_visible_now(send.first):
+                    send.first.click(timeout=MEDIUM)
+            page.wait_for_timeout(3000)
+            log.info("resume: attached %s through the page's own upload control", os.path.basename(str(cv_path)))
+            return True
+    except Exception as e:  # noqa: BLE001
+        log.info("resume: the upload zone did not open a file picker: %s", str(e).splitlines()[0][:120])
+    return False
+
+
+def _field_holds_file(file_input: Any, cv_path: str) -> bool:
+    """True when this file input holds a file, or its own field (not the page) shows the CV's name."""
+    name = os.path.basename(str(cv_path or ""))
+    try:
+        # What the field shows wins over what the input holds: in application 312 Ashby's input carried a
+        # file while its field still offered "Upload File", so the app had never taken it.
+        return bool(file_input.evaluate("""(e, n) => {
+            const f = e.closest('.ashby-application-form-field-entry, fieldset, [class*=field i], li');
+            if (f && (f.innerText || '').trim()) return !!(n && f.innerText.includes(n));
+            return !!(e.files && e.files.length); }""", name))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cv_input_emptied(page: Any) -> bool:
+    """True when a file input that names the CV is on the page, enabled, and holds no file."""
+    try:
+        inputs = page.locator("input[type=file]")
+        for i in range(min(inputs.count(), 8)):
+            el = inputs.nth(i)
+            if not _wants_cv(el) or not _accepts_document(el):
+                continue
+            if el.evaluate("e => !e.disabled && !!e.files && e.files.length === 0"):
+                return True
+    except Exception:  # noqa: BLE001
         pass
     return False
 
@@ -822,7 +1013,51 @@ def dismiss_cookie_banner(page: Any) -> bool:
     return False
 
 
-def detect_captcha(page: Any, raise_: bool = True) -> bool:
+def inline_checkbox_only(page: Any) -> bool:
+    """The only challenge on screen is a tick-box sitting inside a form that still has fields to fill.
+
+    Regression (WELL Health on JazzHR): applytojob.com puts a reCAPTCHA v2 "I'm not a robot" box under its
+    one-page form. The walker checked for a captcha before filling, so the pause handed the user an empty
+    form, twelve times over. A tick-box blocks the send, not the filling, and is ticked last; a painted
+    puzzle frame (bframe / frame=challenge) or a challenge page with no form is still a captcha up front.
+    """
+    try:
+        frames = list(_owning_page(page).frames)
+    except Exception:  # noqa: BLE001
+        return False
+    saw_box = False
+    for fr in frames[1:]:
+        try:
+            url = fr.url or ""
+            if not _CAPTCHA_FRAME_RE.search(url) or _PASSIVE_FRAME_RE.search(url):
+                continue
+            el = fr.frame_element()
+            if not _frame_element_painted(el):
+                continue
+            box = el.bounding_box()
+        except Exception:  # noqa: BLE001
+            continue
+        if not box or box.get("width", 0) <= 30 or box.get("height", 0) <= 30:
+            continue
+        if not _CHECKBOX_FRAME_RE.search(url):
+            return False        # a puzzle, a Turnstile or an interstitial: a real challenge
+        saw_box = True
+    if not saw_box:
+        return False
+    try:
+        fields = int(page.evaluate(
+            """() => [...document.querySelectorAll('input, textarea, select')].filter(el => {
+                    if (/^(hidden|submit|button|image|reset)$/i.test(el.type || '')) return false;
+                    if (/captcha/i.test((el.name || '') + ' ' + (el.id || ''))) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                }).length"""))
+    except Exception:  # noqa: BLE001
+        return False
+    return fields >= 3
+
+
+def detect_captcha(page: Any, raise_: bool = True, allow_inline: bool = False) -> bool:
     """A visible reCAPTCHA / hCaptcha / Turnstile widget (or challenge iframe) on the page.
 
     Also catches the older kind that ships no recognisable widget at all — Zoho Recruit renders a plain
@@ -836,6 +1071,9 @@ def detect_captcha(page: Any, raise_: bool = True) -> bool:
     before a field was filled. The badge is told apart by its own URL (size=invisible), not by the page's
     wording — "verify" is ordinary form copy, and the badge's own text sits in a cross-origin frame that
     innerText cannot see, so keying on prose got it wrong in both directions.
+
+    allow_inline: called before the form is filled — a tick-box inside the form is left for the post-fill
+    check (see inline_checkbox_only), which pauses with CHECKBOX_MSG instead.
     """
     found = False
     try:
@@ -887,8 +1125,12 @@ def detect_captcha(page: Any, raise_: bool = True) -> bool:
         found = False
     elif not found:
         found = captcha_frame_showing(page)
+    inline = found and inline_checkbox_only(page)
+    if inline and allow_inline:
+        log.info("captcha: a tick-box inside the form; left until the form is filled")
+        return False
     if found and raise_:
-        raise NeedsHuman(CAPTCHA_MSG)
+        raise NeedsHuman(CHECKBOX_MSG if inline else CAPTCHA_MSG)
     return found
 
 
@@ -921,7 +1163,8 @@ def _typeable_count(page: Any) -> int:
         return int(page.evaluate(
             "() => {" + DEEP_JS +
             """ const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-                return deepAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select')
+                return deepAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select,'
+                               + ' button[aria-haspopup=listbox], [role=combobox]')
                     .filter(vis).length; }"""))
     except Exception:  # noqa: BLE001
         return -1
@@ -963,6 +1206,14 @@ def wait_for_confirmation(page: Any, timeout_s: int = CONFIRM_TIMEOUT_S, names: 
     except Exception:
         pass
     fields_before = _typeable_count(page)
+    # Confirmation phrases already on the form do not confirm anything: OutSystems' Workday form says "thank you
+    # for your interest" above its fields, and a submit the form refused (phone "isn't recognized") was recorded
+    # as sent 1.5 s after the click (application 341). Only a phrase that appears after the press counts.
+    try:
+        body_before = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
+    except Exception:  # noqa: BLE001
+        body_before = ""
+    stale_phrases = {t for t in CONFIRM_TEXTS if t in body_before}
     gone_since: float | None = None
     # A submit that works navigates, but not instantly: judged in the same millisecond, the old page is still
     # painted. That raced a successful submission into "the code step is still up", which re-submitted onto a
@@ -980,8 +1231,12 @@ def wait_for_confirmation(page: Any, timeout_s: int = CONFIRM_TIMEOUT_S, names: 
             if url != start_url.lower() and confirm_url(url):
                 return True
             body = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
-            if any(t in body for t in CONFIRM_TEXTS):
-                return True
+            if any(t in body for t in CONFIRM_TEXTS if t not in stale_phrases):
+                if not form_errors(page):
+                    return True
+            elif stale_phrases and any(t in body for t in stale_phrases) and _typeable_count(page) == 0 \
+                    and not form_errors(page):
+                return True     # the form went and its old thank-you text is all that is left: a real one
             # An emailed-code step is not a failure and will never turn into a confirmation on its own, so
             # stop waiting once it is really there — but only once it has persisted, never on first sight,
             # which is indistinguishable from the last frame of a page that is already on its way out.
@@ -1065,6 +1320,10 @@ _CAPTCHA_FRAME_RE = re.compile(
 # would wave a real puzzle through. Mirrored by the regex literal inside detect_captcha's page script; keep
 # the two in step.
 _PASSIVE_FRAME_RE = re.compile(r"recaptcha/(?:api2|enterprise)/anchor\?[^#]*\bsize=invisible\b", re.I)
+
+# The tick-box itself, as opposed to the puzzle it may open: reCAPTCHA's visible anchor (the invisible one is
+# passive, above) and hCaptcha's frame=checkbox. Their puzzles are other frames (.../bframe, frame=challenge).
+_CHECKBOX_FRAME_RE = re.compile(r"recaptcha/(?:api2|enterprise)/anchor\?|hcaptcha\.com/.*[#&?]frame=checkbox", re.I)
 
 
 def _owning_page(page: Any) -> Any:
@@ -1272,7 +1531,14 @@ def submit_blocked_message(page: Any) -> str:
 # save notices in the same [role=alert] live region as their validation messages, so "…successfully
 # uploaded" came back as a form error — and a step that had just done exactly what was asked was reported
 # as stuck on it.
-_NOT_AN_ERROR_RE = re.compile(r"success|uploaded|saved\b|complete[ds]?\b|thank you|no errors", re.I)
+# Anchored: a field's own message can carry the tally after it ("Enter a maximum of 50 characters. (1 out of 7
+# issues)" plus the toast's text), and that one must stay attached to its field.
+_SUMMARY_BANNER_RE = re.compile(r"^\W*(?:you\s+have\s+\d+\s+(?:issues?|errors?|problems?)\b|there\s+(?:are|is)\s+\d+\s+"
+                                r"(?:issues?|errors?|problems?)\b|please\s+(?:correct|fix)\s+the\s+(?:errors?|issues?)\b)", re.I)
+# ...and the hint printed under a multi-select ("Select a maximum of 3 locations", Nationwide, application 314):
+# it is there whether or not anything is wrong, and read as a complaint it kept every refill pass busy.
+_NOT_AN_ERROR_RE = re.compile(r"success|uploaded|saved\b|complete[ds]?\b|thank you|no errors"
+                              r"|^\W*\w?\s*select\s+(?:a\s+maximum\s+of|up\s+to)\s+\d+\b", re.I)
 
 
 def form_errors(page: Any) -> list[str]:
@@ -1573,16 +1839,44 @@ def field_errors(page: Any) -> list[dict]:
         log.debug("field_errors failed: %s", e)
         return []
     out: list[dict] = []
+    log.debug("field_errors raw: %s", [(f.get("id"), str(f.get("label"))[:40], str(f.get("message"))[:80])
+                                       for f in (found or []) if isinstance(f, dict)][:12])
     for f in found or []:
         if not isinstance(f, dict):
             continue
         msg = clean(str(f.get("message") or ""))
         if not msg or _NOT_AN_ERROR_RE.search(msg):
             continue
+        if f.get("id") is not None and _SUMMARY_BANNER_RE.search(msg):
+            # The page's tally, not this field's complaint: Oracle pins its toast "You have 8 issues that need
+            # to be fixed" to every field it marked invalid (Nationwide, application 314). The field IS one of
+            # the issues — keep it, with its own inline message when the wrapper shows one.
+            own = _inline_message(page, f.get("id"))
+            msg = own or "This field was marked invalid."
         out.append({"id": f.get("id"), "label": clean(str(f.get("label") or "")),
                     "kind": str(f.get("kind") or ""), "value": clean(str(f.get("value") or "")),
                     "required": bool(f.get("required")), "message": msg})
     return out
+
+
+_INLINE_ERR_RE = re.compile(r"\b(?:enter|required|invalid|maximum|minimum|must|select|choose|provide|format)\b", re.I)
+
+
+def _inline_message(page: Any, stamp: Any) -> str:
+    """The validation line drawn inside a stamped field's own wrapper, '' when there is none."""
+    try:
+        text = page.locator(f'[{_ERR_STAMP}="{stamp}"]').first.evaluate("""e => {
+            let p = e.parentElement;
+            for (let i = 0; i < 6 && p; i++, p = p.parentElement) {
+                if (p.querySelectorAll('input, textarea, select, [role=combobox]').length > 2) break;
+                const t = p.innerText || ''; if (t.split('\\n').length > 1) return t; }
+            return ''; }""") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in (clean(x) for x in str(text).splitlines()):
+        if line and _INLINE_ERR_RE.search(line) and not _SUMMARY_BANNER_RE.search(line) and len(line) < 200:
+            return line
+    return ""
 
 
 def _error_shape(msg: str) -> str:
@@ -1677,6 +1971,32 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
     page = ctx.page
     label, kind, before, msg = f["label"], f["kind"], f["value"], f["message"]
 
+    # "Enter a maximum of 50 characters." — the answer is right and too long (Nationwide's Oracle form held
+    # "N/A - I have not worked at Nationwide or Virgin Money", application 314). Keep its first clause, and
+    # failing that cut at a word boundary; a box that wants less than that is asked about below as usual.
+    cap = re.search(r"\b(?:maximum|max\.?|at\s+most|no\s+more\s+than|up\s+to)\s+(?:of\s+)?(\d{1,5})\s+characters?\b", msg, re.I)
+    if cap and kind in ("text", "textarea") and before:
+        limit = int(cap.group(1))
+        full = current_value(el) or before
+        try:
+            # What the rules say now, first: the box may hold an answer from before a rule was fixed (a
+            # citizenship paragraph in "type of visa you hold", application 314).
+            fresh = clean(ctx.answer(label, None, kind) or "")
+        except NeedsHuman:
+            fresh = ""
+        if fresh and fresh != full:
+            full = fresh
+        if len(full) > limit or full != (current_value(el) or before):
+            short = full if len(full) <= limit else re.split(r"\s+[-–—:;]\s+|[.;]\s", full, maxsplit=1)[0].strip()
+            if not short or len(short) > limit:
+                # Never cut prose mid-sentence ("I am a citizen of" is not an answer): ask for a short one.
+                raise NeedsHuman(f"'{label[:80]}' takes at most {limit} characters. Give a short answer here.",
+                                 question=label, kind=kind)
+            if short and short != (current_value(el) or before):
+                log.info("%r allows %d characters; shortening the answer to %r", label[:60], limit, short)
+                fill_if_empty(el, short, clear=True)
+                return clean(current_value(el)) == clean(short)
+
     # Asked through ctx.answer rather than through _ask: _ask lets an unanswerable question go by when the
     # control looks optional, and a control the form has just named in a validation message is not optional
     # whatever its markup says. This is the other half of the C3 AI failure — the field-of-study box read as
@@ -1684,13 +2004,48 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
     if kind == "checkbox":
         if before == "checked":
             return False
+        # One box of a group is not a question of its own. Greenhouse marks every box of a required group
+        # "Please check this box if you want to proceed" while the group is unsatisfied, and asking each box
+        # by its own label ("Spain?") ticked Spain for a candidate in Bangladesh (Smartcat, application 356).
+        # A group already holding a tick is not what the form is refusing; one holding none is answered as
+        # the group, by the walker, not box by box here.
+        try:
+            siblings = el.evaluate("""e => { const n = e.getAttribute('name');
+                const g = n ? [...document.querySelectorAll('input[type=checkbox]')].filter(x => x.name === n) : [];
+                return {count: g.length, ticked: g.filter(x => x.checked).length}; }""")
+        except Exception:  # noqa: BLE001
+            siblings = {"count": 1, "ticked": 0}
+        if siblings.get("count", 1) > 1:
+            log.info("not ticking %r on its own: it is one box of a %d-box group (%d ticked)",
+                     label[:60], siblings["count"], siblings.get("ticked", 0))
+            return False
         # A consent gate the form will not go in without ("You need to agree to the terms and conditions").
         ans = ctx.answer(label, ["Yes", "No"], "checkbox")
         if not ans or not re.match(r"^\s*(?:y|true|agree|accept|i )", ans, re.I):
             return False
         return bool(tick(el))
 
-    if kind in ("radio", "file", "date"):
+    if kind == "file":
+        # An empty upload the form insists on, other than the cover letter's: the CV goes in it. UKG/UltiPro
+        # parses the CV from an "Upload Resume" box at the top and then refuses the submit over an empty
+        # "Documents" box further down (application 318); upload_resume had already seen the CV's name on
+        # the page and left every other input alone.
+        if before == "file" or not ctx.cv_path or not _accepts_document(el):
+            return False
+        words = (label + " " + label_context(el)).lower()
+        if "cover" in words and not _CV_CONTEXT_RE.search(words):
+            return False
+        try:
+            el.set_input_files(ctx.cv_path, timeout=MEDIUM)
+            page.wait_for_timeout(1500)
+        except Exception as e:  # noqa: BLE001
+            log.info("repair %r: the upload refused the CV (%s)", label[:50], str(e)[:100])
+            return False
+        log.info("repair %r: attached %s to the upload the form insists on", label[:50],
+                 os.path.basename(str(ctx.cv_path)))
+        return True
+
+    if kind in ("radio", "date"):
         return False        # the group container is not knowable from here; the broad refill handles these
 
     if kind == "select":
@@ -1765,6 +2120,14 @@ def repair_fields(ctx: ApplyContext, fields: list[dict]) -> list[str]:
             continue        # a phone's country code: the identity refill sets it from the number itself
         log.info("repairing %r (%s, holds %r): %s",
                  f["label"][:60], f["kind"], f["value"][:40], f["message"][:90])
+        if f["kind"] == "text" and is_prompt_value(f.get("value") or ""):
+            # A "text" box holding a list's own prompt is a dropdown jobbot did not recognise: log its shape.
+            try:
+                log.info("prompt-holding control: %s", re.sub(r"\s+", " ", el.evaluate(
+                    "e => { let n = e; for (let i = 0; i < 3 && n.parentElement; i++) n = n.parentElement;"
+                    " return n.outerHTML.replace(/ (style|d)=\"[^\"]*\"/g, '').slice(0, 1800); }")))
+            except Exception:  # noqa: BLE001
+                pass
         if not re.search(r"\w", f.get("label") or ""):
             _log_unnamed_field(el)
         try:
@@ -1886,10 +2249,66 @@ def get_label_for(el: Any) -> str:
     wrong field, and to 200 characters so a paragraph of instructions is not mistaken for a question.
     """
     try:
-        txt = el.evaluate(_LABEL_JS)
-        return clean(txt)
+        txt = clean(el.evaluate(_LABEL_JS))
+        if _GENERIC_LABEL_RE.match(txt):
+            # "Category" alone says nothing, and its cached answer came from a job-category list on another
+            # form ("Data & Analytics" offered to Nationwide's disability category, application 314). The
+            # control's own name usually does say: GB-STANDARD-ORA_DISABILITY_CATEGORY-STANDARD.
+            hint = _name_hint(el, txt)
+            if hint:
+                return f"{txt} ({hint})"
+            # The box's own prefix, not its question: Taraki draws "PKR [ … ] / month" inside the field
+            # group, the scan stopped on "PKR", and both required salary boxes were left blank as optional
+            # questions nobody could answer (application 308). The heading above the group is the label.
+            above = clean(el.evaluate(_LABEL_ABOVE_UNIT_JS))
+            if above:
+                return above
+        return txt
     except Exception:
         return ""
+
+
+_GENERIC_LABEL_RE = re.compile(r"^\W*(?:category|type|details?|other|please\s+specify|specify|description|value|"
+                               r"select|option|choice|status|level)\W*$", re.I)
+_NAME_NOISE = {"gb", "us", "uk", "standard", "ora", "std", "field", "input", "select", "value", "id", "the", "a"}
+
+
+def _name_hint(el: Any, label: str) -> str:
+    """Readable words from a control's name/id that say more than its generic label, '' when none do."""
+    try:
+        raw = el.evaluate("e => (e.getAttribute('name') || '') + ' ' + (e.id || '')") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    words: list[str] = []
+    for w in re.findall(r"[A-Za-z]{3,}", re.sub(r"([a-z])([A-Z])", r"\1 \2", raw)):
+        lw = w.lower()
+        if lw not in _NAME_NOISE and lw not in words:
+            words.append(lw)
+    if not words or (len(words) == 1 and words[0] == clean(label).lower()):
+        return ""
+    return " ".join(words[:4])
+
+
+# A currency code or symbol, or a per-period suffix: decoration drawn inside a field group.
+_UNIT_LABEL_RE = re.compile(r"^\W*(?:(?-i:[A-Z]{3})|[$€£¥₹৳₨]|/\s*(?:month|year|hour|day|annum)|per\s+(?:month|year|hour|annum)"
+                            r"|%|days?|months?|years?)\W*$", re.I)
+
+_LABEL_ABOVE_UNIT_JS = """e => {
+    const clean = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const code = t => /^\\W*[A-Z]{3}\\W*$/.test(t);
+    const unit = t => code(t) || /^\\W*(?:[$€£¥₹৳₨]|\\/\\s*(?:month|year|hour|day|annum)|per\\s+(?:month|year|hour|annum)|%|days?|months?|years?)\\W*$/i.test(t);
+    let p = e.parentElement;
+    for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
+        if (p.querySelectorAll('input:not([type=hidden]), textarea, select').length > 1) break;
+        const kids = [...p.children];
+        const mine = kids.findIndex(k => k === e || k.contains(e));
+        for (let j = mine - 1; j >= 0; j--) {
+            const t = clean(kids[j].innerText);
+            if (t && t.length <= 200 && /[\\p{L}]/u.test(t) && !unit(t)) return t;
+        }
+    }
+    return '';
+}"""
 
 
 _LABEL_JS = """e => {
@@ -2084,6 +2503,43 @@ def same_option(a: str, b: str) -> bool:
     """
     from jobbot.answers import normalize_question
     return normalize_question(a) == normalize_question(b) and bool(normalize_question(a))
+
+
+def is_materialize_select(el: Any) -> bool:
+    """A native <select> Materialize CSS hides behind its own read-only "select-dropdown" text box."""
+    try:
+        return bool(el.evaluate("e => e.tagName === 'SELECT' && !!e.closest('.select-wrapper')"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_materialize_face(el: Any) -> bool:
+    """Materialize's read-only text box that only displays its hidden <select>'s choice."""
+    try:
+        return bool(el.evaluate("e => e.tagName === 'INPUT' && e.classList.contains('select-dropdown')"
+                                " && !!e.closest('.select-wrapper')"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_hidden_select(el: Any, label: str) -> bool:
+    """Choose `label` in a hidden native <select> the page draws its own way (Materialize: Coveo's French form,
+    application 378), firing the events its script listens for and updating the box it displays."""
+    try:
+        return bool(el.evaluate("""(e, want) => {
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const o = [...e.options].find(x => norm(x.textContent) === norm(want)) ||
+                      [...e.options].find(x => norm(x.textContent).startsWith(norm(want)));
+            if (!o) return false;
+            e.value = o.value; o.selected = true;
+            e.dispatchEvent(new Event('input', {bubbles: true}));
+            e.dispatchEvent(new Event('change', {bubbles: true}));
+            const face = e.closest('.select-wrapper') && e.closest('.select-wrapper').querySelector('input.select-dropdown');
+            if (face) face.value = o.textContent.trim();
+            return e.value === o.value; }""", label))
+    except Exception as e:  # noqa: BLE001
+        log.debug("set_hidden_select(%r): %s", label, e)
+        return False
 
 
 def choose_select(el: Any, answer: str, options: list[str], *, force: bool = False) -> bool:
@@ -2289,6 +2745,16 @@ def reassert_choice(container: Any) -> bool:
 
 
 def check_choice(container: Any, answer: str) -> bool:
+    """See _check_one; a multi-select answer ("a | b | c", resolver.MULTI_SEP) ticks each of its parts."""
+    from jobbot.apply.resolver import MULTI_SEP
+    parts = [p for p in (answer or "").split(MULTI_SEP) if p.strip()] if MULTI_SEP in (answer or "") else [answer]
+    if len(parts) == 1:
+        return _check_one(container, parts[0])
+    results = [_check_one(container, p) for p in parts]
+    return any(results)
+
+
+def _check_one(container: Any, answer: str) -> bool:
     """Tick the radio/checkbox inside `container` whose label equals `answer` (case-insensitive).
 
     Returns what `tick` returned, not merely whether a matching control was found. Reporting success on a
@@ -2425,6 +2891,20 @@ def file_listed(page: Any, path: Any) -> bool:
         return False
 
 
+def _open_combobox(combo: Any) -> None:
+    """Click a combobox's input to open its list. When the widget draws its chosen value (or its prompt) in a
+    layer over the input, Playwright waits on that layer for ever; a forced click lands on the layer, which
+    is what a person clicks and what opens the list. Sea's career site (Coral select) covers every input
+    this way: each open timed out, its 160 countries read as no options at all, and a 'Current Location'
+    already set to "United Arab Emirates" in the window was asked about again with an empty text box
+    (application 300)."""
+    try:
+        combo.click(timeout=SHORT)
+    except Exception as e:  # noqa: BLE001
+        log.debug("combobox click fell back to a forced click: %s", str(e)[:80])
+        combo.click(timeout=SHORT, force=True)
+
+
 def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
     """Open a react-select / aria combobox and read its option texts, then close it.
 
@@ -2438,10 +2918,20 @@ def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
         return widget_options(page, combo)
     opts: list[str] = []
     try:
-        combo.click(timeout=SHORT)
+        _open_combobox(combo)
         page.wait_for_timeout(400)
         listbox = page.locator("[role=listbox]:visible, [role=option]:visible")
         items = page.locator("[role=option]:visible")
+        if not items.count():
+            # Some lists draw their rows only on a key: Oracle's disability "Category" showed nothing on a
+            # click, so its options were never known and the answer could not be matched (application 314).
+            try:
+                combo.focus(timeout=SHORT)
+                page.keyboard.press("ArrowDown")
+                page.wait_for_timeout(700)
+            except Exception:  # noqa: BLE001
+                pass
+            items = page.locator("[role=option]:visible")
         for i in range(min(items.count(), limit)):
             t = option_text(items.nth(i))
             if t:
@@ -2452,6 +2942,52 @@ def combobox_options(page: Any, combo: Any, limit: int = 60) -> list[str]:
     except Exception:
         pass
     return opts
+
+
+_SCROLL_OPTIONS_JS = """async limit => {
+    const clean = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const shown = () => Array.from(document.querySelectorAll('[role=option]'))
+        .filter(o => o.getClientRects().length && getComputedStyle(o).visibility !== 'hidden');
+    const first = shown()[0];
+    let box = first && first.parentElement;
+    while (box && box !== document.body && !(box.scrollHeight > box.clientHeight + 4
+           && /auto|scroll/.test(getComputedStyle(box).overflowY))) box = box.parentElement;
+    const out = [];
+    const take = () => { for (const o of shown()) { const t = clean(o.innerText || o.textContent);
+                                                    if (t && !out.includes(t)) out.push(t); } };
+    take();
+    if (!box || box === document.body) return out;
+    for (let i = 0; i < 80 && out.length < limit; i++) {
+        const before = out.length, top = box.scrollTop;
+        box.scrollTop = top + Math.max(box.clientHeight - 40, 40);
+        await new Promise(r => setTimeout(r, 120));
+        take();
+        if (box.scrollTop === top && out.length === before) break;
+    }
+    box.scrollTop = 0;
+    return out.slice(0, limit);
+}"""
+
+
+def combobox_all_options(page: Any, combo: Any, limit: int = 300) -> list[str]:
+    """Every option of a combobox, for a question to the user — not for matching an answer.
+
+    A virtualised list draws only the rows in view: Sea's 160 countries read as the first 30, without the
+    "United Arab Emirates" the user needed to pick (application 300). The list is scrolled to the end and
+    every row seen on the way is kept.
+    """
+    if is_widget(combo):
+        return widget_options(page, combo)
+    try:
+        _open_combobox(combo)
+        page.wait_for_timeout(400)
+        opts = [clean(t) for t in (page.evaluate(_SCROLL_OPTIONS_JS, limit) or []) if clean(t)]
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(150)
+        return opts or combobox_options(page, combo, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        log.debug("combobox_all_options: %s", e)
+        return combobox_options(page, combo, limit=limit)
 
 
 def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str, ...] | list[str] = (),
@@ -2476,7 +3012,7 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
     if is_widget(combo):
         return choose_widget(page, combo, answer, alternatives, allow_other=allow_other, seen=seen)
     try:
-        combo.click(timeout=SHORT)
+        _open_combobox(combo)
         page.wait_for_timeout(200)
         try:
             combo.fill("", timeout=SHORT)
@@ -2484,6 +3020,7 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
             pass
         page.keyboard.type(answer, delay=20)
         page.wait_for_timeout(600)
+        wait_list_loaded(page)
         items = page.locator("[role=option]:visible")
         texts = [option_text(items.nth(i)) for i in range(min(items.count(), 60))]
         _note_seen(seen, texts)
@@ -2493,15 +3030,23 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
             pick = 0
         if pick is None:
             pick = next((i for i, t in enumerate(texts) if want and t.lower().startswith(want)), None)
+        chosen = texts[pick] if pick is not None else answer
         if pick is not None:
             items.nth(pick).click(timeout=SHORT)
         else:
             page.keyboard.press("Enter")
         page.wait_for_timeout(300)
-        if combobox_value(combo):
+        # A chip counts too, and has to be checked before the retry below: on a multi-select that second
+        # click toggles the choice straight back off (application 314).
+        held = combobox_value(combo)
+        if pick is None and held and clean(held).lower() == clean(answer).lower():
+            # Only our own typing, still sitting in the search box: nothing was picked. Oracle's lists kept
+            # "Asian or Asian British - Bangladeshi" as typed text and the field stayed empty (application 314).
+            held = ""
+        if held or _chip_shows(combo, chosen):
             return True
         # Some widgets swallow the typed text and only take a click on the opened list
-        combo.click(timeout=SHORT)
+        _open_combobox(combo)
         page.wait_for_timeout(300)
         items = page.locator("[role=option]:visible")
         for i in range(min(items.count(), 60)):
@@ -2513,7 +3058,8 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
                 break
         else:
             page.keyboard.press("Escape")
-        if combobox_value(combo):
+        held = combobox_value(combo)
+        if held and not (clean(held).lower() == clean(answer).lower() and not _option_clicked(seen, answer)):
             return True
         if _combobox_search(page, combo, answer, alternatives, allow_other, seen):
             return True
@@ -2524,16 +3070,22 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
         return False
 
 
+def _option_clicked(seen: list[str], answer: str) -> bool:
+    """Whether the answer was ever on the list as an option (so a box showing it may really hold it)."""
+    want = clean(answer).lower()
+    return any(clean(t).lower() == want for t in seen)
+
+
 def _note_seen(seen: list[str], texts: list[str]) -> None:
     for t in texts:
         t = clean(t)
-        if t and t not in seen and not is_prompt_value(t) and len(seen) < 200:
+        if t and t not in seen and not is_prompt_value(t) and not _LIST_LOADING_RE.match(t) and len(seen) < 200:
             seen.append(t)
 
 
 def _combobox_typed_options(page: Any, combo: Any, query: str) -> list[str]:
     """Clear the box, type `query`, and read what the list offers for it (fetched lists refresh per key)."""
-    combo.click(timeout=SHORT)
+    _open_combobox(combo)
     page.wait_for_timeout(150)
     try:
         combo.fill("", timeout=SHORT)
@@ -2541,6 +3093,7 @@ def _combobox_typed_options(page: Any, combo: Any, query: str) -> list[str]:
         pass
     page.keyboard.type(query, delay=20)
     page.wait_for_timeout(900)
+    wait_list_loaded(page)
     items = page.locator("[role=option]:visible")
     return [option_text(items.nth(i)) for i in range(min(items.count(), 60))]
 
@@ -2551,8 +3104,29 @@ def _click_combobox_option(page: Any, combo: Any, pick: str) -> bool:
         if option_text(items.nth(i)) == pick:
             items.nth(i).click(timeout=SHORT)
             page.wait_for_timeout(300)
-            return bool(combobox_value(combo))
+            return bool(combobox_value(combo)) or _chip_shows(combo, pick)
     return False
+
+
+def _chip_shows(combo: Any, pick: str) -> bool:
+    """A multi-select keeps its input empty and draws the choice as a chip beside it: Nationwide's
+    "Preferred Location" took "Head Office - Swindon" and was reported as not chosen (application 314)."""
+    try:
+        return bool(combo.evaluate("""(e, pick) => {
+            let p = e.parentElement;
+            for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+                const chips = p.querySelectorAll('[class*=chip i], [class*=tag i], [class*=multi-value i], [class*=selected i], [class*=token i], li');
+                for (const c of chips) {
+                    // An option in the open list is not a choice: Oracle's rows are <li>s holding the very
+                    // text, and counting them reported three empty dropdowns as chosen (application 314).
+                    if (c.contains(e) || c.getAttribute('role') === 'option' || c.closest('[role=listbox], [role=option]')) continue;
+                    const r = c.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue;
+                    if ((c.innerText || '').trim().startsWith(pick)) return true;
+                }
+            }
+            return false; }""", pick))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _combobox_search(page: Any, combo: Any, answer: str, alternatives: tuple[str, ...] | list[str],
@@ -2708,6 +3282,29 @@ def widget_filter(page: Any, root: Any) -> Any | None:
     return None
 
 
+_LIST_LOADING_RE = re.compile(r"^\W*(?:searching|loading(?: more)?(?: results)?|please wait)\b", re.I)
+
+
+def wait_list_loaded(page: Any, limit_ms: int = 8000) -> None:
+    """Wait while an open list is still fetching for what was typed. A remote-search list (select2 with ajax,
+    Lenovo's 160-currency "Salary Expectation - Currency") keeps the previous rows on screen under a
+    "Searching…" row; read at a fixed 700 ms it offered Afghani…Lek and never the "US Dollar" just typed
+    (application 336)."""
+    waited = 0
+    while waited < limit_ms:
+        try:
+            busy = page.evaluate("""() => !![...document.querySelectorAll(
+                    '[role=option], .select2-results__option, li[class*=loading i], [class*=loading-results i]')]
+                .find(o => o.offsetParent !== null && /^\\W*(searching|loading|please wait)/i.test((o.innerText || '').trim()))""")
+        except Exception:  # noqa: BLE001
+            return
+        if not busy:
+            return
+        page.wait_for_timeout(300)
+        waited += 300
+    log.info("list still loading after %.1fs; reading it anyway", limit_ms / 1000)
+
+
 def widget_type(page: Any, root: Any, text: str) -> bool:
     """Put `text` in the open widget's search box; failing one, type at the widget, which some forward."""
     box = widget_filter(page, root)
@@ -2718,10 +3315,12 @@ def widget_type(page: Any, root: Any, text: str) -> bool:
             if text:
                 box.press_sequentially(text, delay=20, timeout=MEDIUM)
             page.wait_for_timeout(700)      # a remote list refetches on every keystroke
+            wait_list_loaded(page)
             return True
         if text:
             page.keyboard.type(text, delay=20)
             page.wait_for_timeout(500)
+            wait_list_loaded(page)
             return True
     except Exception as e:  # noqa: BLE001
         log.debug("widget_type(%r): %s", text[:30], e)
@@ -3105,12 +3704,106 @@ def tick_consent_clauses(ctx: ApplyContext) -> int:
     return ticked
 
 
+# ---------- consent boxes the walk could not see ----------
+# UKG Pro Recruiting (UltiPro, application 318, MNP) asks for name, phone and "By checking this box, I have
+# read and agree to the Consent and Privacy Policy" on its "Almost there!" page after signup, with Create
+# account disabled until the box is ticked. The walker filled the three text boxes and never touched the
+# tick: a box drawn by a styled sibling over a zero-sized input with no <label> (or a bare role=checkbox
+# <div>) is invisible to every scoped walk, and tick_consent_clauses above skips a line that has a control
+# of its own. So the run stopped on a page whose only gap was one consent tick.
+#
+# This finds such a box by the shape every consent has -- an unticked checkbox, in any drawing, whose own
+# words agree to terms / privacy / a policy -- anywhere on the page, and ticks it. A hidden input with nothing
+# visible drawing it is a honeypot and is left alone.
+_CONSENT_BOX_JS = "() => {" + DEEP_JS + WIDGET_JS + r"""
+    const AGREE = /\b(?:agree|accept|acknowledge|consent|have\s+read|certify|confirm)\b/i;
+    const SUBJECT = /\b(?:terms|privacy|policy|policies|conditions|consent|notice|agreement|statement)\b/i;
+    const small = e => { const r = e.getBoundingClientRect(); return r.width >= 8 && r.width <= 48 && r.height >= 8 && r.height <= 48; };
+    for (const old of document.querySelectorAll('[data-jobbot-consentbox]')) old.removeAttribute('data-jobbot-consentbox');
+    const out = [];
+    let n = 0;
+    for (const el of deepAll('input[type=checkbox], [role=checkbox], [role=switch]')) {
+        const native = el.tagName === 'INPUT';
+        if (native ? el.checked : (el.getAttribute('aria-checked') || '') === 'true') continue;
+        if (el.disabled || (el.getAttribute('aria-disabled') || '') === 'true') continue;
+        if (!native && el.querySelector('input[type=checkbox]')) continue;    // its input is the one to tick
+        // What a person sees and clicks: the control itself, its <label>, an ARIA wrapper, or a small styled
+        // box beside it or round it.
+        let face = wVis(el) ? el : null;
+        if (!face && native) {
+            if ((el.getAttribute('aria-hidden') || '') === 'true' && !(el.labels || []).length) continue;
+            face = [...(el.labels || [])].find(wVis)
+                || (el.parentElement && [...el.parentElement.children].find(k => k !== el && wVis(k) && small(k)))
+                || (() => { for (let a = el.parentElement, i = 0; a && i < 3; a = a.parentElement, i++)
+                                if (wVis(a) && (small(a) || a.matches('label, [role=checkbox], [role=switch]'))) return a;
+                            return null; })();
+        }
+        if (!face) continue;
+        // Its words: its own label or aria naming, else the nearest wrapper that holds a sentence.
+        let words = [...(el.labels || [])].map(wText).join(' ') || el.getAttribute('aria-label') || '';
+        const by = el.getAttribute('aria-labelledby');
+        if (!words && by) words = by.split(/\s+/).map(id => document.getElementById(id)).filter(Boolean).map(wText).join(' ');
+        if (!words) for (let a = el.parentElement, i = 0; a && i < 4; a = a.parentElement, i++) {
+            const t = wText(a);
+            if (t.length >= 10) { words = t.length <= 400 ? t : ''; break; }
+        }
+        if (!AGREE.test(words) || !SUBJECT.test(words)) continue;
+        el.setAttribute('data-jobbot-consentbox', String(n));
+        out.push({id: String(n), text: words.slice(0, 160), native, drawn: face !== el});
+        n++;
+    }
+    return out;
+}"""
+
+
+def tick_consent_boxes(page: Any) -> int:
+    """Tick every unticked consent checkbox on the page, however it is drawn. Returns how many were ticked.
+
+    Consent is given, not asked about (see the consent policy): a form that will not go on without it offers
+    no choice the user has any reason to decline here."""
+    try:
+        found = page.evaluate(_CONSENT_BOX_JS) or []
+    except Exception as e:  # noqa: BLE001
+        log.debug("consent boxes: %s", e)
+        return 0
+    ticked = 0
+    for f in found:
+        el = page.locator(f"[data-jobbot-consentbox='{f['id']}']").first
+        try:
+            if f["native"]:
+                ok = tick(el)
+            else:
+                el.scroll_into_view_if_needed(timeout=SHORT)
+                el.click(timeout=MEDIUM)
+                page.wait_for_timeout(300)
+                if (el.get_attribute("aria-checked") or "") != "true":
+                    el.focus(timeout=SHORT)
+                    page.keyboard.press("Space")
+                    page.wait_for_timeout(300)
+                ok = (el.get_attribute("aria-checked") or "") == "true"
+        except Exception as e:  # noqa: BLE001
+            log.info("consent: could not tick %r (%s)", f["text"][:60], str(e)[:80])
+            continue
+        if ok:
+            ticked += 1
+            log.info("consent: ticked %r%s", f["text"][:80], " (drawn by a styled box)" if f["drawn"] else "")
+        else:
+            log.info("consent: %r would not tick", f["text"][:60])
+    return ticked
+
+
 # The words a list control shows while nothing is chosen. Rippling's eligibility question drew "Select" in a
 # <p>, which read back as the answer, so the question was reported as answered and never asked (application
 # 175); its Apply button stayed disabled over it.
 PROMPT_VALUE_RE = re.compile(
     r"^\s*(?:-+\s*)?(?:please\s+)?(?:select|choose|pick|search)"
-    r"(?:\s+(?:one|an?\s+option|an?\s+answer|an?\s+item|here))?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$", re.I)
+    r"(?:\s+(?:one|an?\s+option|an?\s+answer|an?\s+item|here))?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$"
+    # The same prompt in the languages boards are written in: Coveo's French form showed "Veuillez
+    # sélectionner" in three required lists, read as answers, so they went out empty (application 378).
+    r"|^\s*(?:-+\s*)?(?:veuillez\s+)?(?:s[ée]lectionner|choisir|choisissez|s[ée]lectionnez)(?:\s+une?\s+\w+)?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$"
+    r"|^\s*(?:-+\s*)?(?:bitte\s+)?(?:w[äa]hlen|ausw[äa]hlen)(?:\s+sie)?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$"
+    r"|^\s*(?:-+\s*)?(?:por\s+favor\s+)?(?:seleccione|selecciona|seleccionar|elija|selecione)(?:\s+una?\s+\w+)?\s*(?:\.{3}|…)?\s*(?:-+)?\s*$"
+    r"|^\s*(?:-+\s*)?(?:seleziona|scegli|selecteer|kies)\s*(?:\.{3}|…)?\s*(?:-+)?\s*$", re.I)
 
 
 def is_prompt_value(text: str) -> bool:
@@ -3129,6 +3822,19 @@ def combobox_value(combo: Any) -> str:
     except Exception:  # noqa: BLE001
         own = []
     return "" if clean(shown) in [o for o in own if o] else shown
+
+
+# Coral (Sea's career site) shows the choice as the bare text of [data-coral-select-selected-content], drawn over
+# the search input; the input itself holds only what is being typed, so "Dubai" typed into a list of countries
+# read back as the chosen value though nothing had been picked. While the input has focus the node is taken
+# away altogether, and then nothing on the control is a committed value. The prompt sits in the same node
+# inside a child element, so only the node's own text is the value. null when the control is not a Coral select.
+_CORAL_VALUE_JS = """
+    if (!e.closest('[data-coral-text-field-wrapper]') || e.getAttribute('aria-haspopup') !== 'listbox') return null;
+    const coral = comboScope(e).querySelector('[data-coral-select-selected-content]');
+    if (!coral) return '';
+    return Array.from(coral.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('');
+"""
 
 
 def _combobox_shown(combo: Any) -> str:
@@ -3150,6 +3856,9 @@ def _combobox_shown(combo: Any) -> str:
     an application whose field was correctly filled.
     """
     try:
+        coral = combo.evaluate("e => {" + _COMBO_JS + _CORAL_VALUE_JS + "}")
+        if coral is not None:
+            return clean(coral)
         v = current_value(combo)
         if v:
             return v
@@ -3551,6 +4260,34 @@ def _click_dial_option(page: Any, combo: Any, code: str) -> bool:
     return False
 
 
+def _click_dial_by_name(page: Any, combo: Any, country: str, digits: str) -> str:
+    """Open the picker, type the country's name, and click the row naming it whose code begins our number.
+    The code taken, or ''."""
+    name = clean(country).lower()
+    if not name:
+        return ""
+    for typed in (country, country[:4]):
+        try:
+            combo.click(timeout=SHORT)
+            page.wait_for_timeout(400)
+            _clear_combo(page, combo)
+            page.keyboard.type(typed, delay=60)
+            page.wait_for_timeout(800)
+            rows = page.locator(DIAL_ROW_SEL)
+            for i in range(min(rows.count(), 400)):
+                text = option_text(rows.nth(i))
+                code = dial_in(text)
+                if code and digits.startswith(code) and name in text.lower():
+                    rows.nth(i).scroll_into_view_if_needed(timeout=SHORT)
+                    rows.nth(i).click(timeout=SHORT)
+                    page.wait_for_timeout(400)
+                    return code
+            page.keyboard.press("Escape")
+        except Exception as e:  # noqa: BLE001
+            log.debug("_click_dial_by_name(%s) failed: %s", typed, e)
+    return ""
+
+
 def set_dial_code(page: Any, phone: str, country: str = "") -> str:
     """Point the form's own country-code control at our number's country; the code it then holds, '' if not.
 
@@ -3608,6 +4345,11 @@ def set_dial_code(page: Any, phone: str, country: str = "") -> str:
                     # reach the rest, and a list that filters by code will answer it.
                     code = next((c for c in (digits[:4], digits[:3], digits[:2], digits[:1])
                                  if c and _click_dial_option(page, el, c)), "")
+                if not code and country:
+                    # A listbox that answers typing by jumping to the country NAME (Workday's "Country Phone
+                    # Code" button: "+880" and "880" find nothing, "Bangladesh" scrolls to its row). It stayed
+                    # on "United States of America (+1)" and the form refused the number (application 341).
+                    code = _click_dial_by_name(page, el, country, digits)
                 if not code:
                     continue
             shown = dial_code_on_page(page)
@@ -3688,8 +4430,9 @@ def dial_code_for_phone(page: Any, phone: str, country: str = "") -> str:
     if not held:
         # Nothing shows a code yet. That is the ordinary single-box form -- and also a picker still on its
         # "Select" prompt (Shopee, application 274), which set_dial_code tells apart from an ordinary list
-        # by its options and by where it stands, and drives; anything else it leaves alone.
-        return set_dial_code(page, phone, country) or ""
+        # by its options and by where it stands, and drives; anything else it leaves alone. An empty picker
+        # that names itself a country code (Oracle's, application 314) is driven by country after that.
+        return set_dial_code(page, phone, country) or select_dial_country(page, country, phone) or ""
     if re.sub(r"\D", "", phone or "").startswith(held):
         return held     # already resting on our country — the Bangladeshi tenant of a Bangladeshi employer
     return set_dial_code(page, phone, country) or select_dial_country(page, country, phone) or held
@@ -3720,6 +4463,13 @@ def select_dial_country(page: Any, country: str, phone: str = "") -> str:
                        if is_visible_now(c) and dial_in(current_value(c) or clean(c.inner_text() or ""))),
                       None)
         if picker is None:
+            # An empty picker is still the picker: after one wrong pick Oracle's showed no code at all, and
+            # every later pass skipped it while the form kept saying "Enter a valid number" (application 314).
+            named = page.locator("[id*='country-code' i], [id*='countrycode' i], [aria-controls*='country-code' i], "
+                                 "[role=combobox][aria-label*='country code' i], [role=combobox][aria-label*='dial' i]")
+            picker = next((c for c in (named.nth(i) for i in range(min(named.count(), 10)))
+                           if is_visible_now(c) and not current_value(c)), None)
+        if picker is None:
             return ""
         picker.click(timeout=SHORT)
         page.wait_for_timeout(500)
@@ -3741,8 +4491,32 @@ def select_dial_country(page: Any, country: str, phone: str = "") -> str:
                 page.wait_for_timeout(400)
                 dial = dial_code_on_page(page)
                 log.info("dial-code picker switched to %r -> +%s", country, dial or "?")
-                return dial
+                if dial:
+                    return dial
+                break
         page.keyboard.press("Escape")
+        # Searched by the code instead: Oracle's rows read "+880 (Bangladesh)", and the pick by name left
+        # its box showing no code at all, so Nationwide refused the number (application 314).
+        for k in (3, 2, 1):
+            code = want[:k]
+            if not code:
+                continue
+            picker.click(timeout=SHORT)
+            page.wait_for_timeout(400)
+            _clear_combo(page, picker)
+            page.keyboard.type("+" + code, delay=30)
+            page.wait_for_timeout(700)
+            rows = page.locator(DIAL_ROW_SEL)
+            for i in range(min(rows.count(), DIAL_OPTIONS)):
+                text = option_text(rows.nth(i)).replace(" ", "")
+                if text.startswith("+" + code) and not text[len(code) + 1:len(code) + 2].isdigit() and pattern.search(option_text(rows.nth(i))):
+                    rows.nth(i).click(timeout=SHORT)
+                    page.wait_for_timeout(400)
+                    dial = dial_code_on_page(page)
+                    log.info("dial-code picker: typed +%s, took %r -> +%s", code, option_text(rows.nth(i)) if rows.count() > i else "", dial or "?")
+                    if dial:
+                        return dial
+            page.keyboard.press("Escape")
     except Exception as e:  # noqa: BLE001
         log.debug("select_dial_country failed: %s", e)
     return ""
@@ -4253,7 +5027,9 @@ def _choice_miss(el: Any, label: str, ans: str, options: list[str] | None, kind:
     if not is_required(required_el if required_el is not None else el):
         log.info("leaving the optional %r blank: the form's list has nothing matching %r", label, ans)
         return
-    offered = [o for o in (options or []) if clean(o) and not is_prompt_value(o)][:25]
+    # The card draws these as a <select>, so a country list goes whole: cut at 25, Sea's "United Arab
+    # Emirates" was never on offer and the only way to answer was the browser window (application 300).
+    offered = [o for o in (options or []) if clean(o) and not is_prompt_value(o)][:300]
     raise NeedsHuman(
         f"'{label}' has no option jobbot could match to {ans!r}"
         + (f" (it offers: {', '.join(offered[:8])})" if offered else "")
@@ -4265,9 +5041,24 @@ def _choice_miss(el: Any, label: str, ans: str, options: list[str] | None, kind:
 _NOT_APPLICABLE = "N/A"
 
 
+class _AlwaysRequired:
+    """Stands in for a control the page has said is mandatory; is_required() reads it as required."""
+    def evaluate(self, *_a, **_k):
+        return True
+
+
+def _refused_as_mandatory(ctx: ApplyContext, label: str) -> bool:
+    """The page's last bounce named this field as mandatory (`The field "Zip/Postal Code" is mandatory.`)."""
+    said = (ctx.extra or {}).get("refused_text") or ""
+    key = re.sub(r"[\s.*:]+$", "", clean(label or "")).lower()[:60]
+    return bool(said and key and len(key) >= 3 and key in said)
+
+
 def _ask(ctx: ApplyContext, el: Any, label: str, options: list[str] | None, kind: str,
          required_el: Any = None):
     """The resolver's answer, or None when there is no answer and the form does not need one."""
+    if _refused_as_mandatory(ctx, label):
+        required_el = _AlwaysRequired()
     try:
         ans = ctx.answer(label, options, kind)
         if ans == "" and kind in ("text", "textarea") and is_required(required_el if required_el is not None else el):
@@ -4367,6 +5158,33 @@ def is_required(el: Any) -> bool:
 _REQUIRED_MARK_RE = re.compile(r"\*|\brequired\b|\bobligatoire\b|\bpflichtfeld\b|\bobligatorio\b", re.I)
 
 
+# Workday refuses a free-text box that holds any of these, with "Contains illegal characters < > [ ] " { } \"
+# and no hint of which box — OCBC's Work Experience step bounced on a Role Description carrying nothing worse
+# than the straight quotes around a quoted sentence (application 295). The replacements keep the prose
+# readable rather than deleting runs of it: a curly quote reads as a quote, a paren as a bracket.
+_ILLEGAL_WORKDAY = {'"': "'", "<": "(", ">": ")", "[": "(", "]": ")", "{": "(", "}": ")", "\\": "/"}
+_WORKDAY_HOST_RE = re.compile(r"myworkdayjobs\.com|workday\.com", re.I)
+
+
+def scrub_illegal(page: Any, text: str) -> str:
+    """Drop the characters this board will not accept in free text.
+
+    Scoped to Workday by host rather than applied everywhere: the rule is Workday's own, and rewriting
+    punctuation on a board that never objected to it would change answers for no reason.
+    """
+    if not text:
+        return text
+    try:
+        if not _WORKDAY_HOST_RE.search(page.url or ""):
+            return text
+    except Exception:  # noqa: BLE001 - a frame with no url of its own
+        return text
+    out = "".join(_ILLEGAL_WORKDAY.get(ch, ch) for ch in str(text))
+    if out != text:
+        log.info("scrubbed characters Workday rejects from a %d-character answer", len(str(text)))
+    return out
+
+
 def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: list[str] | None = None,
                    container: Any | None = None) -> None:
     """Ask the resolver for `label` and write the answer into the control according to `kind`."""
@@ -4432,13 +5250,20 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
                 log.info("%r holds %r; the box's own example wants %r", label[:40], existing[:20], shaped)
                 fill_if_empty(el, shaped, clear=True)
                 return
+        if existing and (cleaned := scrub_illegal(page, existing)) != existing:
+            # Already in the box from an earlier pass, or written there by the board's own CV parse. The
+            # branches above correct a value the form will not accept; this is one more of them, and it has
+            # to run before the `seen` below or the step keeps bouncing on prose nothing will rewrite.
+            log.info("%r holds characters Workday rejects; rewriting it", label[:40])
+            fill_if_empty(el, cleaned, clear=True)
+            return
         if existing:
             ctx.seen(existing, label, kind=kind, default=text_is_default(el) or _unchanged_identity(ctx, label, existing))
             return
         if kind == "textarea" and COVER_LABEL_RE.search(label or ""):
             letter = cover_letter_text(ctx)
             if letter:
-                fill_if_empty(el, letter)
+                fill_if_empty(el, scrub_illegal(page, letter))
                 return
         if kind == "text" and (is_number_box(el) or asks_for_figure(ctx, label)):
             # The control decides the shape of the answer: "Negotiable" is a fine answer to a salary box and
@@ -4449,8 +5274,21 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         ans = _ask(ctx, el, label, None, kind)
         if ans is None:
             return
+        if kind == "text" and (fmt := typed_date_format(el)):
+            # A text box that is really a date picker (react-datepicker, a type=date input, a "MM/DD/YYYY"
+            # placeholder) throws away anything it cannot parse on blur: "Immediately" typed into OpenAI's
+            # Ashby "When can you start a new role?" vanished and the form bounced three times on "Missing
+            # entry for required field" (application 329). The answer becomes a date in the box's own format.
+            if fill_typed_date(el, ans, fmt):
+                log.info("date box %r -> %r (from %r)", label[:60], current_value(el), str(ans)[:40])
+                return
+            if is_required(el):
+                raise NeedsHuman(f"'{label}' is a date box jobbot could not set from {ans!r}. Type the date in "
+                                 "the browser window, then click Continue.", question=label, kind="text")
+            return
         if kind == "text" and _GPA_LABEL_RE.search(label):
             ans = shape_gpa(ctx, el, ans)
+        ans = scrub_illegal(page, ans)
         if has_suggestions(el):
             # A box that only accepts what its own list offers. Typing the true answer at it is what fails:
             # Greenhouse refused "Computer Science & Engineering" with "Please select a school, degree, and
@@ -4458,6 +5296,14 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             fill_from_suggestions(page, el, ans, _answer_alternatives(ctx, label))
             return
         if fill_if_empty(el, ans) or kind == "number":
+            if (kind != "number" and ans and not clean(current_value(el))
+                    and not NUMBER_VALUE_RE.match(str(ans).strip())):
+                # Typed, and gone: a box with its own script that keeps digits only (Taraki's salary boxes,
+                # application 308). "Negotiable" vanished from both and the step's Next stayed disabled.
+                log.info("%r dropped %r; asking for a number", label, str(ans)[:40])
+                num = _ask(ctx, el, label, None, "number")
+                if num is not None:
+                    fill_if_empty(el, num, clear=True)
             return
         # The control refused the answer, and the only control that does is a number box. Its `type` read
         # back as text a moment ago — one dropped attribute read on a slow page is all it takes — so the
@@ -4469,6 +5315,19 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             num = _ask(ctx, el, label, None, "number")
             if num is not None:
                 fill_if_empty(el, num)
+    elif kind == "select" and is_materialize_select(el):
+        opts = [o for o in (options or select_options(el)) if not is_prompt_value(o)]
+        held = clean(el.evaluate("e => e.selectedIndex >= 0 && e.value ? e.options[e.selectedIndex].textContent : ''") or "")
+        if held and not is_prompt_value(held):
+            ctx.seen(held, label, kind=kind, options=opts)
+            return
+        ans = _ask(ctx, el, label, opts, kind)
+        if ans is None:
+            return
+        if not set_hidden_select(el, ans):
+            _choice_miss(el, label, ans, opts, kind)
+        else:
+            log.info("hidden select %r -> %r", label[:60], ans)
     elif kind == "select":
         opts = options or select_options(el)
         existing = clean(el.evaluate("e => e.selectedIndex > 0 ? e.options[e.selectedIndex].textContent : ''"))
@@ -4509,6 +5368,10 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         seen: list[str] = list(opts or [])
         if not choose_combobox(page, el, ans, _answer_alternatives(ctx, label), allow_other=_other_ok(label),
                                seen=seen):
+            if not seen or (options is None and len(opts) >= 60):
+                # Typing the answer filtered the list to nothing, so `seen` is empty or a first page: the
+                # question would reach the card as a bare text box. The whole list, for the user to pick from.
+                seen = combobox_all_options(page, el) or seen
             _choice_miss(el, label, ans, seen, kind)
     elif kind in ("radio", "checkbox"):
         cont = container if container is not None else el
@@ -4757,7 +5620,11 @@ def fill_verified(el: Any, value: str) -> bool:
     """
     if value is None or value == "":
         return False
-    fill_if_empty(el, value)
+    typed = fill_if_empty(el, value)
+    if not typed and not clean(current_value(el)):
+        # Nothing went in and nothing was there. Saying True here told every caller the box was filled,
+        # which is how TalentMate's signup was sent three times with both email boxes empty (application 307).
+        return False
     tracked = react_value(el)
     if tracked is not None and clean(tracked) != clean(value) and not clean(tracked):
         try:
@@ -5227,6 +6094,64 @@ def _calendar_label(cal: Any) -> str:
         return ""
 
 
+_DATE_PLACEHOLDER_RE = re.compile(r"^\s*(?:mm|dd|yyyy|yy|m|d)(?:\s*[/.\-]\s*(?:mm|dd|yyyy|yy|m|d)){2}\s*$", re.I)
+
+
+def typed_date_format(el: Any) -> str | None:
+    """The strftime format a typed date box expects, or None when the box is not a date box.
+
+    Recognised by shape, not by board: an <input type=date>, an input inside react-datepicker's wrapper
+    (its default format is MM/dd/yyyy), or a placeholder spelling the format out ("DD/MM/YYYY")."""
+    try:
+        info = el.evaluate("""e => ({type: (e.type || '').toLowerCase(), ph: e.getAttribute('placeholder') || '',
+                                     rdp: !!e.closest('.react-datepicker-wrapper, .react-datepicker__input-container')})""")
+    except Exception:  # noqa: BLE001
+        return None
+    if info.get("type") == "date":
+        return "%Y-%m-%d"
+    ph = clean(info.get("ph") or "")
+    if ph and _DATE_PLACEHOLDER_RE.match(ph):
+        fmt = ph.lower()
+        for tok, rep in (("yyyy", "%Y"), ("yy", "%y"), ("mm", "%m"), ("dd", "%d")):
+            fmt = fmt.replace(tok, rep)
+        fmt = re.sub(r"(?<!%)\bm\b", "%m", fmt)
+        fmt = re.sub(r"(?<!%)\bd\b", "%d", fmt)
+        return fmt.replace(" ", "")
+    if info.get("rdp"):
+        return "%m/%d/%Y"
+    return None
+
+
+def fill_typed_date(el: Any, answer: str, fmt: str) -> bool:
+    """Type `answer` ("Immediately", "2 weeks", "1 Nov 2026") into a date box as a date in `fmt`, and commit
+    it the way a person would (Enter, then leave the box). True when the box keeps the value."""
+    from datetime import date
+    target = _target_date(str(answer or ""), date.today())
+    if target is None:
+        return False
+    value = target.strftime(fmt)
+    try:
+        if fmt == "%Y-%m-%d" and (el.get_attribute("type") or "").lower() == "date":
+            el.fill(value, timeout=SHORT)
+        else:
+            try:
+                el.click(timeout=SHORT)
+            except Exception:  # noqa: BLE001
+                el.focus(timeout=SHORT)
+            el.fill("", timeout=SHORT)
+            el.press_sequentially(value, delay=40, timeout=MEDIUM)
+            el.press("Enter", timeout=SHORT)
+            try:
+                el.press("Escape", timeout=SHORT)
+            except Exception:  # noqa: BLE001
+                pass
+            el.evaluate("e => e.blur()")
+    except Exception as e:  # noqa: BLE001
+        log.debug("fill_typed_date: %s", e)
+        return False
+    return bool(clean(current_value(el)))
+
+
 def _target_date(answer: str, today):
     """The earliest date an answer allows: "Immediately" is today, "2 weeks" is a fortnight on, a date is
     that date. Never in the past, which no availability calendar offers."""
@@ -5386,12 +6311,30 @@ def confirmation_showing(page: Any) -> bool:
     The cheap half of wait_for_confirmation, for callers that only need to know what is on screen.
     """
     try:
-        if confirm_url(page.url or ""):
-            return True
         body = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
-        return any(t in body for t in CONFIRM_TEXTS)
+        if not confirm_url(page.url or "") and not any(t in body for t in STRONG_CONFIRM_TEXTS):
+            return False
+        # A page still holding an application form is not its thank-you page, whatever words it carries
+        # somewhere: Coveo's job page (application 373) was "confirmed" with every field of its form on screen.
+        return _typeable_count_all_frames(page) < 3
     except Exception:  # noqa: BLE001
         return False
+
+
+def _typeable_count_all_frames(page: Any) -> int:
+    """_typeable_count over the page and every frame in it: Coveo draws its form in an iframe, and the top
+    page alone counted none of it (application 375)."""
+    total = max(_typeable_count(page), 0)
+    try:
+        frames = list(getattr(page, "frames", []) or [])
+    except Exception:  # noqa: BLE001
+        frames = []
+    main = getattr(page, "main_frame", None)
+    for fr in frames:
+        if fr is main:
+            continue
+        total += max(_typeable_count(fr), 0)
+    return total
 
 
 def _submit_key(url: str) -> str:

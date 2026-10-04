@@ -89,6 +89,9 @@ def kw_regex(words: frozenset[str] | tuple[str, ...]) -> re.Pattern:
 EEO_KEYWORDS: tuple[str, ...] = (
     "gender", "pronoun ", "pronouns ", "race", "ethnic", "veteran", "disabilit", "sexual orientation",
     "lgbt", "hispanic", "latino", "religion", "transgender", "military status", "date of birth",
+    "marital",      # "Marital Status" (Nationwide's Oracle form, application 314): self-identification, facts only
+    "household earner", "main earner", "socio economic", "socioeconomic",   # UK social-mobility block (314)
+    "community background",   # Northern Ireland's Protestant / Roman Catholic / Neither monitoring question (314)
 )
 
 # Personal details that must come from facts or the candidate — a model guessing a phone number or an
@@ -129,6 +132,11 @@ FACTS_ONLY_KEYWORDS: frozenset[str] = frozenset({
     # question about data architectures down the protected path. "military" is here as well as
     # "military status" in EEO_KEYWORDS, because a form may ask about either.
     "military", "age ",
+    # The same declarations on French / Spanish / Portuguese / Italian / German forms. Coveo asked "Êtes-vous
+    # légalement autorisé.e à travailler dans le pays où vous résidez?" and nothing here caught it, so a
+    # work-authorisation answer would have come from the model (application 378).
+    "autoris", "autoriz", "légalement", "legalmente", "permis de travail", "parrainage", "patrocinio",
+    "permiso de trabajo", "arbeitserlaubnis", "arbeitsgenehmigung", "staatsangehörigkeit", "nationalité",
     *EEO_KEYWORDS, *NEVER_GUESS, *EDUCATION_KEYWORDS,
 })
 
@@ -137,7 +145,7 @@ FACTS_ONLY_KEYWORDS: frozenset[str] = frozenset({
 # first, then what they have already said themselves. Still never the model.
 REUSABLE_PROTECTED_KEYWORDS: frozenset[str] = frozenset({
     "salary", "compensation", "pay expectation", "expected pay", "rate expectation", "remuneration",
-    "day rate",
+    "day rate", "salair", "salarial", "rémunération", "salario", "gehalt", "retribuzione",
 })
 
 # Kept as the union so is_protected() and every caller keep the meaning they had.

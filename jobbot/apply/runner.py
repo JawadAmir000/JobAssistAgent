@@ -181,6 +181,12 @@ def make_seen(resolver: Resolver, answered_here: set[str], fact_values: set[str]
                 return
         if resolver.knows(label):
             return
+        if _VALIDATION_LABEL_RE.search(label or ""):
+            # A field's error message read as its label ("Please enter a valid phone number for the selected
+            # country code", TalentMate, application 307): not a question, and caching it would answer the
+            # complaint with whatever the box held when the form refused it.
+            log.info("app %s: not learning %r: that is the form's error message, not a question", app_id, label[:80])
+            return
         log.info("app %s: learning %r from the form -> %r (typed)", app_id, label, str(value)[:60])
         resolver.learn(label, str(value), source="typed", kind=kind, options=list(options or []))
     return seen
@@ -364,7 +370,9 @@ def has_live_browser(app_id: int) -> bool:
 # how a Workable submit ended up parked on "Verify you are human" with the button stuck on "Submitting...".
 # The user's own Chrome, launched without the automation switch, is the same browser they would have applied
 # in themselves, and the challenge usually passes without ever being shown.
-_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+# Translate off: Chrome auto-translated Coveo's French form, and its dropdowns then held "<font dir=auto …>"
+# markup instead of their values (application 375); translated pages also change the words jobbot matches on.
+_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--disable-features=Translate,TranslateUI"]
 _AUTOMATION_DEFAULTS = ["--enable-automation"]
 
 
@@ -383,6 +391,12 @@ def _launch_browser(pw: Any, headless: bool):
         log.info("browser: Chrome unavailable (%s); using bundled Chromium", str(e)[:120])
     return pw.chromium.launch(headless=headless, args=_LAUNCH_ARGS,
                               ignore_default_args=_AUTOMATION_DEFAULTS)
+
+
+_VALIDATION_LABEL_RE = re.compile(
+    r"^\s*please\s+(?:enter|select|provide|choose|use)\s+(?:a\s+|an\s+)?valid\b"
+    r"|^\s*(?:this|the)\s+field\b.{0,40}\b(?:is\s+)?(?:required|mandatory|invalid)\b"
+    r"|^\s*(?:invalid|required)\b\W*$", re.I)
 
 
 def _screenshot_fn(app_id: int, page_ref: dict):
@@ -718,7 +732,8 @@ def _run_application(app_id: int) -> None:
         return
     job = dict(job_row)
 
-    cv_path = config.get_setting(config.SETTING_CV_PATH) or ""
+    cv_path = config.cv_for_job(job)
+    log.info("app %s: CV for %r -> %s", app_id, job.get("title"), cv_path)
     if not cv_path or not os.path.exists(cv_path):
         db.update_application(app_id, status="failed", reason="Upload a CV in Settings first", finished_at=_now())
         return

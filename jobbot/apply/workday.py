@@ -29,11 +29,12 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from jobbot import credentials, mail
 from jobbot.apply import common as c
 from jobbot.apply import navigator
-from jobbot.apply.base import Adapter, ApplyContext, ApplyError, NeedsHuman, register
+from jobbot.apply.base import Adapter, AlreadyApplied, ApplyContext, ApplyError, NeedsHuman, register
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ MAX_STEPS = 12            # a real application is 5-6 steps; this is the runaway
 RENDER_WAIT = 15000       # ms - how long a step gets to draw itself before we read what is on it
 ACCOUNT_ATTEMPTS = 3      # create, sign in, and one more move once the page has said what it wants
 MAX_VERIFICATIONS = 1     # one resend-and-follow per run; more than that is a tenant we are not getting into
+MAX_RESETS = 1            # one forgot-password round per run; a tenant that still refuses after it needs a person
 # Where a step's controls live, narrowest first. applyFlowPage is Workday's own container for the application;
 # "body" is the last resort so that a tenant that renames it still gets filled rather than silently skipped.
 STEP_SCOPES = ("[data-automation-id='applyFlowPage']", "form", "body")
@@ -115,6 +117,11 @@ EMAIL_AUTH = ("SignInWithEmailButton", "signInWithEmailButton", "emailSignInButt
 SSO_AUTH = ("GoogleSignInButton", "LinkedInSignInButton", "AppleSignInButton")   # documented, never clicked
 CREATE_ACCOUNT_LINK = ("createAccountLink", "createAccountCheckbox")
 SIGN_IN_LINK = ("signInLink",)
+# The forgot-password route (Autodesk's tenant, app 302): the link on the Sign In card opens a card with the
+# email box and resetPasswordButton; the mailed link (".../passwordreset/<token>" on the tenant's own host)
+# opens Password + Verify New Password and the same button, labelled Submit there.
+FORGOT_PASSWORD_LINK = ("forgotPasswordLink",)
+RESET_PASSWORD_BUTTON = ("resetPasswordButton",)
 ACCOUNT_SUBMIT = ("createAccountSubmitButton", "signInSubmitButton")
 # The transparent div Workday lays over its real buttons. It is inert — clicking it sends no request at all —
 # and it is why every click here is forced past it (see _click_first). Never a click target of its own: there
@@ -166,6 +173,14 @@ class WorkdayAdapter(Adapter):
             except Exception as e:  # noqa: BLE001
                 log.debug("workday: reload after error page: %s", e)
 
+        if self._on_candidate_home(page):
+            self._raise_if_listed(ctx)
+            # A resume (or a sign-in) parked on Candidate Home: there is no Apply there, and judging it said
+            # "the posting may be closed" about one Workday still reported open (Huron, application 343).
+            ctx.step("Workday opened Candidate Home; going back to the job")
+            page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            page.wait_for_timeout(STEP_WAIT)
+
         self._dismiss_legal(page)
         c.raise_if_already_applied(page)
 
@@ -188,13 +203,46 @@ class WorkdayAdapter(Adapter):
         if self._on_form(page) or self._on_account_page(page):
             return      # a resume landed us mid-application, or on the signup _account handles next
 
-        if not self._press_apply(page):
+        if not self._press_apply(page) and not self._press_apply_when_drawn(ctx):
             raise NeedsHuman(
                 "No Apply or Continue Application button on this Workday page — the posting may be closed. "
                 "Check the browser window, finish it there if it is open, then click Continue.")
         page.wait_for_timeout(STEP_WAIT)
 
         self._choose_route(ctx)
+
+    def _press_apply_when_drawn(self, ctx: ApplyContext) -> bool:
+        """Apply again once the job page has drawn. Arriving from LinkedIn, the tenant's job page is a blank
+        white SPA shell for several seconds; read in that moment it has no Apply button, and the run asked the
+        user to check a "closed" posting (OutSystems, application 341; Huron, 328). Waits for the page, then
+        reloads once if it stays blank."""
+        page = ctx.page
+        for attempt in range(2):
+            for _ in range(10):
+                page.wait_for_timeout(1500)
+                if self._press_apply(page):
+                    return True
+                if self._on_form(page) or self._on_account_page(page):
+                    return True
+                try:
+                    if len((page.inner_text("body") or "").strip()) > 200 and self._job_page_drawn(page):
+                        break       # a drawn page that still has no Apply: closed, judged by the caller
+                except Exception:  # noqa: BLE001
+                    pass
+            if attempt == 0:
+                ctx.step("Workday page is slow to draw; reloading it")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("workday: reload of a blank job page: %s", e)
+        return False
+
+    @staticmethod
+    def _job_page_drawn(page) -> bool:
+        try:
+            return bool(page.locator("[data-automation-id=jobPostingHeader], [data-automation-id=jobPostingDescription]").count())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _press_apply(self, page) -> bool:
         """Start (or pick up) the application. Named on the accessible label when the automation id is one
@@ -261,7 +309,7 @@ class WorkdayAdapter(Adapter):
         # Before the first attempt, not after it: this is the window the verification mail will land in.
         started = datetime.now(timezone.utc) - timedelta(seconds=MAIL_LOOKBACK_S)
 
-        attempt, budget, just_verified, verifications = 0, ACCOUNT_ATTEMPTS, False, 0
+        attempt, budget, just_verified, verifications, resets = 0, ACCOUNT_ATTEMPTS, False, 0, 0
         while attempt < budget:
             # Every time round, not once before the loop: Workday answers a submitted signup by bouncing
             # back to "Sign in with Google / with email", and an attempt that starts there has no fields to
@@ -297,12 +345,22 @@ class WorkdayAdapter(Adapter):
                 raise NeedsHuman(
                     f"Workday emailed a verification link to {email} and will not let the new account sign "
                     f"in until it is opened ({how}). Click the link in that mail, then click Continue.")
-            if PASSWORD_REJECTED.search(text):
+            # Judged on the form's complaints, not the page: every Create Account card prints its "Password
+            # Requirements", so the page text matched after any unsuccessful signup — OutSystems' "account
+            # already exists" was reported as a rejected password (application 342).
+            if PASSWORD_REJECTED.search(" ".join(c.form_errors(page))) and not ACCOUNT_EXISTS.search(text):
                 raise NeedsHuman(
                     "This employer's Workday rejected the password jobbot generated. Set one it accepts in "
                     "the browser window, save it in Settings -> Secrets as "
                     f"{credentials.SECRET_NAME}, then click Continue.")
             if not creating and SIGN_IN_FAILED.search(text):
+                # An account from before jobbot managed the password (or one set by hand since). It is the
+                # user's own account on the user's own mailbox, so take the route a person would: have the
+                # tenant mail a reset link, set it to jobbot's password, and sign in with that.
+                if resets < MAX_RESETS and self._reset_password(ctx, email, password):
+                    resets += 1
+                    budget, just_verified = budget + 2, True
+                    continue
                 raise NeedsHuman(
                     f"There is already an account at this employer for {email}, and it does not take the "
                     f"password jobbot manages. Two ways on, both in the browser window that is open: sign "
@@ -312,6 +370,69 @@ class WorkdayAdapter(Adapter):
         raise NeedsHuman(
             "Workday would not let jobbot past the sign-in for this employer. Finish signing in (or "
             "creating the account) in the browser window, then click Continue.")
+
+    def _reset_password(self, ctx: ApplyContext, email: str, password: str) -> bool:
+        """Set this tenant's password to jobbot's through "Forgot your password?", then reopen the job.
+
+        Only with a mailbox configured: the reset is a link mailed to the apply address, read back over IMAP
+        exactly like the verification link in _verify_account. The link is matched on this tenant's own host,
+        so an older reset mail from another employer (FIL's sit in the inbox) can never be followed here.
+        False whenever any part of it does not happen, and the caller asks the user as it did before.
+        """
+        configured, why = mail.is_configured()
+        if not configured:
+            log.info("workday: not resetting the password — mail is off (%s)", why)
+            return False
+        page = ctx.page
+        host = urlparse(page.url or ctx.job.get("url") or "").hostname or ""
+        if not host or not self._click_first(page, FORGOT_PASSWORD_LINK):
+            log.info("workday: no 'Forgot your password?' link on %s", (page.url or "")[:100])
+            return False
+        ctx.step("Resetting your password with this employer")
+        page.wait_for_timeout(STEP_WAIT)
+        self._wait_for_render(page)
+        if not self._fill_first(page, SIGN_IN_EMAIL, email):
+            log.info("workday: the forgot-password card has no email box")
+            return False
+        since = datetime.now(timezone.utc) - timedelta(seconds=MAIL_SKEW_S)
+        if not self._click_first(page, RESET_PASSWORD_BUTTON):
+            return False
+        page.wait_for_timeout(STEP_WAIT)
+        ctx.step("Opening the password-reset link from your mailbox")
+        link = mail.fetch_link(since, match=re.compile(re.escape(host) + r"/.*passwordreset/", re.I),
+                               hints=("workday", "password"))
+        if not link:
+            log.info("workday: no reset mail for %s arrived", host)
+            return False
+        try:
+            page.goto(link, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            page.wait_for_timeout(STEP_WAIT)
+            self._wait_for_render(page)
+            self._fill_first(page, (PASSWORD,), password)
+            self._fill_first(page, VERIFY_PASSWORD, password)
+            c.fill_account_password(page, password)     # whatever this tenant calls its two boxes
+            self._click_first(page, RESET_PASSWORD_BUTTON)
+            page.wait_for_timeout(STEP_WAIT)
+            self._wait_for_render(page)
+            # Judged on errors, not on PASSWORD_REJECTED: the reset card always lists its "Password
+            # Requirements", so that pattern matches the page whether or not it took the password.
+            # Workday announces the success in the same alert box its errors use: "Password has been reset"
+            # was read as a refusal and the run asked the user to reset it by hand (Huron, application 343).
+            errors = [e for e in c.form_errors(page)
+                      if not re.search(r"has been (?:reset|changed|updated)|successfully", e, re.I)]
+            if errors and self._on_password_page(page):
+                log.warning("workday: the reset page refused jobbot's password: %s", "; ".join(errors[:3])[:300])
+                return False
+            log.info("workday: password reset on %s; signing in with it", host)
+            page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            page.wait_for_timeout(STEP_WAIT)
+            self._dismiss_legal(page)
+            self._start(ctx)
+            self._wait_for_render(page)
+        except Exception as e:  # noqa: BLE001
+            log.warning("workday: password reset did not go through: %s", e)
+            return False
+        return True
 
     def _take_email_route(self, page) -> None:
         """Answer the "how do you want to sign in?" screen with "Sign in with email".
@@ -478,6 +599,29 @@ class WorkdayAdapter(Adapter):
                 self._wait_for_render(page)
                 if self._submit_if_review(ctx):
                     return
+                if self._on_candidate_home(page):
+                    self._raise_if_listed(ctx)
+                if self._on_candidate_home(page) and not ctx.extra.get("wd_home_back"):
+                    # Signed in, some tenants land on Candidate Home ("My Tasks / My Applications") instead of
+                    # the job, and its page was walked as a step with no Next (Huron, application 343). Go back
+                    # to the posting and start from its Apply, once.
+                    ctx.extra["wd_home_back"] = True
+                    ctx.step("Workday opened Candidate Home; going back to the job")
+                    page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                    page.wait_for_timeout(STEP_WAIT)
+                    self._dismiss_legal(page)
+                    c.raise_if_already_applied(page)
+                    self._start(ctx)
+                    continue
+                if self._on_account_page(page) and ctx.extra.get("wd_account_again", 0) < 2:
+                    # The signup bounced back to a Sign In card a beat after it was judged done: the check ran
+                    # in the blank moment between the two, so the card was walked as a step and "had no Next
+                    # button" (Huron, application 343). It is the account gate again; take it as one.
+                    ctx.extra["wd_account_again"] = ctx.extra.get("wd_account_again", 0) + 1
+                    log.info("workday: the step turned out to be the sign-in card; signing in")
+                    self._account(ctx)
+                    page.wait_for_timeout(STEP_WAIT)
+                    continue
                 if not self._click_first(page, NEXT):
                     # A tenant that renames its own buttons. The automation ids above are Workday's, but a
                     # tenant may ship its own footer, so let the model name the control from the ones on
@@ -603,6 +747,149 @@ class WorkdayAdapter(Adapter):
         c.fill_account_password(page)       # a tenant that asks for the password again mid-flow
         c.fill_cover_letter(ctx)
         walker._questions(ctx)              # the walker leaves prompts alone; _prompts owns them
+        self._experience_dates(ctx)
+        self._question_dates(ctx)
+
+    def _question_dates(self, ctx: ApplyContext) -> None:
+        """Any other empty Workday date field: asked by its label, typed in its own sections.
+
+        "When do you complete the requirements of your degree and be available to commence full time
+        employment?" is an MM/DD/YYYY widget the walker never sees (Avanade, application 377). The resolver
+        answers it ("Immediately" for a finished degree) and common._target_date turns that into a date.
+        """
+        page = ctx.page
+        fields = page.locator("[data-automation-id^='formField-']:has([data-automation-id='dateSectionMonth-input'])")
+        try:
+            n = fields.count()
+        except Exception:  # noqa: BLE001
+            return
+        from datetime import date
+        for i in range(n):
+            field = fields.nth(i)
+            try:
+                aid = field.get_attribute("data-automation-id") or ""
+                if aid in ("formField-startDate", "formField-endDate") or not c.is_visible_now(field):
+                    continue        # work experience: _experience_dates
+                month = field.locator("[data-automation-id='dateSectionMonth-input']").first
+                if (month.input_value() or "").strip().upper() not in ("", "MM"):
+                    continue
+                label = c.strip_required(c.clean(field.locator("label, legend").first.inner_text()))
+                if not label:
+                    continue
+                ans = ctx.answer(label, None, "text")
+                target = c._target_date(str(ans or ""), date.today())
+                if target is None:
+                    raise NeedsHuman(f"'{label[:80]}' wants a date and jobbot could not turn {ans!r} into one. "
+                                     "Type it in the browser window, then click Continue.", question=label, kind="text")
+                has_day = field.locator("[data-automation-id='dateSectionDay-input']").count() > 0
+                typed = target.strftime("%m%d%Y" if has_day else "%m%Y")
+                try:
+                    month.click(timeout=c.SHORT, force=True)
+                except Exception:  # noqa: BLE001
+                    month.evaluate("e => e.focus()")
+                page.keyboard.type(typed, delay=80)
+                page.keyboard.press("Tab")
+                page.wait_for_timeout(300)
+                log.info("workday: date %r -> %s (from %r)", label[:60], target.isoformat(), str(ans)[:40])
+            except NeedsHuman:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.info("workday: date field %d: %s", i, str(e)[:160])
+
+    # ---------- work experience dates ----------
+    def _experience_dates(self, ctx: ApplyContext) -> None:
+        """Fill the From / To of each Work Experience block from facts.yaml's work.history.
+
+        The CV parse fills title and company and leaves the MM/YYYY date sections empty, and Workday refuses
+        the step with "The field From is required" (Avanade/Accenture, application 377). The block is matched
+        to a history entry by company; "present" ticks "I currently work here" instead of a To date.
+        """
+        page = ctx.page
+        from jobbot import config
+        # Read fresh: a run's ctx.facts is the file as it was when the run started, and a history added
+        # during a pause would otherwise be invisible to the retry that follows it.
+        history = ((config.load_facts().get("work") or {}).get("history")) or []
+        if not history:
+            log.info("workday: no work.history in facts.yaml; experience dates left to the form")
+            return
+        starts = page.locator("[data-automation-id='formField-startDate']")
+        try:
+            n = starts.count()
+        except Exception:  # noqa: BLE001
+            return
+        if not n:
+            try:
+                shape = page.evaluate("""() => { const l = [...document.querySelectorAll('label, legend')].find(e => /^\\s*From\\b/.test(e.innerText || ''));
+                    if (!l) return ''; let n = l; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;
+                    return n.outerHTML.replace(/ (class|style)="[^"]*"/g, '').slice(0, 2500); }""")
+                if shape:
+                    log.info("workday: experience dates — no formField-startDate; the From field looks like: %s",
+                             re.sub(r"\s+", " ", shape))
+            except Exception:  # noqa: BLE001
+                pass
+        for i in range(n):
+            start = starts.nth(i)
+            block = start.locator("xpath=ancestor::*[.//input[contains(@id,'companyName') or @name='companyName']][1]")
+            try:
+                if not block.count():
+                    log.info("workday: a start-date field with no company box around it; skipping it")
+                    continue
+                company = c.clean(block.locator("input[id$='companyName'], input[name='companyName']").first.input_value())
+                title = c.clean(block.locator("input[id$='jobTitle'], input[name='jobTitle']").first.input_value())
+            except Exception:  # noqa: BLE001
+                continue
+            entry = next((h for h in history if company and str(h.get("company", "")).lower() in company.lower()), None) \
+                or next((h for h in history if title and str(h.get("title", "")).lower() == title.lower()), None)
+            if not entry:
+                log.info("workday: no work.history entry for %r at %r; leaving its dates", title, company)
+                continue
+            self._fill_month_year(ctx, start, str(entry.get("start", "")), f"start at {company or title}")
+            end = str(entry.get("end", "")).strip().lower()
+            if end == "present":
+                box = block.locator("input[type=checkbox][id$='currentlyWorkHere'], input[type=checkbox][name='currentlyWorkHere']")
+                try:
+                    if box.count() and not box.first.is_checked():
+                        box.first.click(timeout=c.MEDIUM, force=True)
+                        page.wait_for_timeout(500)
+                        log.info("workday: ticked 'I currently work here' for %s", company)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("workday: currently-work-here tick: %s", e)
+            else:
+                end_field = block.locator("[data-automation-id='formField-endDate']")
+                if end_field.count():
+                    self._fill_month_year(ctx, end_field.first, end, f"leave {company or title}")
+
+    def _fill_month_year(self, ctx: ApplyContext, field, value: str, what: str) -> None:
+        """Type "MM/YYYY" into a Workday date field's month section; it moves to the year by itself."""
+        page = ctx.page
+        month = field.locator("[data-automation-id='dateSectionMonth-input']").first
+        year = field.locator("[data-automation-id='dateSectionYear-input']").first
+        try:
+            held = (month.input_value() or "").strip() if month.count() else ""
+            if held and held.upper() != "MM":
+                log.info("workday: %s already holds %r", what, held)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        m = re.fullmatch(r"(\d{4})-(\d{2})", value or "")
+        if not m:
+            raise NeedsHuman(f"Workday wants the month you {what} (MM/YYYY), and the CV gives only the year "
+                             f"({value or 'none'}). Type it in the browser window, then click Continue — or add the "
+                             "month to work.history in facts.yaml so it is filled next time.")
+        try:
+            target = month if month.count() else field
+            try:
+                target.click(timeout=c.SHORT, force=True)
+            except Exception:  # noqa: BLE001 - the section sits under Workday's display layer; focus it instead
+                target.evaluate("e => (e.querySelector('input') || e).focus()")
+            page.keyboard.type(f"{m.group(2)}{m.group(1)}", delay=80)
+            page.keyboard.press("Tab")
+            page.wait_for_timeout(400)
+            got = (month.input_value() if month.count() else "") or ""
+            log.info("workday: %s -> %s/%s (month box now %r, year %r)", what, m.group(2), m.group(1), got,
+                     (year.input_value() if year.count() else ""))
+        except Exception as e:  # noqa: BLE001
+            log.info("workday: could not type the date for %s: %s", what, str(e)[:160])
 
     def _upload_cv(self, ctx: ApplyContext) -> bool:
         """Attach the CV to this step, through the dropzone when that is all there is.
@@ -845,7 +1132,13 @@ class WorkdayAdapter(Adapter):
                 return
         seen: list[str] = []
         searched = False
-        for _ in range(PROMPT_LEVELS):
+        # The branch taken at the top of the tree, and the ones already found to hold nothing true. Autodesk's
+        # "How Did You Hear About Us?" keeps LinkedIn under "Social Networking", not under "Job Board" where
+        # the source policy looks first, and the walk paused on Job Board's children (application 304).
+        # A branch whose children have no true answer is closed and the next one is tried instead.
+        from jobbot.apply.resolver import is_source_question
+        level, root, dead = 0, None, set()
+        for _ in range(PROMPT_LEVELS * 3):
             if not options:
                 break
             texts = [text for text, _ in options]
@@ -853,6 +1146,17 @@ class WorkdayAdapter(Adapter):
             try:
                 answer = ctx.answer(label, texts, "select")
             except NeedsHuman:
+                if level > 0 and root is not None and is_source_question(label) and len(dead) < 4:
+                    dead.add(root)
+                    log.info("workday: %r — nothing true under %r; trying another branch", label, root)
+                    try:
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(PROMPT_WAIT)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    options = [(t, el) for t, el in self._open_prompt(page, box) if t not in dead]
+                    level, root = 0, None
+                    continue
                 # A long list opens on its alphabetical head: Lumentum's "Field of Study" showed
                 # "Accounting ... Agricultural Engineering", and Computer Science was a hundred rows down
                 # (application 285). Such a box also filters on what is typed, so type the answer before
@@ -869,6 +1173,9 @@ class WorkdayAdapter(Adapter):
                      "" if match else " (no option matches)")
             if match is None:
                 break
+            if level == 0:
+                root = answer
+            level += 1
             match.click(timeout=c.MEDIUM)
             # A leaf takes a moment to become the box's value. Read the next "level" too early and it is
             # whatever other list is still on screen: AGF's "How Did You Hear About Us?" took LinkedIn, and the
@@ -917,7 +1224,8 @@ class WorkdayAdapter(Adapter):
         if not query:
             return []
         tried: list[str] = []
-        for term in (query, query.split()[0] if query.split() else ""):
+        fallback: list = []
+        for term in self._search_terms(query):
             if not term or term in tried:
                 continue
             tried.append(term)
@@ -946,14 +1254,59 @@ class WorkdayAdapter(Adapter):
                 if options and [t for t, _ in options] != before:
                     break
             changed = bool(options) and [t for t, _ in options] != before
-            log.info("workday: %r lists nothing until typed; %r offered %d option(s)%s",
-                     label, term, len(options), "" if changed else " (the list did not change)")
+            # Whether the list that came back actually holds the thing being searched for, rather than just
+            # being a different list. See _names_it.
+            names_it = self._names_it(options, query)
+            log.info("workday: %r lists nothing until typed; %r offered %d option(s)%s%s",
+                     label, term, len(options), "" if changed else " (the list did not change)",
+                     "" if names_it else " (none of them name it)")
             # "No matches found" leaves the catalogue it opened on under the message, and that catalogue
             # was returned as the search result for "Computer Science & Engineering" (application 285),
-            # so the shorter query was never tried. An unchanged list is no result.
+            # so the shorter query was never tried. An unchanged list is no result -- and neither is a
+            # changed one that names nothing being looked for: on OCBC's Workday the full query DID bring
+            # back a new list (the catalogue head, under "No matches found"), so this returned it, the
+            # resolver had nothing it could pick, and "Field of Study" was put to the user seven times
+            # (applications 285 and 295). Keep narrowing until the list holds the word being searched for;
+            # the first changed list is kept only as a last resort, for a query no shortening rescues.
             if options and (changed or not before):
-                return options
-        return []
+                if names_it:
+                    return options
+                if not fallback:
+                    fallback = options
+        return fallback
+
+    # Words too generic to narrow a catalogue by: "Computer Science & Engineering" shortened to "Science"
+    # would match a page of them. The head word of a field of study is the one that identifies it.
+    _STOPWORDS = frozenset(("and", "the", "of", "for", "in", "with", "science", "sciences", "studies",
+                            "engineering", "technology", "general", "other", "others"))
+
+    @classmethod
+    def _search_terms(cls, query: str) -> list[str]:
+        """What to type, in order: the whole answer, then the one word that identifies it.
+
+        Jawad's rule, and the right one: search "Computer" first, then take whichever of "Computer
+        Engineering" / "Computer and Information Science" the board actually offers. A list that has no
+        "Computer Science & Engineering" almost always has a "Computer ..." something.
+        """
+        words = [w for w in re.split(r"[^\w+#]+", query) if w]
+        head = next((w for w in words if len(w) > 2 and w.lower() not in cls._STOPWORDS), "")
+        # Falls back to the plain first word so a query made entirely of common words still gets shortened.
+        return [query, head or (words[0] if words else "")]
+
+    @classmethod
+    def _names_it(cls, options: list, query: str) -> bool:
+        """True when some option on this list is recognisably the thing searched for.
+
+        Keyed on the query's head word, not on any shared word: "Aerospace Engineering" shares "Engineering"
+        with "Computer Science & Engineering" and is not it — and that near-match is exactly what an earlier
+        run picked and had to be corrected ("'Field of Study' holds 'Aerospace Engineering', which the
+        education facts do not name").
+        """
+        words = [w for w in re.split(r"[^\w+#]+", query) if w]
+        head = next((w for w in words if len(w) > 2 and w.lower() not in cls._STOPWORDS), "")
+        if not head:
+            return bool(options)
+        return any(head.lower() in (text or "").lower() for text, _ in options)
 
     def _search_skills(self, ctx: ApplyContext, page, box, label: str) -> list:
         """Add the candidate's skills to a "Type to Add Skills" prompt, from facts.yaml's skills list.
@@ -1235,6 +1588,37 @@ class WorkdayAdapter(Adapter):
         try:
             return bool(page.locator(AID.format("bottom-navigation-next-button")).count()) or \
                 bool(page.locator("form input[type=file], [data-automation-id*='formField']").count())
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _raise_if_listed(ctx: ApplyContext) -> None:
+        """Candidate Home's "My Applications" lists this job as submitted: the application is in.
+
+        Trafigura took the submit, then demanded the account be verified and showed its sign-in; after the
+        verification the job page had no Apply and the run called the posting closed (application 388) while
+        Candidate Home said "Forward Deployed Engineer — In Process — October 3, 2026"."""
+        title = c.clean(str(ctx.job.get("title") or "")).lower()
+        if not title:
+            return
+        try:
+            rows = ctx.page.evaluate("""() => [...document.querySelectorAll('tr, [role=row], li')]
+                .map(r => (r.innerText || '').replace(/\\s+/g, ' ').trim()).filter(t => t && t.length < 400)""") or []
+        except Exception:  # noqa: BLE001
+            return
+        for row in rows:
+            low = row.lower()
+            if title[:40] in low and re.search(r"in process|submitted|under review|received|\b20\d\d\b", low):
+                raise AlreadyApplied(f"Workday's Candidate Home lists this application: {row[:160]}")
+
+    @staticmethod
+    def _on_candidate_home(page) -> bool:
+        """Workday's signed-in dashboard (My Tasks / My Applications), which is not part of any application."""
+        try:
+            if re.search(r"/userhome\b", (page.url or "").lower()):
+                return True
+            text = (page.inner_text("body") or "")[:4000]
+            return bool(re.search(r"\bMy Tasks\b", text) and re.search(r"\bMy Applications\b", text))
         except Exception:  # noqa: BLE001
             return False
 

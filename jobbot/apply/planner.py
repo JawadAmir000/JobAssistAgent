@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -67,6 +68,8 @@ PORTABLE = {"email_link", "verification_code", "account", "sso", "captcha", "con
 def unstick(ctx: ApplyContext, goal: str, fill: Callable[[], None] | None = None) -> str:
     """Get the application past the current page. See the module docstring for the outcomes."""
     page = ctx.page
+    if recover_network_error(page):
+        return "moved"
     before = _settled_snapshot(page)
     verdict = _classify(ctx, before, goal)
     if not verdict:
@@ -87,6 +90,40 @@ def unstick(ctx: ApplyContext, goal: str, fill: Callable[[], None] | None = None
     if source != "signal" or ok:
         playbook.remember(before, kind, press or "", ok=ok, lesson=kind in PORTABLE)
     return outcome
+
+
+NETWORK_RETRIES = 3
+
+
+def recover_network_error(page) -> bool:
+    """Reload past Chrome's own network-error page; True when a real page came back.
+
+    A dropped connection is not a verdict on the job. EY's careers site answered one press with
+    ERR_HTTP2_PROTOCOL_ERROR, the model read chrome-error://chromewebdata/ as "not part of an application",
+    and the run failed (application 299). Reloading the error page re-requests the URL that failed; when
+    that keeps failing, going back returns to the page whose press led here, so it can be pressed again.
+    """
+    def broken() -> bool:
+        try:
+            return (page.url or "").startswith("chrome-error://")
+        except Exception:  # noqa: BLE001
+            return False
+    if not broken():
+        return False
+    for attempt in range(NETWORK_RETRIES):
+        log.info("planner: network error page; reloading (attempt %d)", attempt + 1)
+        try:
+            page.wait_for_timeout(2000 * (attempt + 1))
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:  # noqa: BLE001
+            log.debug("planner: reload failed: %s", e)
+        if not broken():
+            return True
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=30000)
+    except Exception:  # noqa: BLE001
+        pass
+    return not broken()
 
 
 _LOADING_RE = re.compile(r"^\W*(?:loading|please wait|one moment|just a moment)\b|\bloading\s*(?:\.{3}|…)", re.I)
@@ -137,11 +174,33 @@ def _classify(ctx: ApplyContext, snap: dict, goal: str) -> dict | None:
             if any(ctl["name"].lower() == name.lower() for ctl in snap["controls"]):
                 return {"kind": "press", "press": name, "source": "memory", "reason": "pressed here before"}
             log.info("planner: remembered control %r is not on this page any more", name)
+        elif mem["kind"] in ("confirmation", "already_applied"):
+            # Never from memory alone: a page wrongly learned as a thank-you (Avanade's pre-apply redirect
+            # modal, 338/350) then "confirmed" every later visit without looking (371/372). The live signals
+            # above already said no, so fall through to the model.
+            log.info("planner: memory says %r here but the page's own signals do not; not trusting it", mem["kind"])
         elif mem["kind"] in KINDS:
-            return {"kind": mem["kind"], "source": "memory",
-                    "reason": f"learned {mem['source']} ({mem.get('phrase', '')[:60]})"}
+            return _apply_over_verdict(snap, {"kind": mem["kind"], "source": "memory",
+                    "reason": f"learned {mem['source']}" + (f" ({mem['phrase'][:60]})" if mem.get('phrase') else "")})
     # 3. The model.
-    return _ask_model(ctx, snap, goal)
+    return _apply_over_verdict(snap, _ask_model(ctx, snap, goal))
+
+
+def _apply_over_verdict(snap: dict, verdict: dict | None) -> dict | None:
+    # A job page with its Apply button below the fold reads as a description and nothing else, and the model
+    # called Lenovo's "not an application" with an "Apply" link in the very menu it was shown (application
+    # 336). A plain Apply control outranks that verdict: pressing it is how every application starts.
+    if verdict and verdict["kind"] in ("not_application", "form_step") and not snap.get("fields"):
+        apply_ctl = next((ctl["name"] for ctl in snap.get("controls") or [] if _APPLY_CONTROL_RE.match(ctl["name"])), None)
+        if apply_ctl:
+            log.info("planner: model said %r but the page offers %r; pressing it", verdict["kind"], apply_ctl)
+            return {"kind": "press", "press": apply_ctl, "source": "rule", "reason": "an Apply control is on the page"}
+    return verdict
+
+
+_APPLY_CONTROL_RE = re.compile(r"^\s*(?:apply|apply now|apply online|apply for (?:this|the) (?:job|position|role)|"
+                               r"start (?:your )?application|i'?m interested|bewerben|jetzt bewerben|postuler|"
+                               r"postuler maintenant|candidatar(?:-se)?|aplicar|solliciteer)\s*[!.›»→]*\s*$", re.I)
 
 
 def _ask_model(ctx: ApplyContext, snap: dict, goal: str) -> dict | None:
@@ -209,6 +268,18 @@ def _act(ctx: ApplyContext, before: dict, verdict: dict, fill: Callable[[], None
     if kind == "closed":
         raise _verdict(kind, f"This posting is not accepting applications: {reason}")
     if kind == "not_application":
+        # The posting's own page judged before it had drawn (Avanade: "site navigation only; job content and
+        # apply button not loaded", application 377). One reload and a second look before giving up on it.
+        if not ctx.extra.get("na_reloaded") and re.search(r"not (?:yet )?loaded|failed to load|still loading|"
+                                                          r"navigation only|no (?:job )?content", reason, re.I):
+            ctx.extra["na_reloaded"] = True
+            log.info("planner: %r looks like a page that had not loaded; reloading once", reason[:80])
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(6000)
+            except Exception as e:  # noqa: BLE001
+                log.debug("planner: reload failed: %s", e)
+            return "moved"
         raise _verdict(kind, f"This page is not part of an application ({reason}) at {page.url}")
     if kind == "captcha":
         c.detect_captcha(page)          # raises the usual pause when a widget is really there
@@ -248,10 +319,43 @@ def _act(ctx: ApplyContext, before: dict, verdict: dict, fill: Callable[[], None
                          "application carries on from there.")
 
     if kind == "form_step":
+        # The one kind whose definition is "questions still unanswered that must be filled", and the only
+        # one that used to answer that by asking the user to fill them. The filler is already in hand — the
+        # same `fill` the account gate is given — so use it before giving the form back. Application 293
+        # stood on Shopee's application form, open and completely blank, was told by the model in as many
+        # words that it was a form step with name, email, education and experience still empty, and handed
+        # the whole thing to the user because this branch only ever pressed a button.
+        #
+        # Once per application: a step that is still a form step after being filled is a step jobbot cannot
+        # fill, and filling it again would only spend the budget twice over.
+        # Once per pass (90 s), not per application: a retry carries ctx.extra over, and a fix made during the pause
+        # would otherwise never get to fill the step it was made for (Rippling, application 385).
+        if fill is not None and time.time() - float(ctx.extra.get("planner_filled_at") or 0) > 90:
+            ctx.extra["planner_filled_at"] = time.time()
+            log.info("planner: filling this form step before asking the user to")
+            try:
+                fill()
+            except (NeedsHuman, AlreadyApplied, ApplyError):
+                raise
+            except Exception as e:  # noqa: BLE001 - one control that would not take a value is not the page
+                log.info("planner: filling this step raised %s", str(e)[:120])
+            # "moved" whether or not the page's shape changed: filling a form rarely changes its signature,
+            # and what the caller needs to know is that the form was reached and worked on, so that it looks
+            # at the page again rather than treating it as a dead end.
+            return "moved"
+        # A step whose one gap is a consent tick drawn in a shape the fill pass did not see: UKG/UltiPro's
+        # "Almost there!" signup page (application 318) had its names and phone filled and Create account
+        # disabled behind an unticked privacy box, and was handed back to the user over that alone.
+        if c.tick_consent_boxes(page):
+            return "moved"
         if press and _press(ctx, before, press):
             return "moved"
-        raise NeedsHuman(f"This step has something jobbot could not fill ({reason or 'an unusual control'}). "
-                         f"Complete it in the open window, then click Continue.")
+        empty = _required_empty(page)
+        if empty:
+            log.info("planner: required and still empty on this step: %s", empty)
+        raise NeedsHuman(f"This step has something jobbot could not fill ({reason or 'an unusual control'})"
+                         + (f" — still empty: {', '.join(empty[:5])}" if empty else "")
+                         + ". Complete it in the open window, then click Continue.")
 
     if kind == "press":
         if not press:
@@ -263,6 +367,20 @@ def _act(ctx: ApplyContext, before: dict, verdict: dict, fill: Callable[[], None
         playbook.forget_action(before, "press", press)
         return ""
     return ""
+
+
+def _required_empty(page) -> list[str]:
+    """Labels of visible required controls that hold nothing, for the message that hands a step back."""
+    try:
+        return page.evaluate("""() => [...document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select')]
+            .filter(e => (e.required || e.getAttribute('aria-required') === 'true') && e.offsetParent !== null)
+            .filter(e => (e.type === 'checkbox' || e.type === 'radio')
+                         ? !document.querySelector(`input[name="${CSS.escape(e.name)}"]:checked`)
+                         : e.type === 'file' ? !(e.files && e.files.length) : !String(e.value || '').trim())
+            .map(e => ((e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') || e.name || e.type || '').trim().slice(0, 60))
+            .filter((v, i, a) => v && a.indexOf(v) === i)""") or []
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _verdict(kind: str, message: str) -> ApplyError:
@@ -306,8 +424,21 @@ def _press(ctx: ApplyContext, before: dict, name: str) -> bool:
         page.wait_for_timeout(SETTLE_MS)
     except Exception as e:  # noqa: BLE001
         log.info("planner: %r would not press (%s)", name, str(e)[:100])
+        try:
+            if c.follow_control_href(page, el, page.url):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         return False
-    return _changed(before, observe.snapshot(ctx.page))
+    after = observe.snapshot(ctx.page)
+    if not _changed(before, after):
+        try:
+            if c.follow_control_href(page, el, page.url):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    return True
 
 
 def _changed(before: dict, after: dict) -> bool:

@@ -275,7 +275,9 @@ def screenshot(name: str):
     path = (config.SCREENSHOTS_DIR / Path(name).name).resolve()
     if not path.is_file() or config.SCREENSHOTS_DIR.resolve() not in path.parents:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return FileResponse(path)
+    # One file per application and label ("301-needs-you.png"), rewritten on every pause: without this the
+    # browser kept showing the first pause's empty form after a later one had filled it.
+    return FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
 # ---------- applications tab ----------

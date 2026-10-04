@@ -90,12 +90,23 @@ def controls(page: Any, limit: int = MAX_CONTROLS) -> list[dict]:
     position in a list has moved by the time the model has answered.
     """
     try:
-        found = page.evaluate(_CONTROLS_JS, {"mark": _MARK, "limit": limit}) or []
+        # Scanned past the cap, then cut: Avanade's header and footer links filled all 40 places and the
+        # page's own "Apply now" was never offered to the model, which then called the posting "not an
+        # application" (application 377). Controls that move an application on are kept ahead of the cut.
+        found = page.evaluate(_CONTROLS_JS, {"mark": _MARK, "limit": max(limit * 5, 200)}) or []
     except Exception as e:  # noqa: BLE001 - a page that cannot be scanned is one to give up on politely
         log.debug("navigator: could not scan the page: %s", e)
         return []
-    return [ctl for ctl in found
+    safe = [ctl for ctl in found
             if not UNSAFE_RE.search(ctl.get("name", "")) and not THIRD_PARTY_RE.search(ctl.get("name", ""))]
+    key = [ctl for ctl in safe if _FORWARD_RE.search(ctl.get("name", ""))]
+    rest = [ctl for ctl in safe if ctl not in key]
+    keep = (key + rest)[:limit]
+    return sorted(keep, key=lambda ctl: ctl.get("i", 0))
+
+
+_FORWARD_RE = re.compile(r"\b(?:apply|submit|continue|next|proceed|start|postuler|soumettre|continuer|suivant|bewerb|"
+                         r"weiter|enviar|siguiente|candidat)", re.I)
 
 
 def press_next(ctx: Any, goal: str) -> str:

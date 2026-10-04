@@ -77,12 +77,13 @@ SUBMIT_NAMES = ("Submit application", "Submit Application", "Submit your applica
                 "Submit", "Apply now", "Apply", "Apply for this job", "Apply for this position", "Apply to this job",
                 "Send", "Finish", "Review and submit", "Confirm and submit", "Submit and continue",
                 # fr / de / es / pt / it / nl
-                "Postuler", "Envoyer", "Soumettre", "Envoyer ma candidature", "Absenden", "Bewerbung absenden",
+                "Postuler", "Envoyer", "Soumettre", "Envoyer ma candidature", "Soumettre ma candidature",
+                "Soumettre la candidature", "Postuler maintenant", "Absenden", "Bewerbung absenden",
                 "Jetzt bewerben", "Enviar", "Enviar solicitud", "Invia", "Invia candidatura", "Verzenden", "Solliciteer")
 # When no exact name matches, a submit-typed control whose name STARTS with the verb still sends the form:
 # "Apply and save", "Submit & Continue", "Send my details". Bounded to what a submit says, and never one that
 # names a third party or a later time ("Apply with LinkedIn", "Save for later", "Autofill from resume").
-SUBMIT_FALLBACK_RE = re.compile(r"^\s*(?:submit|apply|send)\b", re.I)
+SUBMIT_FALLBACK_RE = re.compile(r"^\s*(?:submit|apply|send|soumettre|envoyer|postuler|absenden|enviar|invia)\b", re.I)
 # "Send New Code" starts with "Send", and on Oracle's identity step that was the only control the fallback
 # could see: application 129 pressed it, which re-sent the code, started the resend cooldown and left the
 # run waiting for a confirmation page that a code step never shows. A control that sends a code is never
@@ -118,7 +119,13 @@ IDENTITY_FIELDS = ", ".join(sel + ":visible" for sel in (
     "input[type=email]", "input[autocomplete=email]", "input[name*='email' i]", "input[id*='email' i]",
     "input[type=tel]", "input[autocomplete=tel]", "input[name*='phone' i]",
     "input[autocomplete='given-name']", "input[autocomplete='family-name']",
-    "input[name*='first' i]", "input[name*='last' i]", "input[id*='firstname' i]", "input[id*='lastname' i]"))
+    "input[name*='first' i]", "input[name*='last' i]", "input[id*='firstname' i]", "input[id*='lastname' i]",
+    # Named only in the placeholder: Taraki's modal form has "Your Email" and "Your Full Name" (application 308)
+    "input[placeholder*='email' i]", "input[placeholder*='full name' i]", "input[placeholder*='your name' i]"))
+# An application drawn as a modal over the posting (Taraki's "Apply for Job", application 308). Tried before
+# the page-wide scopes so the posting's own search box behind it stays out of the walk, and only when the
+# dialog asks who the candidate is, so a cookie-preferences dialog full of toggles never qualifies.
+DIALOG_SCOPES = ("[role=dialog]", "[aria-modal=true]", "dialog[open]")
 MIN_FIELDS = 3
 
 # What opens the form when the page shows a teaser instead. Matched on the accessible name, in the
@@ -196,6 +203,11 @@ IDENTITY: tuple[tuple[re.Pattern, str], ...] = (
      "identity.location"),
 )
 LOCATION_KEYS = {"identity.location", "identity.country"}
+# A question answered yes or no is never a contact detail, whatever place or channel it mentions.
+_YES_NO_QUESTION_RE = re.compile(r"^\s*(?:are|do|does|did|will|would|have|has|can|could|is|should|may)\s+you\b", re.I)
+# A box that asks for the city alone, beside its own State and Country boxes (JazzHR's address block).
+# The location rule above sends it identity.location, which wrote "Dhaka, Bangladesh" into it (app 301).
+_BARE_CITY_RE = re.compile(r"^\s*(?:city|town|suburb)\s*[*:]?\s*$", re.I)
 # A control holding a phone number's country code, not a place and not the number. `None` rather than '':
 # the phone block in _identity drives this control off its own option list, and where it cannot, the
 # resolver being asked about it in _questions is the last fallback there is — skipping it outright would
@@ -374,7 +386,7 @@ class GenericFormAdapter(Adapter):
         for page_no in range(1, self.max_pages + 1):
             c.require_open(page)
             c.dismiss_cookie_banner(page)
-            c.detect_captcha(page)
+            c.detect_captcha(page, allow_inline=True)
             c.detect_bot_block(page)
             c.detect_sms_2fa(page)
             if self._login_link(ctx):
@@ -394,7 +406,7 @@ class GenericFormAdapter(Adapter):
             # does not (a reload builds a new one) and nor does any local here.
             ctx.extra["flow_url"] = _flow_key(page.url)
             log.info("generic: page %d — walking the controls under %r on %s", page_no, self.scope, root.url[:80])
-            c.detect_captcha(root)
+            c.detect_captcha(root, allow_inline=True)
             self._fill_page(fctx)
             c.detect_captcha(root)
 
@@ -452,16 +464,20 @@ class GenericFormAdapter(Adapter):
                     "jobbot filled this page but found neither a Submit nor a Next button; the site's "
                     "application flow is not currently automated.")
             ctx.step(f"Moving to page {page_no + 1}")
-            page.wait_for_timeout(STEP_SETTLE_MS)
+            try:
+                page.wait_for_timeout(STEP_SETTLE_MS)
+            except Exception:  # noqa: BLE001 - judged just below
+                pass
             self._adopt_page_opened_since(ctx, pages_before)
+            self._adopt_surviving_page(ctx)
             page = ctx.page
             c.require_open(page)
             root = self._form_root(page)
             if self._confirmed(root) or self._confirmed(page):
                 ctx.step("Submitted")
                 return
-            c.detect_captcha(page)
-            c.detect_captcha(root)
+            c.detect_captcha(page, allow_inline=True)
+            c.detect_captcha(root, allow_inline=True)
             blocked = c.submit_blocked_message(root)
             if blocked:
                 raise ApplyError(blocked[:400])
@@ -476,6 +492,10 @@ class GenericFormAdapter(Adapter):
                     summary = c.rejection_summary(fields, errors)
                     rejected = c.rejection_signature(fields, errors)
                     log.warning("generic: page %d rejected (%s)", page_no, summary[:160])
+                    # What the page itself called mandatory, for is_required's sake on the refill: Taleo
+                    # marks its required boxes with nothing the markup test can see, so a postal code and a
+                    # consent it had just refused over read as optional and were left blank again.
+                    ctx.extra["refused_text"] = (ctx.extra.get("refused_text", "") + " " + " ".join(errors)).lower()[-4000:]
                     fctx = replace(ctx, page=root)
                     changed = c.repair_fields(fctx, fields)
                     self._fill_page(fctx)
@@ -627,6 +647,8 @@ class GenericFormAdapter(Adapter):
         c.fill_cover_letter(ctx)
 
         ctx.step("Answering the form")
+        # Counted before the answers, compared after: an answer can create a control (see _fill_revealed).
+        controls_before = self._application_controls(page, self.scope)
         self._questions(ctx)
         self._toggle_groups(ctx)
         self._aria_radio_groups(ctx)
@@ -634,6 +656,49 @@ class GenericFormAdapter(Adapter):
         # A consent line drawn with no checkbox input at all, and on Shopee not even inside the <form> --
         # so it is looked for on the whole page, after everything the scoped walks could see.
         c.tick_consent_clauses(ctx)
+        # And a real consent checkbox drawn in a shape the scoped walk skipped: a zero-sized input under a
+        # styled box with no <label>, or a bare role=checkbox (UKG/UltiPro's "Almost there!" page).
+        c.tick_consent_boxes(page)
+        self._fill_revealed(ctx, controls_before)
+        if c.cv_input_emptied(page):
+            # An answer redrew the upload block and took the file with it: Taleo's "I want to upload a
+            # resume" radio re-renders its block, and the CV set a few seconds earlier was gone by Save and
+            # Continue, which bounced with "You must select the resume file" on every pass (application 305).
+            log.info("generic: the CV's file input was emptied after it was set; attaching it again")
+            c.upload_resume(page, ctx.cv_path)
+
+    # How many passes a step gets after the first. One is what a choice that reveals a field needs; a field
+    # that is still empty after that is one the walk does not know how to fill, and repeating it only spends
+    # the budget and risks typing into the same box twice.
+    REVEAL_PASSES = 2
+
+    def _fill_revealed(self, ctx: ApplyContext, controls_before: int) -> None:
+        """Fill what this step's own answers brought into being.
+
+        A choice can create a field. Shopee's School list has no RUET, so the walk answers it "Others" —
+        and "Others" reveals a "Please state the full school name" box that did not exist when the step's
+        controls were read, so nothing filled it. Application 293 filled the whole form around that one
+        empty box, pressed Submit against it, and got back neither a confirmation nor an error, which is
+        the least diagnosable way for a form to refuse.
+
+        Keyed on the controls appearing, not on _empty_required: Shopee marks a field required with a red
+        star in the label and leaves the input itself `required=false` with no aria-required, and the star
+        it does draw belongs to the "School" dropdown above rather than to the box its answer revealed — so
+        the required walk cannot see the one field this exists to fill.
+        """
+        page = ctx.page
+        for _ in range(self.REVEAL_PASSES):
+            now = self._application_controls(page, self.scope)
+            if now <= controls_before:
+                return
+            log.info("generic: answering this step revealed %d more control(s); filling them",
+                     now - controls_before)
+            # Re-stamped: a choice can reveal a div-built dropdown as easily as a text box, and an unstamped
+            # one is invisible to both walks below (see common.WIDGET_JS).
+            c.custom_widgets(page, self.scope)
+            self._identity(ctx)
+            self._questions(ctx)
+            controls_before = now
 
     # A question answered by pressing one of a row of buttons ("Yes" "No"), each an ARIA toggle
     # (aria-pressed) rather than a radio. Oracle Recruiting draws its Application Questions this way, and a
@@ -843,7 +908,7 @@ class GenericFormAdapter(Adapter):
             page = ctx.page
         # A challenge page in place of the job (DataDome's slider, a Cloudflare turnstile) has no form and
         # no Apply control; without this it read as "could not find an application form".
-        c.detect_captcha(page)
+        c.detect_captcha(page, allow_inline=True)
         c.detect_bot_block(page)
         # The gate before any form test, not after it. Trying the form first worked for a sign-in page —
         # two controls is plainly not an application — but a create-account page has nine, which reads as a
@@ -860,7 +925,7 @@ class GenericFormAdapter(Adapter):
         if self._adopt_existing_application_page(ctx):
             page = ctx.page
             c.dismiss_cookie_banner(page)
-            c.detect_captcha(page)
+            c.detect_captcha(page, allow_inline=True)
             c.detect_bot_block(page)
             has_opener = self._has_opener(page)
             if self._form_visible(page, c.SHORT if has_opener else FORM_WAIT):
@@ -874,7 +939,7 @@ class GenericFormAdapter(Adapter):
                 page = ctx.page
                 c.require_open(page)
                 self._refuse_known_manual(page)
-                c.detect_captcha(page)
+                c.detect_captcha(page, allow_inline=True)
                 c.detect_bot_block(page)
                 if self._pass_account_gate(ctx):
                     page = ctx.page
@@ -900,6 +965,17 @@ class GenericFormAdapter(Adapter):
             if entered_iframe:
                 return
             if not clicked:
+                # The form check above runs only after a press this method calls successful, and a press
+                # that reports failure is often the one that worked: a control that navigates away detaches
+                # under the click and raises, and the pass after it finds no opener at all — because the
+                # form has replaced the posting. Application 293 pressed Shopee's "Apply Now", landed on its
+                # application form, and walked away from the open form without ever looking at the page
+                # again. Only after an opener was actually pressed, so a page that never had one still goes
+                # straight to the model rather than waiting the full budget twice.
+                if ctx.extra.get("opener_pressed") and (self._form_visible(page, FORM_WAIT)
+                                                        or self._form_in_frame(page)):
+                    log.info("generic: the form was open after all on %s", (page.url or "")[:100])
+                    return
                 break
 
         c.require_open(page)
@@ -934,7 +1010,7 @@ class GenericFormAdapter(Adapter):
             page = ctx.page
             c.require_open(page)
             c.dismiss_cookie_banner(page)
-            c.detect_captcha(page)
+            c.detect_captcha(page, allow_inline=True)
             c.detect_bot_block(page)
             if self._pass_account_gate(ctx):
                 page = ctx.page
@@ -977,6 +1053,31 @@ class GenericFormAdapter(Adapter):
             return tuple(page.context.pages)
         except Exception:
             return ()
+
+    @classmethod
+    def _adopt_surviving_page(cls, ctx: ApplyContext) -> bool:
+        """Carry on in a page that is still open when the step's own page closed under the press.
+
+        Indeed's sign-in (application 303) runs in a popup that shuts itself once the email is accepted and
+        hands back to the tab that opened it; the walk waited on the closed popup and crashed with "Target
+        page, context or browser has been closed". Only a page of the same browser context is taken, newest
+        first, so a window the user really closed (which takes the whole context) still ends the run.
+        """
+        try:
+            if not ctx.page.is_closed():
+                return False
+            alive = [p for p in ctx.page.context.pages if not p.is_closed()]
+        except Exception:  # noqa: BLE001
+            return False
+        if not alive:
+            return False
+        log.info("generic: the step's page closed itself; carrying on in %s", (alive[-1].url or "")[:100])
+        cls._switch_context_page(ctx, alive[-1])
+        try:
+            alive[-1].wait_for_timeout(STEP_SETTLE_MS)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     @classmethod
     def _adopt_page_opened_since(cls, ctx: ApplyContext, pages_before: tuple) -> bool:
@@ -1036,6 +1137,12 @@ class GenericFormAdapter(Adapter):
                         el = found.nth(i)
                         if not c.is_visible_now(el):
                             continue
+                        # A form's own submit is not an opener, least of all a disabled one: Rippling's
+                        # application ends in a greyed "Apply" that stays off until the form is complete, and
+                        # taken for the posting's Apply it made the open form read as a job page (385).
+                        if el.evaluate("e => e.disabled || e.getAttribute('aria-disabled') === 'true'"
+                                       " || (e.type === 'submit' && !!e.closest('form'))"):
+                            continue
                         name = c.clean(el.inner_text() or el.get_attribute("aria-label") or "")
                         if not THIRD_PARTY_RE.search(name):
                             return True
@@ -1076,6 +1183,9 @@ class GenericFormAdapter(Adapter):
                         scope_before = self._detect_scope(page)
                         self._mark_visible_openers(page)
                         ctx.step(f"Pressing '{name[:40] or 'Apply'}'")
+                        # Recorded before the click, not after: a press that navigates detaches its own
+                        # control and raises, and that press is exactly the one _open_form must know about.
+                        ctx.extra["opener_pressed"] = True
                         el.click(timeout=c.MEDIUM)
                         elapsed = 0
                         while elapsed < OPENER_SETTLE_MS:
@@ -1096,9 +1206,16 @@ class GenericFormAdapter(Adapter):
                         # Press whatever apply-named control the click has just revealed.
                         if self._press_revealed_opener(ctx, page, url_before, pages_before):
                             return True
+                        if c.follow_control_href(page, el, url_before):
+                            return True
                         return True
                     except Exception as e:  # noqa: BLE001 - a dead opener is not a reason to give up on the page
                         log.debug("generic: apply control did not click: %s", e)
+                        try:
+                            if c.follow_control_href(page, el, page.url):
+                                return True
+                        except Exception:  # noqa: BLE001
+                            pass
         return False
 
     _SEEN_OPENER = "data-jobbot-opener-seen"
@@ -1212,6 +1329,8 @@ class GenericFormAdapter(Adapter):
         candidate's own details; what a posting has and a form does not is the Apply button.
         """
         try:
+            if any(cls._application_controls(page, d) >= MIN_FIELDS for d in DIALOG_SCOPES):
+                return False    # a form opened over the posting: its Apply is still behind it, and that is fine
             return page.locator(IDENTITY_FIELDS).count() < 2 and cls._has_opener(page)
         except Exception:  # noqa: BLE001
             return False
@@ -1317,8 +1436,16 @@ class GenericFormAdapter(Adapter):
             if not key:
                 continue
             value = ctx.fact(key)
+            if key == "identity.location" and _BARE_CITY_RE.match(label):
+                value = ctx.fact("address.city") or value.split(",")[0].strip()
             if CONFIRM_LABEL_RE.search(label):
-                value = on_page.get(key) or value
+                # What the box it confirms will hold once this pass is done: the page's value, unless that is
+                # the board's CV parse, which the branch below writes facts.yaml over. Copying the parse here
+                # left "Confirm your email" on the CV's address beside the corrected one and SmartRecruiters
+                # bounced every pass with "Provided emails do not match" (ServiceNow, application 345).
+                shown = on_page.get(key) or ""
+                if shown and not (value and not c.same_value(shown, value) and self._from_cv(ctx, shown)):
+                    value = shown
             current = c.current_value(el)
             if key in URL_KEYS and value:
                 self._url_field(ctx, el, label, key, value, current, errors)
@@ -1331,6 +1458,25 @@ class GenericFormAdapter(Adapter):
                     # applications 135-138 did, and the widget answered by resetting itself to +971.
                     continue
                 value = phone_value     # the national part wherever the form holds the code itself
+                try:
+                    cap = int(el.get_attribute("maxlength") or 0)
+                except Exception:  # noqa: BLE001
+                    cap = 0
+                national = ctx.fact("identity.phone_national")
+                held = re.sub(r"\D", "", current or "")
+                if not cap and national and held and held != ours and ours.startswith(held) \
+                        and len(held) >= len(re.sub(r"\D", "", national)):
+                    # No maxlength in the markup, but the box kept only the start of what was typed: a
+                    # script cuts it (Taraki, application 308). Its length is the cap.
+                    cap = len(current)
+                if 0 < cap < len(value) and national and len(national) <= cap:
+                    # The box cannot hold the number as written; the national form says the same thing.
+                    log.info("phone field %r holds at most %d characters; writing the national form %r",
+                             label, cap, national)
+                    value = national
+                    if current and current != value:
+                        c.fill_if_empty(el, value, clear=True)
+                        continue
                 cur_digits = re.sub(r"\D", "", current)
                 if dial and cur_digits.startswith(dial) and cur_digits != re.sub(r"\D", "", value):
                     # The whole international number in the box beside a picker that now holds the code:
@@ -1515,11 +1661,35 @@ class GenericFormAdapter(Adapter):
         that identity fields are recognised by label rather than by this-vendor's ids."""
         page = ctx.page
         handled_groups: set[str] = set()
-        controls = page.locator(self._controls_selector(self.scope, extra=True))
-        for i in range(controls.count()):
-            el = controls.nth(i)
+        # Walked by stamp, not by index. A react-select drops a node when it takes a value, so a count taken
+        # up front then pointed every later index one control too far: one question was skipped and the last
+        # index timed out (Smartcat's Greenhouse form, application 360 — its required authorisation dropdown
+        # went out empty twice). Each turn takes the first control this pass has not stamped yet.
+        token = f"q{time.time_ns()}"
+        base = self._controls_selector(self.scope, extra=True)
+        fresh = ", ".join(f'{part.strip()}:not([data-jobbot-q^="{token}-"])' for part in base.split(","))
+        budget = max(page.locator(base).count() * 3, 30)
+        for i in range(budget):
+            nxt = page.locator(fresh).first
+            try:
+                if not nxt.count():
+                    break
+                # A stamp of its own, and the locator bound to it: `nxt` is lazy, and once stamped it
+                # already means the control after this one.
+                nxt.evaluate(f"e => e.setAttribute('data-jobbot-q', '{token}-{i}')", timeout=c.SHORT)
+            except Exception as e:  # noqa: BLE001
+                log.debug("generic: control walk stopped at %d: %s", i, e)
+                break
+            el = page.locator(f'[data-jobbot-q="{token}-{i}"]').first
             try:
                 typ = (el.get_attribute("type") or "").lower()
+                if c.is_materialize_face(el):
+                    continue        # only displays the hidden <select> beside it, which is answered instead
+                if c.is_materialize_select(el):
+                    label = c.strip_required(c.get_label_for(el))
+                    if label and not c.is_furniture_label(label):
+                        c.answer_and_set(ctx, el, label, "select")
+                    continue
                 if not c.is_visible_now(el) and not (typ in ("radio", "checkbox") and c.drawn_by_label(el)):
                     # A checkbox the page hides and draws with a styled label is invisible to Playwright
                     # and still required -- see common.drawn_by_label. Anything else off screen is
@@ -1592,6 +1762,13 @@ class GenericFormAdapter(Adapter):
         """Ask about one div-built dropdown and set it. `w` is its custom_widgets entry."""
         label = c.strip_required(c.get_label_for(root))
         placeholder = c.clean(w.get("placeholder") or "")
+        # A label read off a wrapper that also holds the widget carries what the widget shows: select2's
+        # aria-labelledby node gave "Salary Expectation - Currency * Select an option", then "... * US Dollar"
+        # once chosen, so each pass cached the same question under a new key (application 336).
+        for shown in (c.clean(w.get("face") or ""), c.clean(w.get("value") or ""), placeholder):
+            if shown and label.endswith(shown) and len(label) > len(shown):
+                label = c.strip_required(label[: -len(shown)].strip())
+        label = re.sub(r"\s*\*\s*$", "", label).strip()
         if not label and placeholder and not c.is_prompt_value(placeholder):
             label = placeholder
         if not label or c.is_furniture_label(label):
@@ -1683,7 +1860,8 @@ class GenericFormAdapter(Adapter):
                     loc = finder()
                     for i in range(min(loc.count(), 4)):
                         el = loc.nth(i)
-                        if c.is_visible_now(el) and el.is_enabled():
+                        if (c.is_visible_now(el) and el.is_enabled() and c.click_reachable(el)
+                                and GenericFormAdapter._inside_form_root(el)):
                             return el
                 except Exception:  # noqa: BLE001
                     continue
@@ -1694,7 +1872,8 @@ class GenericFormAdapter(Adapter):
                 loc = page.locator(sel)
                 for i in range(min(loc.count(), 24)):
                     el = loc.nth(i)
-                    if not c.is_visible_now(el) or not el.is_enabled():
+                    if (not c.is_visible_now(el) or not el.is_enabled() or not c.click_reachable(el)
+                            or not GenericFormAdapter._inside_form_root(el)):
                         continue
                     text = c.clean(el.inner_text() or el.get_attribute("value") or el.get_attribute("aria-label") or "")
                     if (fallback.search(text) and not SUBMIT_FALLBACK_EXCLUDE_RE.search(text)
@@ -1705,6 +1884,21 @@ class GenericFormAdapter(Adapter):
                 continue
         return None
 
+    @staticmethod
+    def _inside_form_root(el) -> bool:
+        """True unless the page has a stamped overlay form (see _stamp_overlay_form) that `el` is outside."""
+        try:
+            # A dialog's own button always counts, and a stamp nobody can see any more (left from an earlier
+            # look at the page) never fences anything: LinkedIn's Easy Apply Next was refused against a stale
+            # one (application 310).
+            return bool(el.evaluate("""e => { const r = document.querySelector('[data-jobbot-form-root]');
+                if (!r || r.contains(e)) return true;
+                if (e.closest('[role=dialog], [aria-modal=true], dialog[open]')) return true;
+                const b = r.getBoundingClientRect();
+                return !(b.width > 0 && b.height > 0); }"""))
+        except Exception:  # noqa: BLE001
+            return True
+
     def _press(self, page, names: tuple[str, ...], fallback: re.Pattern | None = None) -> bool:
         el = self._button(page, names, fallback=fallback)
         if el is None:
@@ -1713,7 +1907,19 @@ class GenericFormAdapter(Adapter):
             el.scroll_into_view_if_needed(timeout=c.SHORT)
         except Exception:  # noqa: BLE001
             pass
-        el.click(timeout=c.MEDIUM)
+        try:
+            el.click(timeout=c.MEDIUM)
+        except Exception as e:  # noqa: BLE001
+            # The click landed and the page is still navigating: Taleo's Save and Continue posts the CV as a
+            # multipart upload, and Playwright's wait for that navigation outran the click timeout, crashing
+            # a step that had in fact been sent (application 305). Anything else is a real failure.
+            if "click action done" not in str(e):
+                raise
+            log.info("generic: the press landed; waiting for the slow navigation it started")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=60000)
+            except Exception:  # noqa: BLE001
+                pass
         return True
 
     @staticmethod
@@ -1744,7 +1950,7 @@ class GenericFormAdapter(Adapter):
             if c.confirm_url(page.url or ""):
                 return True
             body = c.clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
-            return any(t in body for t in c.CONFIRM_TEXTS)
+            return any(t in body for t in c.STRONG_CONFIRM_TEXTS) and c._typeable_count_all_frames(page) < 3   # see common
         except Exception:  # noqa: BLE001
             return False
 
@@ -1944,12 +2150,105 @@ class GenericFormAdapter(Adapter):
         Narrowest first, so a page that does have a <form> is still walked inside it and a stray search box
         in the header stays out of the application.
         """
+        try:
+            page.evaluate("a => { for (const o of document.querySelectorAll('[' + a + ']')) o.removeAttribute(a); }",
+                          cls._OVERLAY_ATTR)
+        except Exception:  # noqa: BLE001
+            pass
+        for scope in DIALOG_SCOPES:
+            try:
+                if (cls._application_controls(page, scope) >= MIN_FIELDS
+                        and page.locator(", ".join(f"{scope} {sel}" for sel in IDENTITY_FIELDS.split(", "))).count()):
+                    return scope
+            except Exception:  # noqa: BLE001
+                continue
+        overlay = cls._stamp_overlay_form(page)
+        if overlay:
+            return overlay
         for scope in cls.SCOPES:
             if cls._application_controls(page, scope) >= MIN_FIELDS:
+                if scope == "form":
+                    return cls._widen_past_form(page) or scope
                 return scope
         # Nothing reached three. A step that gates the application behind an email box and a Next button is
         # still an application form, and is walked inside its own <form> like any other.
         return "form" if cls._gateway_form(page) else None
+
+    # A page whose <form> holds only part of the application. UKG/UltiPro (application 318, MNP) wraps the
+    # contact block and each upload in a <form> of its own and draws everything else — "How did you hear
+    # about this opportunity?", the referral Yes/No, five screening questions as radio groups — in plain
+    # <div>s beside them. Scoped to `form`, the walk filled name and phone, pressed Submit with every question
+    # empty, and the form came back with "Please select one of these options" on each radio.
+    #
+    # So when visible application controls sit outside every form, the scope becomes the smallest element
+    # holding all of them (stamped, like the overlay below). The site's header, navigation, footer and search
+    # are left out of that reckoning, so they do not drag the root up to <body> and are not walked.
+    _WIDE_ATTR = "data-jobbot-wide-root"
+    _WIDE_JS = "(attr) => {" + c.DEEP_JS + c.WIDGET_JS + _JUNK_FORM_JS + r"""
+        for (const old of document.querySelectorAll('[' + attr + ']')) old.removeAttribute(attr);
+        const sel = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]), textarea, select, [role=combobox]';
+        const furniture = 'header, nav, footer, [role=banner], [role=navigation], [role=contentinfo], [role=search], [role=dialog], [aria-modal=true]';
+        const ctl = [...document.querySelectorAll(sel)].filter(e => vis(e) && !e.closest(furniture)
+                                                                && !isJunkForm(e.closest('form')));
+        const outside = ctl.filter(e => !e.closest('form'));
+        if (outside.length < 2 || outside.length === ctl.length) return false;
+        let root = ctl[0].parentElement;
+        while (root && !ctl.every(e => root.contains(e))) root = root.parentElement;
+        if (!root) return false;
+        if (root === document.body || root === document.documentElement) return 'body';
+        root.setAttribute(attr, '1');
+        return true;
+    }"""
+
+    @classmethod
+    def _widen_past_form(cls, page) -> str | None:
+        """The scope to walk instead of `form` when part of the application is drawn outside it, else None."""
+        try:
+            got = page.evaluate(cls._WIDE_JS, cls._WIDE_ATTR)
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: controls outside the form: %s", e)
+            return None
+        if not got:
+            return None
+        scope = "body" if got == "body" else f"[{cls._WIDE_ATTR}]"
+        log.info("generic: the application has questions outside its <form>; walking %r instead", scope)
+        return scope
+
+    _OVERLAY_ATTR = "data-jobbot-form-root"
+    _OVERLAY_JS = r"""(attr) => {
+        for (const old of document.querySelectorAll('[' + attr + ']')) old.removeAttribute(attr);
+        const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const ctl = 'input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select';
+        const who = document.querySelectorAll("input[type=email], input[type=tel], input[name*=email i], "
+            + "input[placeholder*=email i], input[name*=phone i], input[placeholder*='full name' i]");
+        for (const f of who) {
+            if (!vis(f)) continue;
+            for (let p = f.parentElement; p && p !== document.body; p = p.parentElement) {
+                const pos = getComputedStyle(p).position;
+                if (pos !== 'fixed' && pos !== 'sticky') continue;
+                if ([...p.querySelectorAll(ctl)].filter(vis).length < 3) break;
+                p.setAttribute(attr, '1');
+                return true;
+            }
+        }
+        return false;
+    }"""
+
+    @classmethod
+    def _stamp_overlay_form(cls, page) -> str | None:
+        """Scope for a form drawn in a fixed overlay with no dialog role, stamped so CSS can name it.
+
+        Taraki (a Bubble app) opens "Apply for Job" as a position:fixed panel over the job list. Without a
+        role or a <form>, the walk fell back to 'body', and the send button was looked for page-wide: it
+        pressed the list's "Apply" behind the panel, then its "Next page" link (application 308).
+        """
+        try:
+            if page.evaluate(cls._OVERLAY_JS, cls._OVERLAY_ATTR):
+                return f"[{cls._OVERLAY_ATTR}]"
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: overlay form test: %s", e)
+        return None
 
     @staticmethod
     def _text_controls(page, scope: str = "form") -> list:
@@ -2008,6 +2307,11 @@ class GenericFormAdapter(Adapter):
         if not text:
             return None
         if _DIAL_LABEL_RE.search(text):
+            return None
+        if _YES_NO_QUESTION_RE.match(text):
+            # "Are you authorized to work in the selected location without … sponsorship?" names a location
+            # and asks a yes/no question. Read as identity.location, the refill typed "Dhaka, Bangladesh" into
+            # its dropdown on every pass before Submit and cleared the "No" (Smartcat, application 367).
             return None
         for pattern, key in IDENTITY:
             if pattern.search(text):

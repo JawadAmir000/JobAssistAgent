@@ -41,6 +41,8 @@ SETTING_MODEL = "llm_model"                # provider-specific model id (may be 
 SETTING_LOCATIONS = "search_locations"     # comma-separated
 SETTING_HOURS_OLD = "search_hours_old"     # e.g. "72"
 SETTING_CV_PATH = "cv_path"
+SETTING_CV_PATH_AI = "cv_path_ai"         # CV for AI engineering roles (see cv_for_job)
+SETTING_CV_PATH_FDE = "cv_path_fde"       # CV for forward deployed engineer roles
 SETTING_HEADLESS = "browser_headless"      # "0" | "1"
 SETTING_MAIL_USER = "mail_user"            # mailbox to read verification codes from (blank = identity.email)
 SETTING_IMAP_HOST = "imap_host"            # blank = imap.gmail.com
@@ -52,6 +54,8 @@ DEFAULTS = {
     SETTING_LOCATIONS: "Remote, Canada, Australia, United Kingdom, United Arab Emirates, Singapore",
     SETTING_HOURS_OLD: "72",
     SETTING_CV_PATH: "",
+    SETTING_CV_PATH_AI: "/Users/jawadamir/Desktop/Resume/Jawad-AI.pdf",
+    SETTING_CV_PATH_FDE: "/Users/jawadamir/Desktop/Resume/Jawad-FDE.pdf",
     SETTING_HEADLESS: "0",
     SETTING_MAIL_USER: "",
     SETTING_IMAP_HOST: "",
@@ -264,6 +268,26 @@ def save_answers(d: dict[str, str]) -> None:
     what it is: this is the Settings box and the test fixtures, not anything jobbot inferred."""
     from jobbot import answers
     answers.save(answers.from_mapping(d, default_source="human"))
+
+
+# Which CV a job gets, decided on its title. Forward deployed is checked first: "Forward Deployed Engineer,
+# GenAI" is an FDE role that happens to mention AI.
+_FDE_TITLE_RE = re.compile(r"\bforward[\s-]*deploy", re.I)
+_AI_TITLE_RE = re.compile(r"\bA\.?I\b|\bgen\s*ai\b|\bLLMs?\b|\bML\b|machine learning|\bagentic\b|\bNLP\b"
+                          r"|deep learning|artificial intelligence", re.I)
+
+
+def cv_for_job(job: dict | None) -> str:
+    """The CV file to send for this job: the FDE CV for forward deployed roles, the AI CV for AI engineering
+    roles, else the one uploaded in Settings. A role CV that is missing on disk falls back to the Settings one."""
+    title = (job or {}).get("title") or ""
+    key = (SETTING_CV_PATH_FDE if _FDE_TITLE_RE.search(title)
+           else SETTING_CV_PATH_AI if _AI_TITLE_RE.search(title) else "")
+    if key:
+        path = get_setting(key) or ""
+        if path and os.path.exists(path):
+            return path
+    return get_setting(SETTING_CV_PATH) or ""
 
 
 CV_TEXT_MAX = 12000

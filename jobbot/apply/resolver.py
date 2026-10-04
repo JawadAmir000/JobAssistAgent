@@ -61,8 +61,32 @@ _RESIDENCY_STATUS_RE = re.compile(r"\bresidenc(?:y|e)\s+status\b|\bresident\s+st
                                   r"|\bstatus\s+of\s+residenc")
 _JOB_COUNTRY_Q_RE = re.compile(r"country (?:where|in which) the (?:job|position|role) is (?:located|based)"
                                r"|country of the (?:job|position|role)|job location country")
-_AUTH_QUESTION_RE = re.compile(r"\bsponsor|\bauthori[sz]|\bwork permit\b|\bright to work\b|\beligib\w* to work\b|\blegally\b|\bvisa\b"
+_AUTH_QUESTION_RE = re.compile(r"\bsponsor|\bauthori[sz]|\bautori[sz]|\bl[ée]galement\b|\blegalmente\b|\bpermis de travail\b|\bparrainage\b|\bwork permit\b|\bright to work\b|\beligib\w* to work\b|\blegally\b|\bvisa\b"
                                r"|\bwork(?:ing)?\s+rights?\b|\bimmigration\s+status\b|\bpermitted\s+to\s+work\b")
+
+
+_CURRENCY_NAMES = {"USD": "US Dollar", "GBP": "Pound Sterling", "EUR": "Euro", "AUD": "Australian Dollar",
+                   "CAD": "Canadian Dollar", "SGD": "Singapore Dollar", "AED": "UAE Dirham", "THB": "Baht",
+                   "BDT": "Taka", "INR": "Indian Rupee"}
+
+
+MULTI_SEP = " | "
+_MULTI_SELECT_RE = re.compile(r"\b(?:select|check|tick|choose|mark)\s+(?:all|any|every)\b|\ball\s+that\s+apply\b"
+                              r"|\b(?:one or more|multiple)\b.*\b(?:select|choose|option)", re.I)
+
+
+def is_multi_select(question: str, options: list[str] | None) -> bool:
+    """A checkbox list that wants every true option ("Select all that apply"), not one pick."""
+    return bool(options) and len(options) > 2 and bool(_MULTI_SELECT_RE.search(question or ""))
+
+
+def _asks_job_country(key: str) -> bool:
+    """True when the question wants the job's country as its answer. "Are you authorized to work in the country
+    where the job is located?" only points at that country: it is a Yes/No authorisation question, and answering
+    it "Singapore" left OpenAI's form unanswerable (application 329)."""
+    return bool(_JOB_COUNTRY_Q_RE.search(key)) and not _AUTH_QUESTION_RE.search(key)
+
+
 # The same subject asked as an open question ("What are your working rights in Australia?"). The answer is
 # not a word but a statement of the facts, composed from facts.yaml — never from the model, which is not
 # even shown the authorisation block. Yes/No-shaped questions ("Are you authorised to work in…?") stay with
@@ -127,13 +151,15 @@ def fact_key_for(question: str) -> str:
     return ""
 
 
-_YES_WORDS = {"yes", "y", "true"}
+_YES_WORDS = {"yes", "y", "true", "oui", "sí", "si", "ja", "sim"}   # fr/es/de/pt lists (Coveo, application 378)
 
 # The consent gates every board puts in front of a submission. Shape-matched on the first person plus an
 # agreement verb, or on the well-known notice names, so a substantive question that merely mentions
 # "terms" ("Describe the terms of your notice period") is not swept up.
 _CONSENT_RE = re.compile(
     r"^\s*i\s+(?:accept|agree|acknowledge|consent|confirm|certify|declare|understand|have\s+read|authori[sz]e)\b"
+    # "I provide my consent to receiving information…" (Cognizant on Taleo, application 305: mandatory there)
+    r"|^\s*i\s+(?:hereby\s+)?(?:provide|give|grant)\s+(?:my\s+)?consent\b"
     # PDPA-style gates worded as a noun phrase: "Consent to collect, use and disclose your personal data for
     # the purpose of recruiting..." (LINE MAN Wongnai, application 277)
     r"|\bconsent\b.{0,80}\bpersonal\s+(?:data|information)\b|\bpersonal\s+(?:data|information)\b.{0,80}\bconsent\b|\bpdpa\b"
@@ -148,7 +174,7 @@ _CONSENT_RE = re.compile(
 # a statement of fact about the candidate is excluded below and still answered from facts.yaml.
 _OPT_IN_RE = re.compile(
     r"\btalent\s+(?:pool|community|network|bank)\b"
-    r"|\bfuture\s+(?:roles|opportunities|vacancies|positions|openings)\b"
+    r"|\bfuture\s+(?:\w+\s+)?(?:roles|opportunities|vacancies|positions|openings)\b"
     r"|\bkeep\s+(?:me|my\s+\w+|your\s+\w+)\b.{0,30}\bon\s+file\b|\bon\s+file\s+for\b"
     r"|\bmarketing\b|\bnewsletter\b|\bmailing\s+list\b"
     r"|\b(?:receive|send\s+me|notify\s+me|keep\s+me\s+informed)\b.{0,40}"
@@ -158,7 +184,9 @@ _OPT_IN_RE = re.compile(
 # "Tick this box if you do NOT wish to…" — the meaning inverts, so the rule must not fire. Ticking an
 # opt-out is the opposite of what the setting above asks for, and there is no way to tell which from a
 # keyword alone.
-_OPT_OUT_RE = re.compile(r"\bdo\s+not\b|\bdon'?t\b|\bopt\b.{0,12}\bout\b|\bunsubscribe\b"
+# "…from which I can unsubscribe at any time" is the reassurance on an opt-in, not an opt-out (application 305).
+_OPT_OUT_RE = re.compile(r"\bdo\s+not\b|\bdon'?t\b|\bopt\b.{0,12}\bout\b"
+                         r"|(?<!can )(?<!may )\bunsubscribe\b(?!\s+at\s+any\s+time)"
                          r"|\bwithdraw\b|\bobject\s+to\b|\bno\s+longer\b", re.I)
 
 # Statements of fact about the candidate wear the same "I …" shape as a consent but are not one. A box
@@ -171,12 +199,21 @@ _FACTUAL_CLAIM_RE = re.compile(
     r"|\bdate\s+of\s+birth\b|\bsexual\s+orientation\b|\bcurrently\s+employed\b", re.I)
 
 
+# An acknowledgement that closes a notice: "…Proof may include a passport, Landed Immigrant Status, a working
+# visa, etc. I understand the statement given:" (Accenture, application 382). What is being said is "I
+# understand", not anything about a visa, so the factual-claim screen does not apply to it.
+_ACK_TAIL_RE = re.compile(r"\bi\s+(?:understand|acknowledge|have\s+read(?:\s+and\s+understood)?|confirm\s+i\s+have\s+read)"
+                          r"\s+(?:the\s+|this\s+)?(?:above|statement|information|notice|terms)(?:\s+\w+){0,3}\s*$", re.I)
+
+
 def is_agreeable(key: str) -> bool:
     """True for a tickbox jobbot may agree to on the user's behalf without asking."""
+    if key and _ACK_TAIL_RE.search(key) and not _OPT_OUT_RE.search(key):
+        return True
     if not key or _OPT_OUT_RE.search(key) or _FACTUAL_CLAIM_RE.search(key):
         return False
     return bool(_CONSENT_RE.search(key) or _OPT_IN_RE.search(key))
-_NO_WORDS = {"no", "n", "false"}
+_NO_WORDS = {"no", "n", "false", "non", "nein", "não", "nao", "nee"}
 
 _LLM_TERMS = ("llm", "large language", "genai", "gen ai", "generative", "ai", "machine learning", "ml",
               "agent", "claude", "gpt", "openai", "anthropic", "prompt", "rag", "nlp", "deep learning")
@@ -184,7 +221,8 @@ _LLM_TERMS = ("llm", "large language", "genai", "gen ai", "generative", "ai", "m
 # Sponsorship questions scoped to where the candidate already lives ("…to work in the country you are based").
 _HOME_COUNTRY_SCOPE = re.compile(
     r"country (?:in which |where )?you (?:are |re )?(?:currently )?(?:based|located|reside|residing|live|living)"
-    r"|country of residence|your current country|where you (?:currently )?(?:live|reside)")
+    r"|country of residence|your current country|where you (?:currently )?(?:live|reside)"
+    r"|pays (?:où|ou|dans lequel) vous (?:r[ée]sidez|habitez|vivez)|pays de r[ée]sidence|pa[ií]s (?:donde|en el que) (?:resides|reside|vives|vive)")
 
 # "How did you hear about us?" — the application-source question. Always answered from
 # preferences.job_source, never asked, because the answer never varies between applications.
@@ -682,6 +720,37 @@ class Resolver:
                 self.learn(question, src, source="rule", kind=kind)
                 return src
 
+        # (0.3) A salutation: "Title" offering Mr / Mrs / Ms / Mx / Doctor (Nationwide's Oracle form, application
+        # 314, where a row of buttons ended on "Mx."). The cache's "Title" is a job title from another form, so
+        # this goes ahead of it, and only fires when the options themselves are honorifics.
+        hon = [o for o in (options or []) if re.match(r"^\s*(?:mr|mrs|miss|ms|mx|dr|doctor|prof)\.?\s*$", o, re.I)]
+        if options and len(hon) >= 3 and re.search(r"\b(?:title|salutation|prefix|honorific)\b", key):
+            g = str((self.fact("eeo", {}) or {}).get("gender") or "").lower()
+            want = "mr" if g in ("male", "man", "m") else "ms" if g in ("female", "woman", "f") else ""
+            for o in hon:
+                if want and re.sub(r"[^a-z]", "", o.lower()) == want:
+                    return o
+
+        # (0.35) "The type of visa you hold" / "The expiry date of your current visa" (Nationwide, application
+        # 314): about a visa the candidate holds for the job's country. The facts say there is none there, and
+        # a paragraph about citizenship is not a visa type or a date — the form refused both.
+        if re.search(r"\b(?:type|kind|category)\s+of\s+visa\b|\bvisa\s+(?:type|category|expiry|expiration|end)\b"
+                     r"|\b(?:expiry|expiration|end)\s+date\s+of\s+(?:your\s+)?(?:current\s+)?visa\b", key) \
+                and not options and self._authorized_here(key) is False:
+            return "N/A" if re.search(r"expir|end\s+date|date", key) else "None - I do not currently hold a visa for this country"
+
+        # (0.4) "Is the salary you've entered based on full time or part time" (Nationwide, application 314):
+        # the word "salary" made it protected, but it asks the work pattern, which the facts state.
+        if re.search(r"\bfull[\s-]*time\b.{0,20}\bpart[\s-]*time\b|\bpart[\s-]*time\b.{0,20}\bfull[\s-]*time\b", key):
+            pattern = self.fact_str("preferences.employment_type")
+            if pattern:
+                if not options:
+                    return pattern
+                want = "full" if re.search(r"full", pattern, re.I) else "part"
+                for o in options:
+                    if re.search(rf"\b{want}[\s-]*time\b", o, re.I):
+                        return o
+
         # (0.5) Protected questions, decided before the cache is even consulted. This ordering is the whole
         # point: the EEO gate used to sit below the cache, so an "ethnicity" scraped off an untouched
         # dropdown answered a real EEO question, and a plain Yes/No "right to work in Australia" was served
@@ -789,7 +858,7 @@ class Resolver:
         # the first level is a country list, and it is the job's country, not the candidate's -- AIA's form
         # was searched for "Bangladesh" (application 283). The second level, the eligibility sentences,
         # falls through to the authorisation rules below.
-        if _JOB_COUNTRY_Q_RE.search(key):
+        if _asks_job_country(key):
             country = self._job_country()
             if country:
                 if not options:
@@ -824,6 +893,9 @@ class Resolver:
         elif self.is_eeo(question):
             stopped = f"Your answer needed: {question}"
             stated = self._eeo_answer(key)
+            if stated and not options and stated.strip().lower() in _NO_WORDS and "disabilit" in key \
+                    and re.search(r"\b(?:categor|type|kind|nature)", key):
+                stated = "Not applicable"   # a category of a disability the candidate does not have
             if stated:
                 mapped = self._map_eeo_to_options(key, stated, options) if options else stated
                 if mapped is not None:
@@ -978,6 +1050,34 @@ class Resolver:
         name = canonical(m.group(1).strip())
         return name.title() if name else ""
 
+    _DEMONYMS = {"u s": "united states", "us": "united states", "american": "united states", "british": "united kingdom",
+                 "u k": "united kingdom", "uk": "united kingdom", "irish": "ireland", "indian": "india",
+                 "new zealand": "new zealand", "emirati": "united arab emirates", "singaporean": "singapore",
+                 "german": "germany", "french": "france", "dutch": "netherlands", "bangladeshi": "bangladesh",
+                 "eu": "european union", "european": "european union"}
+
+    @classmethod
+    def _citizenship_named(cls, key: str) -> str:
+        """The country a citizenship question names ("u s citizen", "citizen of canada"), canonical, or ''."""
+        try:
+            from jobbot.discovery.location import canonical
+        except Exception:  # noqa: BLE001
+            return ""
+        cands: list[str] = []
+        m = re.search(r"\b(?:citizen(?:ship)?|permanent\s+resident)\s+of\s+(?:the\s+)?([a-z][a-z ]{1,30})", key)
+        if m:
+            words = m.group(1).split()
+            cands += [" ".join(words[:n]) for n in (3, 2, 1)]
+        m = re.search(r"([a-z][a-z ]{0,40}?)\s*\b(?:citizen|permanent\s+resident)", key)
+        if m:
+            words = m.group(1).split()
+            cands += [" ".join(words[-n:]) for n in (3, 2, 1) if len(words) >= n]
+        for cand in cands:
+            name = cls._DEMONYMS.get(cand) or canonical(cand)
+            if name:
+                return name
+        return ""
+
     def _job_country(self) -> str:
         """The country the job is in, '' when it does not say (a remote posting)."""
         try:
@@ -1016,6 +1116,18 @@ class Resolver:
         """Map a stated self-identification onto this form's wording. None when nothing matches safely."""
         if not options:
             return value or None
+        if normalize_question(value) == "neither":
+            # Northern Ireland's community list words "neither" as "Code 1.C - I am not a member of either …".
+            hit = next((o for o in options if re.search(r"\bneither\b|\bnot a member of either\b", str(o), re.I)), None)
+            if hit is not None:
+                return hit
+        if "ethnic" in key or "race" in key:
+            # The specific sub-group first: a UK list ("Asian or Asian British - Indian / - Bangladeshi / …")
+            # names the stated "Asian" in every row, and the generic match took the first of them — Indian
+            # (application 314). The facts say which one is true (eeo.race_ethnicity_alternatives).
+            picked = self._pick_ethnic_alternative(options)
+            if picked is not None:
+                return picked
         generic = self._map_to_options(value, options)
         if generic is not None:
             return generic
@@ -1026,6 +1138,26 @@ class Resolver:
             is_hl = "hispanic" in vl or "latino" in vl
             return self._pick_eeo_polarity(options, affirmative=is_hl)
 
+        if "community background" in key:
+            for o in options:
+                if re.search(rf"\b{re.escape(vl)}\b", o, re.I) and not _is_decline_option(o):
+                    return o
+            return None
+
+        if "earner" in key:
+            for o in options:
+                if re.search(rf"\b{re.escape(vl)}\b", o, re.I) and not _is_decline_option(o):
+                    return o
+            return None
+
+        if "sexual" in key or "sexuality" in key:
+            # Lists combine the words ("Heterosexual/Straight", "Straight (heterosexual)") or use either one.
+            if re.search(r"hetero|straight", vl):
+                for o in options:
+                    if re.search(r"\bhetero\w*|\bstraight\b", o, re.I) and not _is_decline_option(o):
+                        return o
+            return None
+
         if "gender" in key or "sex " in key:
             for canon, names in self._GENDER_SYNONYMS.items():
                 if vl in names:
@@ -1034,6 +1166,12 @@ class Resolver:
                             return o
             return None
 
+        # "Category (disability category)" when there is no disability: the list's own "not applicable".
+        if vl in _NO_WORDS and "disabilit" in key and re.search(r"\b(?:categor|type|kind|nature)", key):
+            for o in options:
+                if re.search(r"\bnot\s+applicable\b|^\s*n/?a\b|^\s*none\b|\bno\s+disabilit", o, re.I):
+                    return o
+
         # veteran / disability: the stated value is yes or no, the options are sentences
         if vl in _YES_WORDS or vl in _NO_WORDS:
             return self._pick_eeo_polarity(options, affirmative=vl in _YES_WORDS)
@@ -1041,8 +1179,20 @@ class Resolver:
         # (Thailand)" (Lumentum, application 285) -- names no group the stated "Asian" could be; its own
         # "Others" is then the one true entry. Only when nothing above matched, and only for ethnicity.
         if "ethnic" in key or "race" in key:
+            # A list that splits the stated group up names the candidate's own sub-group somewhere; the
+            # facts say which, most specific first (eeo.race_ethnicity_alternatives).
             for o in options:
                 if _OTHER_OPTION_RE.match(re.sub(r"\s*\([^)]*\)\s*$", "", str(o).strip())):
+                    return o
+        return None
+
+    def _pick_ethnic_alternative(self, options: list[str]) -> str | None:
+        """The option naming the candidate's own sub-group, most specific first; None when none does."""
+        alts = (self.fact("eeo", {}) or {}).get("race_ethnicity_alternatives") or []
+        for alt in alts:
+            pat = re.compile(r"(?<![\w-])" + re.escape(str(alt)) + r"(?![\w-])", re.I)
+            for o in options:
+                if not _is_decline_option(o) and pat.search(str(o)):
                     return o
         return None
 
@@ -1075,8 +1225,27 @@ class Resolver:
             return str(eeo.get("veteran_status") or "").strip()
         if has("disabilit", "disabled"):
             return str(eeo.get("disability_status") or "").strip()
+        # Ahead of religion: Kainos words it "Regardless of whether they actually practice a particular
+        # religion ... Protestant or Roman Catholic communities", and the religion rule answered "Muslim",
+        # which is on no such list (application 361).
+        if has("community background") or (has("protestant") and has("catholic")):
+            # Northern Ireland's monitoring question: Protestant, Roman Catholic or neither — read off religion.
+            rel = str(eeo.get("religion") or "").strip().lower()
+            if not rel:
+                return ""
+            if re.search(r"catholic", rel):
+                return "Roman Catholic"
+            if re.search(r"protestant|anglican|presbyterian|methodist|church of ireland|baptist", rel):
+                return "Protestant"
+            return "Neither"
         if has("religion", "religious", "faith"):
             return str(eeo.get("religion") or "").strip()
+        if has("marital", "civil partnership"):
+            return str(eeo.get("marital_status") or "").strip()
+        if has("sexual orientation", "sexuality"):
+            return str(eeo.get("sexual_orientation") or "").strip()
+        if has("household earner", "main earner", "highest earner"):
+            return str(eeo.get("household_earner_at_14") or "").strip()
         if has("race", "ethnic", "hispanic", "latino"):
             return str(eeo.get("race_ethnicity") or "").strip()
         # Pronouns are their own fact, never read off gender: "Male" is not an option on a pronoun list
@@ -1118,12 +1287,32 @@ class Resolver:
         mapped = self._map_to_options(value, options)
         if mapped is not None:
             return mapped
+        if normalize_question(value) == "neither":
+            hit = next((o for o in options if re.search(r"\bneither\b|\bnot a member of either\b|\bnone of (?:these|the above)\b",
+                                                         str(o), re.I)), None)
+            if hit is not None:
+                return hit
         for alt in self._alternatives_for(key):
             mapped = self._map_to_options(alt, options)
             if mapped is not None:
                 log.info("%r is not on this form's list; taking %r, which facts.yaml allows instead",
                          value, mapped)
                 return mapped
+        if _DEGREE_LEVEL_KEY_RE.search(key or "") and "classification" not in (key or ""):
+            # A list of bare abbreviations ("BS", "BA", "MS", "B.Arch") matches none of the spelled-out
+            # wordings: F5's "Degree" list stopped to ask for a B.Sc. (application 348). Compare letters only,
+            # and take the abbreviation a wording carries in brackets: "Bachelor of Science (B.S)" -> "bs".
+            def compact(x: str) -> str:
+                return re.sub(r"[^a-z]", "", str(x).lower())
+            wanted: list[str] = []
+            for w in [value, *self._alternatives_for(key)]:
+                wanted.append(compact(w))
+                wanted += [compact(m) for m in re.findall(r"\(([^)]+)\)", str(w))]
+            for w in [w for w in wanted if w]:
+                hit = next((o for o in options if compact(o) == w), None)
+                if hit is not None:
+                    log.info("%r is not on this form's list; taking the abbreviation %r", value, hit)
+                    return hit
         if _OTHER_OK_KEY_RE.search(key or "") or _FIELD_OF_STUDY_KEY_RE.search(key or ""):
             other = next((o for o in options if _OTHER_OPTION_RE.match(str(o).strip())), None)
             if other is not None:
@@ -1156,7 +1345,9 @@ class Resolver:
                 return o
         # A numbered list ("5 - Bachelors") and a degree named by its level: AGF's Workday "Degree" list did
         # not match "Bachelor's Degree" and stopped to ask (application 251).
-        unnum = {re.sub(r"^\s*\d+\s*[-.):]?\s*", "", normalize_question(o)): o for o in options}
+        # Also a monitoring code in front ("Code 2.A Male", "Code 1.C - I am not…", Kainos, application 361).
+        unnum = {re.sub(r"^\s*(?:code\s+\d+\s*[a-z]?\s*[-.):]?\s*|\d+\s*[-.):]?\s*)", "", normalize_question(o)): o
+                 for o in options}
         if nv in unnum:
             return unnum[nv]
         level = re.search(r"\b(bachelor|master|doctor|phd|associate|diploma)", nv)
@@ -1217,7 +1408,7 @@ class Resolver:
         # --- the job's country, not the candidate's ---
         # "Select the name of the country where the job is located..." (AIA's Workday, application 283) fell
         # to the identity rule below and was searched for Bangladesh. Ahead of everything else on purpose.
-        if _JOB_COUNTRY_Q_RE.search(key):
+        if _asks_job_country(key):
             country = self._job_country()
             if country:
                 return country
@@ -1225,11 +1416,26 @@ class Resolver:
         # --- legal age ---
         # "Are you over the age of 18?" -- facts.yaml keeps no date of birth, only identity.over_18 (derived from
         # the education dates). AGF's Workday stopped to ask it (application 251).
-        if re.search(r"\b(?:over|at least|older than)\s+(?:the\s+)?(?:age\s+of\s+)?(?:18|eighteen|21|twenty one)\b"
-                     r"|\b(?:18|21)\s+years?\s+(?:of\s+age|old)\s+or\s+older\b|\blegal\s+(?:working\s+)?age\b", key):
+        # Any minimum age up to 18 is the same fact: "Are you at least 16 years of age?" (Avanade, application
+        # 377) stopped to ask. Above 18 over_18 proves nothing, so 21 is only answered when over_18 is false.
+        age = re.search(r"\b(?:over|at least|older than)\s+(?:the\s+)?(?:age\s+of\s+)?(\d{2}|eighteen|sixteen|twenty one)\b"
+                        r"|\b(\d{2})\s+years?\s+(?:of\s+age|old)\s+or\s+older\b", key)
+        if age or re.search(r"\blegal\s+(?:working\s+)?age\b", key):
             over = self.fact("identity.over_18", None)
-            if over is not None:
+            word = (age.group(1) or age.group(2)) if age else "18"
+            n = {"eighteen": 18, "sixteen": 16, "twenty one": 21}.get(word) or int(word)
+            if over is not None and (n <= 18 or not over):
                 return "Yes" if over else "No"
+            if over and n <= 21 and self.fact("education.start_year", None):
+                return "Yes"     # a degree started in 2015 puts the candidate well past 21 (see identity.over_18)
+
+        # Ahead of the education dates below: "present you with all relevant opportunities" read as an end date.
+        if has(" stem ", "stem degree", "stem field", "stem subject"):
+            # "Please indicate if you have a STEM degree?" (Avanade, application 377): a fact read off the
+            # field of study, which facts.yaml states.
+            field = f("education.field_of_study").lower()
+            if field:
+                return "Yes" if re.search(r"comput|engineer|science|math|statist|physic|chemi|biolog|technolog", field) else "No"
 
         # --- the date of signing ---
         # "Today's date" beside a signature box. The model answered "2026-02-01" on 2026-09-29 and the cache
@@ -1267,6 +1473,14 @@ class Resolver:
                     r"|germany|france|netherlands|ireland|japan|uae|united arab emirates|saudi arabia|qatar)\b", key):
                 return "No"
 
+        # "Please only select 'yes' to this question if you are NOT a British Citizen." (Nationwide, application
+        # 314) — the negation flips the usual citizenship question; the answer is a fact about citizenship.
+        m = re.search(r"\b(?:you\s+are|are\s+you)\s+not\s+an?\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:citizen|national)\b", key)
+        if cit and m:
+            named, own = m.group(1).lower(), cit.lower()
+            is_mine = named.startswith(own[:6]) or own.startswith(named[:6])
+            return "No" if is_mine else "Yes"
+
         # --- work authorization (facts only; NEVER guess) ---
         if has("sponsor"):
             req = auth.get("requires_sponsorship")
@@ -1277,12 +1491,22 @@ class Resolver:
                 home = f("identity.country").lower()
                 countries = [str(x).lower() for x in (auth.get("authorized_countries") or [])]
                 citizenship = str(auth.get("citizenship") or "").lower()
-                if home and (home in countries or home == citizenship):
-                    return "No"
+                if not (home and (home in countries or home == citizenship)):
+                    return None
+                needs = False
+            elif req is None:
                 return None
-            if req is None:
-                return None
-            return "Yes" if bool(req) else "No"
+            else:
+                # A job (or a question) in a country the candidate may already work in needs no sponsorship there.
+                needs = False if self._authorized_here(key) is True else bool(req)
+            if re.search(r"\b(?:without|no need (?:for|of)|not (?:need|require))\b[^?]*\bsponsor", key):
+                # The question turned round: "Are you authorized to work ... WITHOUT current or future need for
+                # visa sponsorship?" is answered Yes only by someone who needs none. The plain rule answered it
+                # as "Do you need sponsorship?" — "Yes" for a candidate who does (Smartcat, application 356;
+                # SolveAI, hedgehog lab and Nutrient went out that way), and "No" for the home-country form of
+                # it (SecurityScorecard). Both false.
+                return "No" if needs else "Yes"
+            return "Yes" if needs else "No"
         # "Do you require a visa to work in the location you are applying to?" (AIA's Workday, application
         # 283): "visa" makes the question protected, and nothing here answered it. The candidate's side of the
         # sponsorship fact: no visa where they may already work, one everywhere else.
@@ -1290,7 +1514,14 @@ class Resolver:
             here = self._authorized_here(key)
             if here is not None:
                 return "No" if here else "Yes"
-        if has("authoriz", "authoris", "legally", "right to work", "eligible to work", "work permit", "permitted to work"):
+        if has("authoriz", "authoris", "legally", "right to work", "eligible to work", "work permit", "permitted to work",
+               "autoris", "autoriz", "légalement", "legalmente", "permis de travail"):
+            if _HOME_COUNTRY_SCOPE.search(key) and not has("sponsor", "parrainage", "patrocinio"):
+                # The candidate's own country of residence: authorised there if it is on the list.
+                home = f("identity.country").lower()
+                countries = [str(c).lower() for c in (auth.get("authorized_countries") or [])]
+                if home:
+                    return "Yes" if home in countries or home == str(auth.get("citizenship") or "").lower() else "No"
             countries = [str(c).lower() for c in (auth.get("authorized_countries") or [])]
             # A country named anywhere, not only after "in"/"for": "authorized under UK laws to work for Janus
             # Henderson" put the employer after "for" and the country before it (application 239).
@@ -1318,8 +1549,25 @@ class Resolver:
                 return "No"
             # no country recognised: only answer if the list is empty (then definitely No)
             return "No" if not countries else None
+        if has("permanent resident") and not has("citizen"):
+            # "Are you currently an Australian Permanent Resident?" (Avanade, application 377): the candidate
+            # holds that status only for a country they are citizens of or authorised in.
+            named = self._citizenship_named(key)
+            if named:
+                from jobbot.discovery.location import canonical
+                mine = {canonical(str(x).lower()) or str(x).lower()
+                        for x in [auth.get("citizenship"), *(auth.get("authorized_countries") or [])] if x}
+                return "Yes" if named in mine else "No"
         if has("citizen"):
             cit = str(auth.get("citizenship") or "").strip()
+            # "U.S. citizen" / "Citizen of Canada?" as a Yes/No: the question names a country, so the answer is
+            # whether that is the candidate's own, not the citizenship itself — "Bangladesh" matched neither
+            # button and Databricks stopped to ask (application 331).
+            named = self._citizenship_named(key)
+            if cit and named:
+                from jobbot.discovery.location import canonical
+                own = canonical(cit.lower()) or cit.lower()
+                return "Yes" if named == own else "No"
             return cit or None
         # "…eligible for Security Clearance, meaning you have lived in the UK for the past 5 years
         # continuously. Can you confirm this applies to you?" -- a residency test, and facts.yaml says where the
@@ -1412,7 +1660,12 @@ class Resolver:
             return f("address.street") or None
         if has("country"):
             return f("identity.country") or None
-        if has("city", " location", "where are you based", "where do you live", "where are you located", "reside"):
+        # "Preferred Location" / "Which office would you prefer" asks which of the employer's sites, not
+        # where the candidate lives: Nationwide's list held only "Head Office - Swindon", and the home
+        # address replaced it as the answer (application 314).
+        if has("prefer", "work location", "office location", "which office", "which site", "relocat"):
+            pass
+        elif has("city", " location", "where are you based", "where do you live", "where are you located", "reside"):
             return f("identity.location") or None
 
         # --- work ---
@@ -1501,6 +1754,12 @@ class Resolver:
                     return str(level)
 
         # --- preferences ---
+        # "Salary Expectation - Currency" is a currency list, not a salary: the salary rule below answered it
+        # "Negotiable", which no currency list offers, and Lenovo's form stopped to ask (application 336).
+        if has("currency") and not has("amount", "figure", "how much"):
+            cur = f("preferences.salary_currency")
+            if cur:
+                return _CURRENCY_NAMES.get(cur.upper(), cur)
         if has("salary", "compensation", "pay expectation", "expected pay", "rate expectation"):
             sal = f("preferences.salary_min")
             if sal:
@@ -1541,6 +1800,7 @@ class Resolver:
         # Arabic?") is below the fuzzy threshold, so the model is the only thing that can recognise it — and
         # it can only do that if the relevant pair is actually in front of it.
         prior = self._relevant_prior(normalize_question(question))
+        multi = is_multi_select(question, options)
         prompt = (
             "You are completing a job application form on the candidate's behalf. Answer as the candidate, "
             "truthfully, using only the CV and facts below.\n\n"
@@ -1555,7 +1815,9 @@ class Resolver:
               "never explain what you would need; nobody reads this except the employer.\n"
               "- If one of the previously answered questions asks the same thing in different words, reply "
               "with that same answer. The candidate already told you; do not ask them twice.\n"
-              "- When options are given, reply with exactly one option, verbatim, and always pick one: "
+            + ("- This question accepts several options: reply with EVERY option that is true for this "
+               "candidate, each verbatim on its own line, and nothing else.\n" if multi else "")
+            + "- When options are given, reply with exactly one option, verbatim, and always pick one: "
               "UNKNOWN is never a valid reply to a list. Choose the option that is most accurate for this "
               "candidate.\n"
               "- Yes/No questions about skills, tools or experience: answer Yes when the CV shows that "
@@ -1588,7 +1850,7 @@ class Resolver:
         try:
             # Free text needs room: 120 tokens cut essay answers off mid-sentence ("…architectures that"),
             # and a truncated answer goes onto a real application. Option picks stay cheap.
-            budget = 60 if options else 600
+            budget = (250 if multi else 60) if options else 600
             reply = complete(prompt, purpose="answer", job_id=self.job.get("id"), max_tokens=budget)
         except RuntimeError as e:
             log.info("LLM unavailable, needs human: %s", e)
@@ -1597,6 +1859,17 @@ class Resolver:
             log.warning("LLM answer failed: %s", e)
             return None
         reply = (reply or "").strip().strip('"').strip()
+        if multi and reply:
+            # "Select all examples of AI automation you have used" (Smartcat, application 356): the model named
+            # three options on three lines, the first-line rule below kept a fragment, and the run stopped.
+            picked = []
+            for line in re.split(r"[\n;|]+", reply):
+                line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip().strip('"').rstrip(".")
+                hit = self._map_to_options(line, options) if line else None
+                if hit and hit not in picked and not _is_non_answer(hit):
+                    picked.append(hit)
+            if picked:
+                return MULTI_SEP.join(picked)
         if options:
             # An option pick is one line; anything after it is the model talking to itself.
             reply = reply.splitlines()[0].strip().strip('"').strip("'").rstrip(".") if reply else ""
