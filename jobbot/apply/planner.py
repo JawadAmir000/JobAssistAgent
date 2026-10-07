@@ -157,6 +157,23 @@ def _settled_snapshot(page: Any) -> dict:
     return snap
 
 
+# A step's own forward button, by its whole name: "Review Accommodations for Disability" matched a bare
+# "review" and took a Siemens run to the accommodation-request form (application 438).
+_FORWARD_STEP_RE = re.compile(r"^\s*(?:next(?:\s+step)?|continue|proceed|save\s*(?:and|&)\s*(?:continue|next|proceed)"
+                              r"|save|register|create\s+(?:my\s+)?profile|submit(?:\s+(?:my\s+)?application)?)\s*[>›»→]*\s*$",
+                              re.I)
+
+
+def c_controls(page) -> list:
+    return navigator.controls(page)
+
+
+_ACCOUNT_STEP_RE = re.compile(r"^\s*(?:proceed to |continue to )?(?:create (?:an |my |your )?account|sign ?up|register"
+                              r"|create profile|new (?:user|candidate)|i'?m new|get started"
+                              # "Account Already Exists ... Click Sign In" (EY's SuccessFactors, application 431)
+                              r"|sign ?in|log ?in)\s*$", re.I)
+
+
 # ---------- classify ----------
 def _classify(ctx: ApplyContext, snap: dict, goal: str) -> dict | None:
     sig = snap.get("signals") or {}
@@ -166,10 +183,17 @@ def _classify(ctx: ApplyContext, snap: dict, goal: str) -> dict | None:
                        ("verification_code", "verification_code"), ("account_gate", "account")):
         if sig.get(name):
             return {"kind": kind, "source": "signal", "reason": str(sig[name])[:160]}
+    # 1b. An optional account upsell ("Set Up Password" / "Skip for now"): skipped, never filled in.
+    if c.UPSELL_PAGE_RE.search(snap.get("text") or ""):
+        skip = next((ctl["name"] for ctl in snap["controls"] if c.SKIP_CONTROL_RE.match(ctl["name"])), None)
+        if skip:
+            return {"kind": "press", "press": skip, "source": "rule", "reason": "optional account prompt; skipping it"}
     # 2. Memory. A site step carries the control that moved it on last time, which must still be on the page.
     mem = playbook.recall(snap)
     if mem:
-        if mem["kind"] == "press":
+        if mem["kind"] == "press" and c.COOKIE_CONTROL_RE.search(mem.get("action", "")):
+            log.info("planner: ignoring a remembered cookie-banner press %r", mem.get("action"))
+        elif mem["kind"] == "press":
             name = mem.get("action", "")
             if any(ctl["name"].lower() == name.lower() for ctl in snap["controls"]):
                 return {"kind": "press", "press": name, "source": "memory", "reason": "pressed here before"}
@@ -214,7 +238,10 @@ def _ask_model(ctx: ApplyContext, snap: dict, goal: str) -> dict | None:
     except Exception as e:  # noqa: BLE001
         log.debug("planner: no llm: %s", e)
         return None
-    menu = "\n".join(f'{o["i"]}. {o["name"]} ({o["tag"]})' for o in snap["controls"]) or "(none)"
+    # A cookie banner's buttons never move an application on, and offered to the model they were picked
+    # over a page's own "Skip for now" (application 413), so they are not offered at all.
+    menu = "\n".join(f'{o["i"]}. {o["name"]} ({o["tag"]})' for o in snap["controls"]
+                     if not c.COOKIE_CONTROL_RE.search(o["name"])) or "(none)"
     kinds = "\n".join(f"- {k}: {v}" for k, v in KINDS.items())
     prompt = (
         "You are the eyes of a browser automation that applies to jobs for a candidate. It filled what it "
@@ -314,6 +341,17 @@ def _act(ctx: ApplyContext, before: dict, verdict: dict, fill: Callable[[], None
     if kind == "account":
         if account.pass_gate(ctx, fill or (lambda: None)):
             return "moved"
+        # An account page that is only a doorway: Amazon's "Looks like you're new here" offers one button,
+        # "Proceed to create account", and the sign-up form is behind it (application 414, seen 6 times).
+        # Pressed like any step; the form it opens is then an ordinary account gate.
+        step = press or next((ctl["name"] for ctl in before.get("controls") or []
+                              if _ACCOUNT_STEP_RE.search(ctl["name"])), None)
+        # Twice per button: the page behind a doorway can send the run back to it once (EY's "Account Already
+        # Exists -> Sign In" after a signup, application 431); a third time is a loop.
+        presses = int(ctx.extra.get(f"account_step:{step}") or 0)
+        if step and presses < 2 and _press(ctx, before, step):
+            ctx.extra[f"account_step:{step}"] = presses + 1
+            return "moved"
         raise NeedsHuman("This employer wants you to sign in or create an account here, in a shape jobbot "
                          "does not recognise yet. Do it in the open window, then click Continue — the "
                          "application carries on from there.")
@@ -351,8 +389,25 @@ def _act(ctx: ApplyContext, before: dict, verdict: dict, fill: Callable[[], None
         if press and _press(ctx, before, press):
             return "moved"
         empty = _required_empty(page)
+        if not empty and not ctx.extra.get("planner_forward_pressed"):
+            # Filled, nothing required left empty, and still here: the step's own forward button has a name
+            # the walker does not look for (Siemens' Avature profile, application 438). Pressed once per run.
+            fwd = [ctl["name"] for ctl in c_controls(page) if _FORWARD_STEP_RE.match(ctl["name"])]
+            if fwd:
+                ctx.extra["planner_forward_pressed"] = True
+                log.info("planner: nothing required is empty; pressing %r to move the step on", fwd[-1])
+                if _press(ctx, before, fwd[-1]):
+                    return "moved"
         if empty:
             log.info("planner: required and still empty on this step: %s", empty)
+            try:
+                # The markup of a step jobbot could not fill, for working out why (the screenshot shows only
+                # the top of the page): data/screenshots/last-unfilled-step.html.
+                import pathlib as _pl
+                (_pl.Path(__file__).resolve().parents[2] / "data" / "screenshots" / "last-unfilled-step.html").write_text(
+                    page.content())
+            except Exception:  # noqa: BLE001
+                pass
         raise NeedsHuman(f"This step has something jobbot could not fill ({reason or 'an unusual control'})"
                          + (f" — still empty: {', '.join(empty[:5])}" if empty else "")
                          + ". Complete it in the open window, then click Continue.")
@@ -416,16 +471,36 @@ def _press(ctx: ApplyContext, before: dict, name: str) -> bool:
         log.info("planner: %r is not on the page to press", name)
         return False
     ctx.extra["planner_presses"] = spent + 1
+    job_url = str(ctx.job.get("url") or "")
     try:
         el = page.locator(f'[{navigator._MARK}="{target["i"]}"]').first
+        if c.other_job(job_url, c.control_href(el)):
+            log.info("planner: not pressing %r — it applies to a different job", name)
+            return False
         ctx.step(f"Pressing '{name[:40]}'")
         el.scroll_into_view_if_needed(timeout=c.SHORT)
-        el.click(timeout=c.MEDIUM)
-        page.wait_for_timeout(SETTLE_MS)
+        # A press that opens the OS file picker wants the CV: Eightfold's profile builder offers "Upload your
+        # resume" as its way on (GlobalFoundries, application 402). Unanswered, the picker swallowed the press
+        # and the page never moved. The handler answers it with the CV this job was given.
+        chose: list = []
+
+        def _choose(chooser) -> None:
+            if ctx.cv_path:
+                chooser.set_files(ctx.cv_path)
+                chose.append(chooser)
+        page.on("filechooser", _choose)
+        try:
+            el.click(timeout=c.MEDIUM)
+            page.wait_for_timeout(SETTLE_MS)
+        finally:
+            page.remove_listener("filechooser", _choose)
+        if chose:
+            log.info("planner: %r opened a file picker; gave it the CV", name)
+            page.wait_for_timeout(8000)     # the board reads the CV before it draws the next step
     except Exception as e:  # noqa: BLE001
         log.info("planner: %r would not press (%s)", name, str(e)[:100])
         try:
-            if c.follow_control_href(page, el, page.url):
+            if c.follow_control_href(page, el, page.url, job_url):
                 return True
         except Exception:  # noqa: BLE001
             pass
@@ -433,7 +508,7 @@ def _press(ctx: ApplyContext, before: dict, name: str) -> bool:
     after = observe.snapshot(ctx.page)
     if not _changed(before, after):
         try:
-            if c.follow_control_href(page, el, page.url):
+            if c.follow_control_href(page, el, page.url, job_url):
                 return True
         except Exception:  # noqa: BLE001
             pass

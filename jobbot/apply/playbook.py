@@ -31,6 +31,9 @@ from jobbot.apply import observe
 
 log = logging.getLogger(__name__)
 
+_COOKIE_RE = re.compile(r"cookie|accept all|reject all|allow all|deny all|without accepting|necessary only"
+                        r"|(?:only|strictly) necessary|manage (?:preferences|consent)", re.I)
+
 LESSON_MIN_WORDS = 3
 LESSON_MATCH = 0.75       # share of a lesson's words that must appear on the page for it to apply
 LESSON_WORDS = 24         # a lesson keeps its most distinctive words, not a whole page of copy
@@ -140,6 +143,8 @@ def remember(snap: dict, kind: str, action: str = "", ok: bool = True, lesson: b
     """
     if not kind:
         return
+    if kind == "press" and _COOKIE_RE.search(action or ""):
+        return          # dismissing a cookie banner is not a step of the site (application 413)
     try:
         _ensure()
         sig, now, url = observe.signature(snap), _now(), (snap.get("url") or "")[:300]

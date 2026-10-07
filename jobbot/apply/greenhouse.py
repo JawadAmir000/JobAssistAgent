@@ -116,7 +116,7 @@ class GreenhouseAdapter(Adapter):
 
         # Work on the embed as a top-level page so ordinary locators reach the fields.
         try:
-            page.goto(src, wait_until="domcontentloaded", timeout=EMBED_NAV_TIMEOUT)
+            c.goto(page, src, timeout=EMBED_NAV_TIMEOUT)
         except Exception as e:
             raise ApplyError(f"Greenhouse embed did not load in {EMBED_NAV_TIMEOUT // 1000}s: {e}"[:400]) from None
         page.wait_for_timeout(1000)

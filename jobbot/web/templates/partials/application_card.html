@@ -27,6 +27,12 @@
         </label>
         <button type="submit" class="btn primary">Answer &amp; continue</button>
       </form>
+      {# Without an answer: a one-time code or sign-in link jobbot reads from the mailbox itself, or a fix made
+         since the pause. The box above is required, so this was impossible from the card (application 414). #}
+      <div class="actions">
+        <button class="btn" hx-post="/application/{{ a['id'] }}/retry" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Retry</button>
+        <button class="btn" hx-post="/application/{{ a['id'] }}/mark-applied" hx-target="#app-{{ a['id'] }}" hx-swap="outerHTML">Mark applied</button>
+      </div>
     {% else %}
       <p class="muted">Finish the step in the browser window, then continue.</p>
       <div class="actions">

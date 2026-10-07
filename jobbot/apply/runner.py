@@ -830,7 +830,7 @@ def _run_application(app_id: int) -> None:
         live["ctx"] = ctx
 
         step("Opening job page")
-        page.goto(job["url"], wait_until="domcontentloaded", timeout=45000)
+        common.goto(page, job["url"], timeout=45000)
         page.wait_for_timeout(1000)
     except Exception as e:
         log.exception("app %s: browser setup failed", app_id)

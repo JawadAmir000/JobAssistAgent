@@ -99,7 +99,7 @@ def jobs_list(request: Request, min_score: int = 3, q: str = "", low: str | None
     sid = h.parse_search_id(search_id)
     search = db.get_search(sid) if sid else None
     if search is not None and search["has_snapshot"]:
-        jobs = db.list_jobs(min_score=min_score, query=q or None, search_id=sid, limit=500)
+        jobs = db.list_jobs(min_score=min_score, query=q or None, search_id=sid, limit=3000)
         locs = h.parse_locations(search["locations"])
         total = db.count_search_jobs(sid)
         return _partial(request, "partials/job_list.html", jobs=jobs, shown=len(jobs), total=total,

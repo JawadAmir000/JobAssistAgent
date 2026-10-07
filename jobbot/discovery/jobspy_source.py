@@ -31,8 +31,11 @@ except Exception:  # noqa: BLE001  jobbot.apply/__init__ may import adapters not
                 return ats
         return "other"
 
-SITES = ["indeed", "linkedin", "google"]
-RESULTS_WANTED = 25
+# Google is left out: it answers every scrape with a /sorry 429 and costs ~20s of retries per location.
+# Glassdoor (location lookup 400s) and Bayt (403) are also blocked from here, so they are not listed.
+SITES = ["indeed", "linkedin"]
+# Indeed pages fast (~500 rows in 5s); LinkedIn sleeps between pages (~100 rows per 50s), so it gets less.
+RESULTS_WANTED = {"indeed": 500, "linkedin": 150}
 LOCATION_BUDGET_S = 240  # covers all of SITES scraped one after another
 MAX_DESC = 8000
 
@@ -92,7 +95,7 @@ def _rows_to_jobs(rows: list[dict]) -> list[Job]:
 
 def _site_kwargs(query: str, location: str, hours_old: int, site: str) -> dict[str, Any]:
     kwargs: dict[str, Any] = dict(
-        site_name=[site], search_term=query, results_wanted=RESULTS_WANTED,
+        site_name=[site], search_term=query, results_wanted=RESULTS_WANTED.get(site, 50),
         hours_old=hours_old, description_format="markdown", verbose=0,
     )
     if location.strip().lower() == "remote":

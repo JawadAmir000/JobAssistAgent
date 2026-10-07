@@ -51,8 +51,9 @@ UNSAFE_RE = re.compile(
     # ServiceNow's board, and one no reply should be able to reach.
     r"|refer|recommend|recommander)\b", re.I)
 # The same third-party rule the opener search uses: "Apply with LinkedIn" opens somebody else's login.
-THIRD_PARTY_RE = re.compile(r"linked\s*in|indeed|google|facebook|apple\b|seek\b|xing|microsoft|dropbox|okta",
-                            re.I)
+# Social links too: AMD's footer "YouTube" icon took the window to youtube.com mid-application (421).
+THIRD_PARTY_RE = re.compile(r"linked\s*in|indeed|google|facebook|apple\b|seek\b|xing|microsoft|dropbox|okta"
+                            r"|youtube|twitter|instagram|discord|tiktok|glassdoor|\bx\b\s*$", re.I)
 
 _MARK = "data-jobbot-nav"
 
@@ -97,12 +98,24 @@ def controls(page: Any, limit: int = MAX_CONTROLS) -> list[dict]:
     except Exception as e:  # noqa: BLE001 - a page that cannot be scanned is one to give up on politely
         log.debug("navigator: could not scan the page: %s", e)
         return []
+    # "Skip" is unsafe on a form, where it drops a step of the application -- but on an optional account
+    # upsell ("Set Up Password" / "Skip for now", application 413) it is the only way on.
+    upsell = any(c.SKIP_CONTROL_RE.match(ctl.get("name", "")) for ctl in found) and _upsell_page(page)
     safe = [ctl for ctl in found
-            if not UNSAFE_RE.search(ctl.get("name", "")) and not THIRD_PARTY_RE.search(ctl.get("name", ""))]
+            if (not UNSAFE_RE.search(ctl.get("name", "")) or (upsell and c.SKIP_CONTROL_RE.match(ctl.get("name", ""))))
+            and not THIRD_PARTY_RE.search(ctl.get("name", ""))]
     key = [ctl for ctl in safe if _FORWARD_RE.search(ctl.get("name", ""))]
     rest = [ctl for ctl in safe if ctl not in key]
     keep = (key + rest)[:limit]
     return sorted(keep, key=lambda ctl: ctl.get("i", 0))
+
+
+def _upsell_page(page: Any) -> bool:
+    try:
+        text = page.evaluate("() => (document.body && document.body.innerText) || ''") or ""
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(c.UPSELL_PAGE_RE.search(text))
 
 
 _FORWARD_RE = re.compile(r"\b(?:apply|submit|continue|next|proceed|start|postuler|soumettre|continuer|suivant|bewerb|"

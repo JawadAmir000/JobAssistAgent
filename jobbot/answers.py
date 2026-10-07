@@ -132,6 +132,9 @@ FACTS_ONLY_KEYWORDS: frozenset[str] = frozenset({
     # question about data architectures down the protected path. "military" is here as well as
     # "military status" in EEO_KEYWORDS, because a form may ask about either.
     "military", "age ",
+    # Government employment: a personal fact, never the model's. ServiceNow's "employee of a ... governmental
+    # entity in another country?" got a cached model "No" (and a country rule's "Bangladesh"), application 464.
+    "government", "governmental", "public official",
     # The same declarations on French / Spanish / Portuguese / Italian / German forms. Coveo asked "Êtes-vous
     # légalement autorisé.e à travailler dans le pays où vous résidez?" and nothing here caught it, so a
     # work-authorisation answer would have come from the model (application 378).
@@ -238,6 +241,9 @@ ROW_FIELD_LABELS: frozenset[str] = frozenset({
     # employment history
     "company", "company name", "employer", "employer name", "job title", "position", "position title",
     "role", "role description", "responsibilities", "duties", "reason for leaving", "supervisor",
+    # an experience row's own free text, and a skills picker: learned as "Resume" and a doubled-up skills
+    # string, and replayed into Siemens' profile form (application 438)
+    "description", "job description", "position description", "skills", "skill",
     "supervisor name", "i currently work here", "i currently work in this role", "currently work here",
     "start date", "end date", "from", "to", "location",
     # education

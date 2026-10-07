@@ -121,6 +121,10 @@ def _body_text(msg: email.message.Message) -> str:
             continue
         if ctype == "text/html":
             text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
+            # A button's target lives only in its href, and stripping the tags used to drop it: Employment
+            # Hero's "Sign In" mail is HTML-only, so its one-time link never reached extract_link (app 413).
+            # Kept as "label url" so a link can be recognised by what the button says.
+            text = _ANCHOR_RE.sub(lambda m: f" {m.group(3)} {m.group(2)} ", text)
             text = re.sub(r"<[^>]+>", " ", text)
             text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
                         .replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'"))
@@ -198,11 +202,27 @@ _LINK_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.I)
 VERIFY_LINK_RE = re.compile(r"verif|activat|confirm", re.I)
 
 
-def extract_link(text: str, match: re.Pattern = VERIFY_LINK_RE) -> str | None:
-    """The first link in `text` whose URL looks like the one the mail is asking you to follow."""
-    for url in _LINK_RE.findall(text or ""):
-        url = url.rstrip(".,);\"'")
+# Most senders wrap every link in a click-tracking redirect (SendGrid's ".../ls/click?upn=..."), so the URL says
+# nothing about where it goes; the button's own words ("Sign In", "Verify Email") do.
+_ANCHOR_RE = re.compile(r"<a\b[^>]*?href\s*=\s*([\"'])(https?://[^\"']+)\1[^>]*>(.*?)</a>", re.I | re.S)
+VERIFY_LABEL_RE = re.compile(r"\b(?:verify|confirm|activate)\b", re.I)
+LOGIN_LABEL_RE = re.compile(r"\b(?:sign[\s-]?in|log[\s-]?in|verify|confirm|magic link|continue (?:your |the )?"
+                            r"application|access (?:your )?(?:account|application))\b", re.I)
+_NOT_ACTION_RE = re.compile(r"unsubscribe|privacy|terms|preferences|help|support|policy", re.I)
+
+
+def extract_link(text: str, match: re.Pattern = VERIFY_LINK_RE, label: re.Pattern | None = None) -> str | None:
+    """The first link in `text` whose URL looks like the one the mail is asking you to follow, or -- when
+    `label` is given -- whose button text right before it does (see _body_text)."""
+    text = text or ""
+    prev_end = 0
+    for m in _LINK_RE.finditer(text):
+        url = m.group(0).rstrip(".,);\"'")
+        words = re.sub(r"<[^>]+>", " ", text[prev_end:m.start()])[-60:]
+        prev_end = m.end()
         if match.search(url):
+            return url
+        if label is not None and label.search(words) and not _NOT_ACTION_RE.search(words):
             return url
     return None
 
@@ -249,7 +269,7 @@ def _scan_messages(since: datetime, hints: Iterable[str], pick):
 
 
 def fetch_link(since: datetime, match: re.Pattern = VERIFY_LINK_RE, timeout_s: int = DEFAULT_TIMEOUT_S,
-               hints: Iterable[str] = ()) -> str | None:
+               hints: Iterable[str] = (), label: re.Pattern | None = None) -> str | None:
     """Poll the mailbox for a verification link sent after `since`. None if it never arrives or mail is off.
 
     Never raises, for the same reason fetch_code does not: a mailbox problem must degrade into asking the
@@ -262,7 +282,7 @@ def fetch_link(since: datetime, match: re.Pattern = VERIFY_LINK_RE, timeout_s: i
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            link = _scan_messages(since, hints, lambda text: extract_link(text, match))
+            link = _scan_messages(since, hints, lambda text: extract_link(text, match, label))
             if link:
                 return link
         except imaplib.IMAP4.error as e:
@@ -300,8 +320,13 @@ def _scan_once(since: datetime, length: int, hints: Iterable[str]) -> str | None
             subject, sender = _decoded(msg.get("Subject")), _decoded(msg.get("From"))
             if not _looks_relevant(subject, sender, hints):
                 continue
-            code = extract_code(f"{subject}\n{_body_text(msg)}", length)
+            text = f"{subject}\n{_body_text(msg)}"
+            # The length is the form's guess from its box, and the guess can be wrong: Amazon's box read as 8
+            # while its mail carries a 6-digit code (application 414). The guess first, then the usual lengths.
+            code = next((found for n in dict.fromkeys((length, 6, 8, 4, 5, 7))
+                         if (found := extract_code(text, n))), None)
             if code:
+                length = len(code)
                 log.info("mail: found a %d-character code in %r from %s", length, subject, sender)
                 return code
     finally:
@@ -338,4 +363,47 @@ def fetch_code(since: datetime, length: int = 8, timeout_s: int = DEFAULT_TIMEOU
             log.warning("mail: scan %d failed: %s", attempt, e)
         time.sleep(POLL_S)
     log.info("mail: no code arrived within %ds", timeout_s)
+    return None
+
+
+# An employer's "we have your application" mail. The page after Submit is the usual proof, but a portal that
+# redraws itself (Manulife's Phenom front over Workday, application 437) can leave a blank page where the
+# thank-you should be, while "Thanks for applying at Manulife/John Hancock" lands in the inbox 30 s later.
+_RECEIPT_RE = re.compile(
+    r"thank(?:s| you)\s+(?:you\s+)?for\s+(?:your\s+)?(?:applying|application|interest)|application\s+(?:was\s+|has\s+been\s+)?"
+    r"(?:received|submitted|complete)|we(?:'ve| have)\s+received\s+your\s+application|successfully\s+submitted", re.I)
+
+
+_NOT_RECEIPT_RE = re.compile(r"confirm your (?:e-?mail|subscription)|verify|preference|newsletter|job alert|subscri"
+                             r"|password|sign[- ]?in|log[- ]?in|security code|one-time", re.I)
+
+
+def fetch_application_receipt(since: datetime, company: str, timeout_s: int = 90) -> str | None:
+    """The subject of an application receipt from `company` sent after `since`, or None. Never raises."""
+    ok, why = is_configured()
+    head = re.split(r"[\s,|(/]+", (company or "").strip())[0] if company else ""
+    if not ok or len(head) < 3:
+        return None
+    want = re.compile(rf"\b{re.escape(head)}", re.I)
+
+    def pick(text: str) -> str | None:
+        subject = text.split("\n", 1)[0]
+        # The receipt must be about an application, in its subject: Siemens' "Please confirm your email with
+        # Siemens" (a preference-centre mail) was taken for one (application 438).
+        if _NOT_RECEIPT_RE.search(subject) or not re.search(r"appl(?:y|ied|ying|ication)|candida", subject, re.I):
+            return None
+        return subject if want.search(text) and _RECEIPT_RE.search(text) else None
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            found = _scan_messages(since, (head,), pick)
+            if found:
+                return found
+        except imaplib.IMAP4.error as e:
+            log.warning("mail: IMAP rejected the receipt scan (%s)", e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            log.warning("mail: receipt scan failed: %s", e)
+        time.sleep(POLL_S)
     return None

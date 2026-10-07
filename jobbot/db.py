@@ -193,8 +193,10 @@ JOB_LIST_COLUMNS = (
 
 def list_jobs(min_score: int | None = None, query: str | None = None, limit: int = 200,
               include_hidden: bool = False, locations: list[str] | None = None,
-              max_age_days: int | None = None, search_id: int | None = None) -> list[sqlite3.Row]:
-    """Jobs for the Jobs tab. `locations` and `max_age_days` mirror the search form: the table keeps
+              max_age_days: int | None = None, search_id: int | None = None,
+              include_applied: bool = False) -> list[sqlite3.Row]:
+    """Jobs for the Jobs tab. Jobs already submitted are left out, including the same company+title
+    found again under another source's id. `locations` and `max_age_days` mirror the search form: the table keeps
     every posting ever found, so without them the list shows the whole history rather than the search."""
     sql = f"SELECT {JOB_LIST_COLUMNS}, a.status AS app_status, a.id AS app_id FROM jobs j "
     args: list = []
@@ -205,6 +207,10 @@ def list_jobs(min_score: int | None = None, query: str | None = None, limit: int
             "ORDER BY id DESC LIMIT 1) WHERE 1=1")
     if not include_hidden:
         sql += " AND j.hidden=0"
+    if not include_applied:
+        sql += (" AND NOT EXISTS (SELECT 1 FROM applications sa JOIN jobs sj2 ON sj2.id=sa.job_id "
+                "WHERE sa.status='submitted' AND (sj2.id=j.id OR (lower(trim(sj2.company))=lower(trim(j.company)) "
+                "AND lower(trim(sj2.title))=lower(trim(j.title)))))")
     if min_score is not None:
         sql += " AND (j.score IS NULL OR j.score>=?)"
         args.append(min_score)

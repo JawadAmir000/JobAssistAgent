@@ -98,7 +98,7 @@ class AshbyAdapter(Adapter):
         if not ON_APPLICATION_URL.search(url):
             # The job page shows an "Application" tab; /application is the same view without the click.
             try:
-                page.goto(url + "/application", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                c.goto(page, url + "/application", timeout=NAV_TIMEOUT)
                 page.wait_for_timeout(800)
             except Exception as e:
                 raise ApplyError(f"Ashby application page did not load in {NAV_TIMEOUT // 1000}s: {e}"[:400]) from None
@@ -108,6 +108,8 @@ class AshbyAdapter(Adapter):
         c.detect_captcha(page)
         if c.visible(page.locator(FORM_READY), FORM_WAIT):   # re-run after a pause: give a re-render time
             return
+        if c.spam_flagged(page):
+            raise NeedsHuman(c.SPAM_FLAG_MSG)     # the form went in once and came back as "possible spam"
         raise ApplyError(f"Ashby application form not found at {page.url}"[:400])
 
     def _identity(self, ctx: ApplyContext) -> None:
@@ -293,6 +295,20 @@ class AshbyAdapter(Adapter):
             b = buttons.nth(j)
             if (b.get_attribute("aria-pressed") or "").lower() == "true" or \
                     (b.get_attribute("aria-checked") or "").lower() == "true":
+                if c.error_for_field(c.form_errors(ctx.page), label):
+                    # Pressed on screen, "Missing entry for required field" in the form's own state: the CV
+                    # re-attach after a bounce re-rendered the form under the earlier click (VASCO's hybrid-policy
+                    # Yes, application 432). Off and on again, so the form hears both changes.
+                    other = next((buttons.nth(k) for k in range(buttons.count()) if k != j), None)
+                    try:
+                        if other is not None:
+                            other.click(timeout=c.MEDIUM)
+                            ctx.page.wait_for_timeout(200)
+                        b.click(timeout=c.MEDIUM)
+                        ctx.page.wait_for_timeout(200)
+                        log.info("ashby: %r was pressed but the form still wanted it; pressed it again", label[:60])
+                    except Exception as e:  # noqa: BLE001
+                        log.info("ashby: re-pressing %r: %s", label[:60], str(e)[:120])
                 return  # already answered on an earlier pass
         ans = ctx.answer(label, opts, "radio")
         for j in range(buttons.count()):

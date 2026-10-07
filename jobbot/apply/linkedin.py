@@ -162,7 +162,7 @@ class LinkedInAdapter(Adapter):
                 "Finish it in the browser window, then click Continue.")
         if navigate:
             ctx.step(f"Following LinkedIn through to {ats}")
-            ctx.page.goto(target, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(ctx.page, target, timeout=NAV_TIMEOUT)
             ctx.page.wait_for_timeout(1000)
             # A shortened or redirecting Apply link only names its ATS once it has been followed, and the
             # detection above ran on the link as LinkedIn wrote it. "https://grnh.se/lv1el75lanz" is a
@@ -178,8 +178,23 @@ class LinkedInAdapter(Adapter):
                 if better is not None:
                     ats, target, adapter = settled, landed, better
                     ctx.step(f"Following LinkedIn through to {ats}")
-        # Delegate on the same page so the runner's screenshots, pause and resume keep working.
-        adapter.apply(replace(ctx, job={**ctx.job, "ats": ats, "url": target}))
+        # The posting LinkedIn's Apply led to, remembered for the resumes: they pass the window's URL as the
+        # target, and when the portal has moved the window to another of its jobs that URL is the wrong job.
+        # Handed on as the job's URL, the remembered one is what the adapter checks it is still applying to
+        # (Macquarie, application 487: a retry resumed on a different posting's application page).
+        if navigate or not ctx.extra.get("linkedin_target"):
+            ctx.extra["linkedin_target"] = target
+        home = ctx.extra["linkedin_target"]
+        if c.other_job(home, target):
+            log.info("linkedin: the window is on %s, a different job from %s; going back", target[:120], home[:120])
+            ctx.step("The window is on a different job; going back to this one")
+            c.goto(ctx.page, home, timeout=NAV_TIMEOUT)
+            ctx.page.wait_for_timeout(1000)
+            target = home
+        # Delegate on the same page so the runner's screenshots, pause and resume keep working. The job's URL
+        # is the posting, not wherever a resume finds the window: the walker goes back to it when the window
+        # has wandered (an expired session drops Macquarie's onto its job list, application 488).
+        adapter.apply(replace(ctx, job={**ctx.job, "ats": ats, "url": home}))
 
     @classmethod
     def _is_easy_apply(cls, page) -> bool:
@@ -251,9 +266,22 @@ class LinkedInAdapter(Adapter):
         ctx.step("Reloading the page with the current session")
         try:
             page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            page.wait_for_timeout(1500)
         except Exception as e:  # noqa: BLE001
-            log.debug("linkedin reload failed: %s", e)
+            log.info("linkedin reload failed (%s); opening the job again", str(e)[:80])
+            try:
+                c.goto(page, page.url, timeout=NAV_TIMEOUT)
+            except Exception as e2:  # noqa: BLE001
+                log.debug("linkedin re-open failed: %s", e2)
+        # Wait for the page to say which it is -- an Apply control, or the "Application submitted" card. Read
+        # 36 ms after the reload, TekStaff's page had neither yet and an application sent four days earlier was
+        # handed back as "No Apply button found" (application 441, that message seen 15 times).
+        for _ in range(20):
+            try:
+                page.wait_for_timeout(500)
+                if applied_notice(page) or LinkedInAdapter._apply_control(page) is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                break
 
     @staticmethod
     def _signed_out(page) -> bool:

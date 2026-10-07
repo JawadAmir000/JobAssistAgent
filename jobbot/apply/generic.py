@@ -140,9 +140,22 @@ OPEN_NAMES = re.compile(
     r"(?!\s*(?:with|via|using|through|by|avec|mit|con|com|met)\b)", re.I)
 THIRD_PARTY_RE = re.compile(r"linkedin|indeed|google|facebook|apple|seek\b|xing|microsoft|dropbox", re.I)
 # Pages and frames that are advertising plumbing, never part of an application.
+# Pages a run can wander onto from a form's own links, where filling and submitting is the wrong thing to do:
+# Siemens' "Review Accommodations for Disability" opened an accommodation-request form that was then walked as
+# the application (application 438).
+_NOT_APPLICATION_URL_RE = c.NOT_APPLICATION_URL_RE
+
 TRACKING_URL_RE = re.compile(
     r"doubleclick\.net|googleadservices|googlesyndication|google-analytics|googletagmanager|facebook\.com/tr\b"
-    r"|adsrvr\.org|bat\.bing\.com|linkedin\.com/px|adnxs\.com|demdex\.net|omtrdc\.net|criteo|hotjar|clarity\.ms",
+    r"|adsrvr\.org|bat\.bing\.com|linkedin\.com/px|adnxs\.com|demdex\.net|omtrdc\.net|criteo|hotjar|clarity\.ms"
+    # Social pages are never a step of an application either: a footer "YouTube" icon left a tab on
+    # youtube.com/@AMDDevCentral that was then adopted as the application window (AMD, application 421).
+    r"|//(?:www\.|m\.)?(?:youtube\.com|youtu\.be|facebook\.com|twitter\.com|x\.com|instagram\.com|tiktok\.com"
+    r"|discord\.(?:gg|com)|pinterest\.com)\b|linkedin\.com/(?:company|in|school|showcase)/"
+    # Consent managers draw in frames whose src can say "careers" (EY's careers.ey.com/widgets/
+    # cookiemanageriframe/, hopped to as "the embedded form" after a signup, application 431).
+    r"|cookie-?manager|cookiemanager|cookie-?consent|cookiebot|onetrust|cookielaw|trustarc|usercentrics|didomi"
+    r"|consentmanager|/consent(?:/|\b)|privacy-?center",
     re.I)
 
 # Sites that cannot be driven: they gate the application behind a national identity login or a hardware
@@ -172,6 +185,10 @@ IDENTITY: tuple[tuple[re.Pattern, str], ...] = (
     # A phone *extension* is not the phone: AGF's Workday "Phone Extension" got the number typed into it
     # (application 251). Mobile numbers have no extension; leave it empty.
     (re.compile(r"\b(?:phone\s*)?extension\b|\bext\.?\s*$", re.I), ""),
+    # A question about the phone, not the phone: Eightfold's "Phone Device Type" (Mobile / Home / Work) had the
+    # number typed into its dropdown (GlobalFoundries, application 403). Left to the question pass, which
+    # answers it "Mobile" (see answers._ABOUT_THE_FIELD_RE).
+    (re.compile(r"\bdevice\s*type\b|\bphone\s*(?:number\s*)?type\b|\btype\s+of\s+(?:phone|number)\b", re.I), ""),
     # Name fields for a script we do not write in. Workday asks for both ("Bengali Given Name(s)" next to
     # "Given Name(s) - Western Script"), and the Latin name belongs in exactly one of them.
     (re.compile(r"\b(?:bengali|bangla|chinese|japanese|kanji|katakana|hiragana|hangul|korean|cyrillic|"
@@ -196,7 +213,7 @@ IDENTITY: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"current\s*(job\s*)?title|current\s*(role|position)|\bposte\s+actuel\b", re.I), "work.current_title"),
     # Before the location rule: "Country" wants "Bangladesh", not "Dhaka, Bangladesh". Anchored so that a
     # "Country phone code" field is not answered with a country name.
-    (re.compile(r"^\s*country(?:\s*/\s*region)?\s*$|\bcountry\s+of\s+(?:residence|citizenship)\b|^\s*pays\s*[*:]?\s*$"
+    (re.compile(r"^\s*country(?:\s*/\s*region)?\s*$|\bcountry(?:\s*/\s*region)?\s+of\s+(?:residence|citizenship)\b|^\s*pays\s*[*:]?\s*$"
                 r"|^\s*land\s*[*:]?\s*$|^\s*pa[ií]s\s*[*:]?\s*$|^\s*paese\s*[*:]?\s*$", re.I), "identity.country"),
     (re.compile(r"\b(city|town|location|address|where are you based|country)\b|\bville\b|\bstadt\b|\bort\b"
                 r"|\bciudad\b|\bcidade\b|\bcitt[àa]\b|\bwoonplaats\b|\badresse\b|\bdirecci[óo]n\b", re.I),
@@ -258,7 +275,7 @@ _JUNK_FORM_JS = r"""
     // What only a real application asks. An opt-in line inside one ("also email me similar jobs") must not
     // cost the whole form -- application C in the regression set is exactly that shape.
     const applyMarker = /\bresumes?\b|\bcv\b|\bcurriculum vitae\b|\bcover letter\b|\bwork authoriz|\bauthoris?z?(?:ed|ation)\s+to\s+work\b|\blegally\s+(?:authoris|authoriz|entitled|eligible)|\bright to work\b|\bvisa\b|\bsponsorship\b|\bnotice period\b|\bsalary expectation|\bexpected salary\b|\byears of experience\b|\brequire sponsorship\b/i;
-    const junkText = /\bjob alerts?\b|\bcreate (?:a |an )?(?:job )?alert\b|\balert me\b|\bemail me (?:similar |new )?jobs\b|\brefer (?:someone|a friend|this job|somebody)\b|\btell a friend\b|\btalent (?:community|network|pool)\b|\bjoin our talent\b|\bstay (?:connected|in touch)\b|\badd to favou?rites\b|\bsave this job\b/i;
+    const junkText = /\bjob alerts?\b|\bcreate (?:a |an )?(?:job )?alert\b|\balert me\b|\bemail me (?:similar |new )?jobs\b|\brefer (?:someone|a friend|this job|somebody)\b|\btell a friend\b|\btalent (?:community|network|pool)\b|\bjoin our talent\b|\bstay (?:connected|in touch)\b|\badd to favou?rites\b|\bsave this job\b|\bget notified\b|\bnotify me\b|\bsimilar jobs\b|\bsign up to receive\b|\bjob (?:updates|notifications)\b/i;
     const isJunkForm = f => {
         if (!f) return false;
         if (f.getAttribute('role') === 'search') return true;
@@ -274,6 +291,15 @@ _JUNK_FORM_JS = r"""
         const text = (f.innerText || '').replace(/\s+/g, ' ');
         if (!deepIn(f, 'input[type=file]').length && junkText.test(text) && !applyMarker.test(text))
             return true;
+        // The widget's heading sits just outside its <form>: OpenText's "Get notified for similar jobs / Sign up
+        // to receive job alerts" box (email + Submit) was walked and sent as the application (application 451).
+        // The surrounding block, while it is still small enough to be the widget rather than the page.
+        for (let p = f.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) {
+            const around = (p.innerText || '').replace(/\s+/g, ' ');
+            if (around.length > 900) break;
+            if (!deepIn(p, 'input[type=file]').length && junkText.test(around) && !applyMarker.test(around))
+                return true;
+        }
         return false;
     };
 """
@@ -351,6 +377,8 @@ class GenericFormAdapter(Adapter):
     def apply(self, ctx: ApplyContext) -> None:
         page = ctx.page
         c.require_open(page)
+        self._leave_stray_page(ctx)
+        page = ctx.page
         # Signed on the context, which outlives this call: the runner offers a failed vendor adapter one
         # retry with this walker, and a walk that has already happened must not be offered again.
         ctx.extra["generic_walked"] = True
@@ -385,6 +413,15 @@ class GenericFormAdapter(Adapter):
 
         for page_no in range(1, self.max_pages + 1):
             c.require_open(page)
+            if _NOT_APPLICATION_URL_RE.search(page.url or ""):
+                # Not filled, not submitted: an accommodation/contact/privacy page is never the application
+                # (Siemens' accommodation form was filled and sent as one, application 438).
+                self._leave_stray_page(ctx)
+                page = ctx.page
+                if _NOT_APPLICATION_URL_RE.search(page.url or ""):
+                    raise NeedsHuman(f"jobbot is on {(page.url or '')[:120]}, which is not the application; it "
+                                     "will not fill or send anything there. Open the job's application in the "
+                                     "window, then click Continue.")
             c.dismiss_cookie_banner(page)
             c.detect_captcha(page, allow_inline=True)
             c.detect_bot_block(page)
@@ -407,17 +444,43 @@ class GenericFormAdapter(Adapter):
             ctx.extra["flow_url"] = _flow_key(page.url)
             log.info("generic: page %d — walking the controls under %r on %s", page_no, self.scope, root.url[:80])
             c.detect_captcha(root, allow_inline=True)
+            self._code_step = False
             self._fill_page(fctx)
             c.detect_captcha(root)
+
+            # An emailed code that verifies the account, not the application: Eightfold's signup (GlobalFoundries,
+            # application 402) mails one, and its "Submit" under the code boxes read as the application's own.
+            # The walk then waited for a thank-you page while the profile builder — the real next step — sat
+            # on screen. A code step that has no CV upload and no name or phone box is a door, so its button
+            # is pressed like a Next and the walk goes on; Greenhouse's code, which sits on the full form
+            # beside the CV, still goes through submit_and_confirm below.
+            if self._code_step and not self._looks_like_application(root):
+                pages_before = self._context_pages(page)
+                ctx.extra["advanced_at"] = datetime.now(timezone.utc)
+                if (self._press(root, self.next_names)
+                        or self._press(root, ("Submit", "Confirm", "Done", "Sign in", "Log in"))):
+                    log.info("generic: the emailed code verified the account; carrying on to the next step")
+                    page.wait_for_timeout(STEP_SETTLE_MS)
+                    self._adopt_page_opened_since(ctx, pages_before)
+                    page = ctx.page
+                    c.require_open(page)
+                    continue
 
             if self._button(root, self.submit_names, fallback=self.submit_fallback) is not None:
                 ctx.step("Submitting")
                 ctx.extra["advanced_at"] = datetime.now(timezone.utc)
                 self._identity(fctx)     # idempotent re-pass: recover anything the page dropped while we filled it
-                c.submit_and_confirm(fctx, self.submit_names,
-                                     click=lambda: self._press(root, self.submit_names,
-                                                               fallback=self.submit_fallback),
-                                     refill=lambda: (self._identity(fctx), self._questions(fctx)))
+                had_cv_upload = self._has_file_input(root)
+                try:
+                    c.submit_and_confirm(fctx, self.submit_names,
+                                         click=lambda: self._press(root, self.submit_names,
+                                                                   fallback=self.submit_fallback),
+                                         refill=lambda: (self._identity(fctx), self._questions(fctx)))
+                except NeedsHuman as e:
+                    if not self._closed_onto_job_page(ctx, str(e), had_cv_upload):
+                        raise
+                    page = ctx.page
+                    continue
                 ctx.step("Submitted")
                 return
 
@@ -578,6 +641,31 @@ class GenericFormAdapter(Adapter):
             log.debug("generic: resume-in-flow test: %s", e)
             return False
 
+    @staticmethod
+    def _leave_stray_page(ctx: ApplyContext) -> None:
+        """Out of a page no application lives on, before anything is read from it.
+
+        A window left on EY's cookie-manager widget (application 431) was walked from there on every Retry, and
+        the planner called it "not an application" each time. Back once; if that is still not the way, the
+        job's own page, which is where every application starts.
+        """
+        page = ctx.page
+        try:
+            if not TRACKING_URL_RE.search(page.url or "") and not _NOT_APPLICATION_URL_RE.search(page.url or ""):
+                return
+            log.info("generic: the window is on %s, which is no part of an application; leaving it", (page.url or "")[:100])
+            try:
+                page.go_back(wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            except Exception:  # noqa: BLE001
+                pass
+            if TRACKING_URL_RE.search(page.url or "") or not (page.url or "").startswith("http"):
+                url = ctx.job.get("url") or ""
+                if url:
+                    c.goto(page, url, timeout=NAV_TIMEOUT)
+            page.wait_for_timeout(1500)
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: leaving a stray page: %s", e)
+
     @classmethod
     def _form_root(cls, page):
         """The page itself when its own document holds the form, else a view over the child frame that does."""
@@ -603,7 +691,9 @@ class GenericFormAdapter(Adapter):
         # has even opened -- "apply with your email" mails a code and waits. Without this the walk finds
         # nothing it recognises to fill, presses Next, and bounces on the same step until it gives up.
         if self._verification(ctx):
+            self._code_step = True
             return
+        c.expand_hidden_choice_groups(page, self.scope)
         # Before anything is typed: if the board can fill the form from the CV itself, let it. Everything
         # below is idempotent and only writes into empty controls, so the pass after it corrects nothing the
         # CV already answered and fills what the parse missed.
@@ -835,6 +925,45 @@ class GenericFormAdapter(Adapter):
             except Exception as e:  # noqa: BLE001
                 log.warning("generic: could not press %r for %r: %s", pick, label[:60], str(e)[:80])
 
+    @staticmethod
+    def _has_file_input(root) -> bool:
+        try:
+            return bool(root.locator("input[type=file]").count())
+        except Exception:  # noqa: BLE001
+            return True
+
+    # A pop-up form that closes back onto the job page it was opened over, with that page's Apply still on
+    # offer, was a step before the application rather than the application. Eightfold's profile builder
+    # (GlobalFoundries, application 402) reads the CV into a "review your profile" dialog with a Submit; its
+    # closing looked like a sent form and the job was marked applied while "Apply Now" sat on screen. Kept
+    # narrow, because pressing Apply again after a real application could send a second one: the closed form
+    # had no CV upload (an application form almost always has one), nothing is left to type into, the job's
+    # own Apply is showing, and it is allowed once per application.
+    _APPLY_OPENERS = ("Apply now", "Apply", "Apply for this job", "Apply for this position", "Apply to this job")
+
+    def _closed_onto_job_page(self, ctx: ApplyContext, message: str, had_cv_upload: bool) -> bool:
+        page = ctx.page
+        if (had_cv_upload or message != c.UNCERTAIN_MSG or ctx.extra.get("closed_onto_job_page")
+                or c._typeable_count(page) or not c._button_named_visible(page, self._APPLY_OPENERS)):
+            return False
+        ctx.extra["closed_onto_job_page"] = True
+        ctx.extra.pop("submit_uncertain", None)
+        log.info("generic: the form closed back onto the job page with Apply still offered; it was a step "
+                 "before the application, so pressing Apply again")
+        return True
+
+    @staticmethod
+    def _looks_like_application(root) -> bool:
+        """True when the step carries an application's own fields: a CV upload, or a name or phone box."""
+        try:
+            return bool(root.locator(
+                "input[type=file], input[type=tel]:visible, input[autocomplete=tel]:visible, "
+                "input[name*='phone' i]:visible, input[autocomplete='given-name']:visible, "
+                "input[autocomplete='family-name']:visible, input[name*='first' i]:visible, "
+                "input[name*='last' i]:visible").count())
+        except Exception:  # noqa: BLE001
+            return True
+
     def _verification(self, ctx: ApplyContext) -> bool:
         """True when this step was an emailed code and it has now been typed in.
 
@@ -882,11 +1011,64 @@ class GenericFormAdapter(Adapter):
         fill ordinary fields from facts.yaml. A signup asks for names, a phone and a country like any other
         form, and the walker above already answers those.
         """
-        return account.pass_gate(ctx, self._gate_fill(ctx))
+        modal = self._pass_blocking_modal(ctx)
+        return account.pass_gate(ctx, self._gate_fill(ctx)) or modal
+
+    # A modal that holds the page back on one or two required questions before the application shows:
+    # Eightfold's "Please review before continuing" (GlobalFoundries, application 402) asks only "Country/
+    # region of residence" — a typeable combobox whose asterisk is drawn by CSS on a `required-…` class.
+    # Short of three fields it was no form to _detect_scope, so it went to the user unfilled; scoped to it
+    # as a form, the walker answered it, pressed its Submit and then waited for an application confirmation
+    # that a consent pop-up never shows. It is a gate: answer it, press its button, carry on behind it.
+    _GATE_MODAL_ATTR = "data-jobbot-gate-modal"
+    _GATE_MODAL_JS = r"""(attr) => {
+        for (const o of document.querySelectorAll('[' + attr + ']')) o.removeAttribute(attr);
+        const ctl = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox])'
+                  + ':not([type=radio]), textarea, select, [role=combobox]';
+        for (const d of document.querySelectorAll('[aria-modal=true], dialog[open]')) {
+            if (!d.getClientRects().length) continue;
+            const fields = [...d.querySelectorAll(ctl)].filter(e => e.getClientRects().length);
+            if (!fields.length || fields.length > 2) continue;
+            if (d.querySelector('input[type=password], input[type=file], input[type=email]')) continue;
+            if (!(d.querySelector('[required], [aria-required=true], [class*=required i]') || /\*/.test(d.innerText)))
+                continue;
+            d.setAttribute(attr, '1');
+            return true;
+        }
+        return false;
+    }"""
+
+    def _pass_blocking_modal(self, ctx: ApplyContext) -> bool:
+        page = ctx.page
+        try:
+            if not page.evaluate(self._GATE_MODAL_JS, self._GATE_MODAL_ATTR):
+                return False
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: blocking-modal test: %s", e)
+            return False
+        scope, before = self.scope, f"[{self._GATE_MODAL_ATTR}]"
+        log.info("generic: a modal holds the page on a required question; answering it first")
+        try:
+            self.scope = before
+            self._identity(ctx)
+            self._questions(ctx)
+            # Looked for inside the modal only: the page behind it has an application's own Submit.
+            if not self._press(page.locator(before).first, NEXT_NAMES + ("Submit", "Confirm", "OK", "Save", "Done")):
+                return False
+        finally:
+            self.scope = scope
+        try:
+            page.locator(before).first.wait_for(state="detached", timeout=15000)  # Eightfold takes ~8s
+        except Exception:  # noqa: BLE001
+            log.info("generic: the modal is still open after its button was pressed")
+            return False
+        return True
 
     def _gate_fill(self, ctx: ApplyContext):
         """How a signup's ordinary fields get filled: from facts.yaml, like any other form."""
         def fill() -> None:
+            if self._pass_blocking_modal(ctx):
+                return
             self.scope = self._detect_scope(ctx.page) or "form"
             self._identity(ctx)
             self._questions(ctx)
@@ -902,6 +1084,18 @@ class GenericFormAdapter(Adapter):
         """
         page = ctx.page
         self._refuse_redirect_home(ctx)
+        # A careers page that names its vendor job by id (?ashby_jid=, ?gh_jid=): the vendor's own page first,
+        # before the cookie toggles on the host page can pass for a form (XYZ Reality, application 422).
+        vendor = self._vendor_job_url(page)
+        if vendor:
+            log.info("generic: the posting embeds %s; opening it directly", vendor[:100])
+            ctx.step("Opening the embedded form")
+            try:
+                c.goto(page, vendor, timeout=NAV_TIMEOUT)
+                page.wait_for_timeout(1500)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.info("generic: could not open %s: %s", vendor[:100], str(e)[:120])
         # A window parked on the portal's job search (BCG's Career Hub after its sign-in, application 289):
         # its search form passes every form test below, and the walker searched it for the job title.
         if self._back_to_the_job(ctx):
@@ -1153,6 +1347,8 @@ class GenericFormAdapter(Adapter):
     def _click_opener(self, ctx: ApplyContext) -> bool:
         """Press the Apply / I'm interested control, in whichever frame holds it. True when one was pressed."""
         page = ctx.page
+        job_url = str(ctx.job.get("url") or "")
+        skipped_other = False
         try:
             frames = list(page.frames)
         except Exception:  # noqa: BLE001
@@ -1173,6 +1369,11 @@ class GenericFormAdapter(Adapter):
                     except Exception:  # noqa: BLE001
                         name = ""
                     if THIRD_PARTY_RE.search(name):
+                        continue
+                    if c.other_job(job_url, c.control_href(el)):
+                        log.info("generic: skipping %r — it applies to a different job (%s)",
+                                 name[:40], c.control_href(el)[:120])
+                        skipped_other = True
                         continue
                     try:
                         pages_before = self._context_pages(page)
@@ -1206,16 +1407,29 @@ class GenericFormAdapter(Adapter):
                         # Press whatever apply-named control the click has just revealed.
                         if self._press_revealed_opener(ctx, page, url_before, pages_before):
                             return True
-                        if c.follow_control_href(page, el, url_before):
+                        if c.follow_control_href(page, el, url_before, job_url):
                             return True
                         return True
                     except Exception as e:  # noqa: BLE001 - a dead opener is not a reason to give up on the page
                         log.debug("generic: apply control did not click: %s", e)
                         try:
-                            if c.follow_control_href(page, el, page.url):
+                            if c.follow_control_href(page, el, page.url, job_url):
                                 return True
                         except Exception:  # noqa: BLE001
                             pass
+        if skipped_other and not ctx.extra.get("back_to_posting") and _flow_key(page.url) != _flow_key(job_url):
+            # Every Apply here was another job's: the window is on the portal's list of postings (Macquarie
+            # sends an expired session to it, application 488). Open this job's own posting and look there.
+            ctx.extra["back_to_posting"] = True
+            log.info("generic: only other jobs' Apply buttons here; opening the posting %s", job_url[:120])
+            ctx.step("Going back to this job's posting")
+            try:
+                c.goto(page, job_url, timeout=NAV_TIMEOUT)
+                page.wait_for_timeout(1500)
+                c.dismiss_cookie_banner(page)
+                return self._click_opener(ctx)
+            finally:
+                ctx.extra.pop("back_to_posting", None)
         return False
 
     _SEEN_OPENER = "data-jobbot-opener-seen"
@@ -1349,6 +1563,33 @@ class GenericFormAdapter(Adapter):
                 return False
         return False
 
+    # A job id in the URL of an employer's own careers page, as the vendors' embed scripts put it there, and
+    # where the vendor's board name can be read off the page: its embed script or frame names the board.
+    _VENDOR_EMBEDS = (
+        ("ashby_jid", r"jobs\.ashbyhq\.com/([A-Za-z0-9._-]+)", "https://jobs.ashbyhq.com/{org}/{jid}/application"),
+        ("gh_jid", r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/(?:embed/job_board/js\?for=|embed/job_app\?for=)?([A-Za-z0-9_-]+)",
+         "https://job-boards.greenhouse.io/{org}/jobs/{jid}"),
+        ("lever-origin", r"jobs\.lever\.co/([A-Za-z0-9._-]+)", ""),
+    )
+
+    @classmethod
+    def _vendor_job_url(cls, page) -> str:
+        """The vendor's own page for a job an employer's site embeds by id, '' when there is none."""
+        try:
+            from urllib.parse import parse_qs
+            query = parse_qs(urlparse(page.url or "").query)
+            for param, org_re, shape in cls._VENDOR_EMBEDS:
+                jid = (query.get(param) or [""])[0]
+                if not jid or not shape:
+                    continue
+                html = page.content()
+                for org in re.findall(org_re, html):
+                    if org.lower() not in ("embed", "api", "static", "assets", "js", "widget"):
+                        return shape.format(org=org, jid=jid)
+        except Exception as e:  # noqa: BLE001
+            log.debug("generic: vendor job url: %s", e)
+        return ""
+
     @classmethod
     def _enter_iframe(cls, ctx: ApplyContext) -> bool:
         """Some boards embed the form from another host, or (iCIMS) keep the whole candidate flow inside a
@@ -1360,7 +1601,20 @@ class GenericFormAdapter(Adapter):
         wrong iframe more often than not.
         """
         page = ctx.page
-        target = ""
+        target = cls._vendor_job_url(page)
+        if target:
+            # The posting names its vendor job by id: XYZ Reality's /join-the-team?ashby_jid=... (application
+            # 422) draws Ashby's embed late or not at all, and was judged "not an application". The vendor's
+            # own page for that id is the same form, with the adapter that knows it.
+            log.info("generic: the posting embeds %s; opening it directly", target[:100])
+            try:
+                ctx.step("Opening the embedded form")
+                c.goto(page, target, timeout=NAV_TIMEOUT)
+                page.wait_for_timeout(1500)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.debug("generic: vendor hop failed: %s", e)
+                target = ""
         try:
             host = (urlparse(page.url or "").netloc or "").lower()
             for frame in list(page.frames)[1:]:
@@ -1389,7 +1643,7 @@ class GenericFormAdapter(Adapter):
             if not target or target.split("#")[0] == (page.url or "").split("#")[0]:
                 return False
             ctx.step("Opening the embedded form")
-            page.goto(target, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, target, timeout=NAV_TIMEOUT)
             page.wait_for_timeout(1500)
         except Exception as e:  # noqa: BLE001
             log.debug("generic: iframe hop failed: %s", e)
@@ -1974,12 +2228,25 @@ class GenericFormAdapter(Adapter):
         if not job_url.startswith("http"):
             return False
         try:
-            if _flow_key(page.url) == _flow_key(job_url):
+            if c.session_expired(page):
+                # The portal ended its session while the run waited on the user (Macquarie logs out after
+                # about ten idle minutes, application 488): the form under the dialog is dead, and filling it
+                # again only re-reported "the tick is left". Start over from the posting.
+                log.info("generic: the site's session has expired; going back to %s", job_url[:120])
+                ctx.step("The site's session expired; starting again from the job posting")
+            elif _flow_key(page.url) == _flow_key(job_url):
                 return False
-            if not self._is_portal_search(page):
+            elif c.other_job(job_url, page.url):
+                # The window is on another posting of the same portal (Macquarie, application 487: a retry
+                # resumed on "Employment Screening Administrator" and was about to apply there).
+                log.info("generic: the window is on a different job (%s); going back to %s",
+                         page.url[:120], job_url[:120])
+                ctx.step("The window is on a different job; going back to this one")
+            elif not self._is_portal_search(page):
                 return False
-            ctx.step("This is the portal's job search; going back to the job posting")
-            page.goto(job_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            else:
+                ctx.step("This is the portal's job search; going back to the job posting")
+            c.goto(page, job_url, timeout=NAV_TIMEOUT)
             page.wait_for_timeout(1500)
             c.dismiss_cookie_banner(page)
         except Exception as e:  # noqa: BLE001

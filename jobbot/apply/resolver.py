@@ -136,8 +136,22 @@ FACT_SYNONYMS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"^\s*(?:city|town|suburb)\s*$"), "address.city"),
     (re.compile(r"^\s*(?:state|province|region|county)\s*$"), "address.state"),
     (re.compile(r"\btime\s*zone\b"), "identity.time_zone"),
+    # The candidate's own government employment, however worded ("currently or in the past three years",
+    # "within the past 5 years", "U.S. Federal Government"). A relative's is a different question.
+    (re.compile(r"^(?!.*\b(?:family|relative|spouse|child|parent|related)\b).*\b(?:employee|employed|worked)\b.*\bgovern"),
+     "identity.government_employee"),
     (re.compile(r"\bpronunciation\b|\bpronounce\b|\bphonetic\b"), "identity.name_pronunciation"),
 )
+
+
+_PRONOUN_GROUPS = {"he": "he", "him": "he", "his": "he", "she": "she", "her": "she", "hers": "she",
+                   "they": "they", "them": "they", "their": "they", "theirs": "they"}
+
+
+def _pronoun_set(text: str) -> frozenset:
+    """{'he'} for "He/Him", "a. Him/His", "he / him / his"; {'he', 'they'} for "He/They"."""
+    words = re.findall(r"[a-z]+", re.sub(r"^\s*(?:[a-z]|\d+)[.)]\s+", "", (text or "").lower()))
+    return frozenset(_PRONOUN_GROUPS[w] for w in words if w in _PRONOUN_GROUPS)
 
 
 def fact_key_for(question: str) -> str:
@@ -277,7 +291,10 @@ _OPTION_ALIASES: dict[str, tuple[str, ...]] = {
 _CONDITIONAL_FOLLOWUP_RE = re.compile(
     r"^\s*if\s+(?:(?:your\s+)?answer\s+(?:is|was)\s+)?(?P<trigger>yes|no|y|n|other|so|selected|applicable|any)\b"
     r"[^a-z]*(?:please\s+)?"
-    r"(?:explain|elaborate|specify|describe|provide|share|tell|give|list|detail|note|state|comment|expand)")
+    r"(?:explain|elaborate|specify|describe|provide|share|tell|give|list|detail|note|state|comment|expand"
+    # "If yes, what are the general terms?" (GEI, application 443) under a non-compete answered No was filled
+    # with a paragraph about sponsorship: the question words count as much as the verbs.
+    r"|what|which|who|whom|when|where|how|name|enter|indicate|include)")
 _AFFIRMATIVE_RE = re.compile(r"^\s*(?:yes|y|true|agree|i\s+(?:do|am|have|will))\b", re.I)
 _NEGATIVE_RE = re.compile(r"^\s*(?:no|n|false|none|never|i\s+(?:do\s*n[o']?t|am\s+not|have\s+not))\b", re.I)
 
@@ -323,7 +340,8 @@ _LINKEDIN_OPTION_RE = re.compile(r"linked\s*-?\s*in", re.I)
 # Media" opens onto Facebook, Instagram, X and YouTube — none of them true.
 _SOURCE_FALLBACK_RES = (
     re.compile(r"job\s*(?:board|site|search|posting|listing)|\b(?:online|internet|web)\b|search\s+engine|google", re.I),
-    re.compile(r"social\s+(?:media|network)", re.I),
+    # "Socially" on Workday's own board (application 427): LinkedIn is a social network, said as an adverb.
+    re.compile(r"social\s+(?:media|network)|^\s*social(?:ly)?\s*$|social\s+(?:platform|site)s?", re.I),
     re.compile(r"^\s*other\b", re.I),
 )
 
@@ -481,6 +499,15 @@ def _yes_no_option(options: list[str], want_yes: bool) -> str | None:
     return None
 
 
+_NOT_A_QUESTION_RE = re.compile(r"\bno\s+[\w/ ]{1,40}\s+(?:available|found)\b|\bno (?:options|results|matches)\b"
+                                r"|\bnothing (?:to show|found)\b|\bloading\b", re.I)
+# Labels that are a fragment of a control, not a question: a date's "Month"/"Day"/"Year" box (today's date was
+# learned as the answer to "Month", application 429) or a file's own name read as its label ("Jawad-AI.pdf").
+_BARE_PART_RE = re.compile(r"^\s*(?:month|day|year|mm|dd|yyyy|yy|hour|minute|am/pm)\s*$|[.\s](?:pdf|docx?|rtf|txt)\s*$", re.I)
+_CONTROL_CAPTION_RE = re.compile(r"^\s*(?:\+\s*)?(?:add|edit|upload|save|remove|delete|browse|attach|"
+                                 r"generate|magically|show more|see more|view)\b(?:\s+\w+){0,3}\s*$", re.I)
+
+
 class Resolver:
     """Answers screening questions from cache, facts, and (optionally) the LLM."""
 
@@ -557,6 +584,23 @@ class Resolver:
             # Not an answer, whoever supplied it. Kept out of memory as well as off the disk: a run that
             # accepted one would select the list's own prompt on the form, and the board refuses that.
             log.info("not learning %r for %r: that is the list's prompt, not an answer", str(answer), question)
+            return
+        if source == "typed" and _NOT_A_QUESTION_RE.search(str(question)) or source == "typed" and _BARE_PART_RE.match(str(question)):
+            # A control's empty-state text read as its label ("Profile — No states/provinces available",
+            # Amazon, application 414): there is no question there to remember an answer to.
+            log.info("not learning %r: %r is a control's empty state, not a question", str(answer), question)
+            return
+        if source != "human" and key in store.ROW_FIELD_LABELS:
+            # A field of one repeating row (an experience's "Description", its "Start date"): the answer
+            # belongs to that row. Cached, "Resume" and "Immediately" were replayed into the next
+            # employer's experience rows (Siemens, application 438).
+            self.answers[key] = str(answer)
+            log.info("not caching %r for the row field %r", str(answer)[:40], question)
+            return
+        if source == "typed" and _CONTROL_CAPTION_RE.match(str(answer)):
+            # A button's caption read as the field's value: Employment Hero's "Introduction" section was taken
+            # for a dropdown holding "Add Experience" (application 413). Nobody answers a question that way.
+            log.info("not learning %r for %r: that is a button's caption, not an answer", str(answer), question)
             return
         rec = AnswerRecord(key=key, answer=str(answer), source=source, confidence=confidence, kind=kind,
                            options=[str(o) for o in (options or [])], scope=scope, reusable=reusable,
@@ -662,6 +706,26 @@ class Resolver:
         self.previous_answer = ans
         return ans
 
+    # "If you have not previously worked for ... Manulife ..., select "Not Applicable"" (application 426): the
+    # question names the option for the candidate who never worked there, and the list may not even carry it
+    # among the options read (a "Not Applicable" box reads as a placeholder). Answered only when the employer
+    # appears nowhere in the CV; anyone who did work there is asked as before.
+    _NEVER_WORKED_RE = re.compile(
+        r"if you have not (?:previously |ever )?(?:worked|been employed|been on assignment|provided services)"
+        r"[^\"“]{0,300}?(?:select|choose|pick|check|tick|indicate)\s*[\"“']([^\"”']{2,40})[\"”']", re.I)
+
+    def _named_option_for_never_worked_here(self, question: str) -> str:
+        m = self._NEVER_WORKED_RE.search(question or "")
+        if not m:
+            return ""
+        company = str(self.job.get("company", "") or "").strip()
+        head = re.split(r"[\s,|(]+", company)[0] if company else ""
+        if not head or len(head) < 3 or re.search(rf"\b{re.escape(head)}\b", self.cv_text or "", re.I):
+            return ""
+        log.info("%r: %s is not in the CV; answering with the option the question names, %r",
+                 question[:60], company, m.group(1))
+        return m.group(1).strip()
+
     def _numeric(self, question: str, ans: str) -> str:
         """`ans` as a number for a number box, or a pause so the user can give one.
 
@@ -684,6 +748,9 @@ class Resolver:
         key = normalize_question(question)
         if not key:
             raise NeedsHuman("Empty question", question=question, options=options, kind=kind)
+        named = self._named_option_for_never_worked_here(question)
+        if named:
+            return named
 
         # A one-time code is never in the cache, in facts, or something a model may invent: go straight to
         # the pause. (The runner seeds it into this resolver on resume, so the cache hit below is this run's.)
@@ -924,8 +991,25 @@ class Resolver:
         raise NeedsHuman(stopped, question=question, options=options, kind=kind)
 
     def _rule_for_protected(self, key: str, question: str, options: list[str], kind: str) -> str | None:
-        rule = self._rule_answer(key, question)
+        # The synonym fact first: "...governmental entity in another country?" otherwise met the country rule
+        # and was answered "Bangladesh" (ServiceNow, application 464).
+        rule = None if (fact_key_for(question) and self.fact_str(fact_key_for(question))) else self._rule_answer(key, question)
         if rule is None:
+            # A personal fact the candidate stated once under a synonym key (identity.government_employee,
+            # confirmed 2026-10-06): Amazon's "No, I was NEVER a government employee." and ServiceNow's plain
+            # Yes/No are both read from it, the long options by their polarity.
+            fk = fact_key_for(question)
+            stated = self.fact_str(fk) if fk else ""
+            if stated:
+                yes = stated.strip().lower() in _YES_WORDS
+                no = stated.strip().lower() in _NO_WORDS
+                if options and (yes or no):
+                    mapped = self._map_answer(key, stated, options) or self._pick_eeo_polarity(options, affirmative=yes)
+                else:
+                    mapped = stated if not options else self._map_answer(key, stated, options)
+                if mapped:
+                    self.learn(question, mapped, source="rule", kind=kind, options=options)
+                    return mapped
             return None
         mapped = self._map_answer(key, rule, options) if options else rule
         if mapped is None:
@@ -1116,6 +1200,15 @@ class Resolver:
         """Map a stated self-identification onto this form's wording. None when nothing matches safely."""
         if not options:
             return value or None
+        if "pronoun" in key:
+            # Pronouns by the set they name, not the spelling: the fact "a. Him/His" (Avanade's option, with its
+            # list marker) and PSP's "He/Him" are the same answer (application 425). One person's pronoun set
+            # is {he}, {she}, {they} or a mix; an option naming exactly the same set is the match.
+            want = _pronoun_set(value)
+            if want:
+                hit = [o for o in options if _pronoun_set(str(o)) == want]
+                if len(hit) == 1:
+                    return hit[0]
         if normalize_question(value) == "neither":
             # Northern Ireland's community list words "neither" as "Code 1.C - I am not a member of either …".
             hit = next((o for o in options if re.search(r"\bneither\b|\bnot a member of either\b", str(o), re.I)), None)
@@ -1161,9 +1254,16 @@ class Resolver:
         if "gender" in key or "sex " in key:
             for canon, names in self._GENDER_SYNONYMS.items():
                 if vl in names:
+                    wanted = [normalize_question(n) for n in names]
                     for o in options:
-                        if normalize_question(o) in [normalize_question(n) for n in names]:
+                        if normalize_question(o) in wanted:
                             return o
+                    # A combined label, "Man / Trans Man" (PSP's Workday, application 425): one of its parts
+                    # is the stated answer, word for word. Taken only when exactly one option has such a part.
+                    parts = [o for o in options
+                             if any(normalize_question(x) in wanted for x in re.split(r"\s*[/|]\s*|\s+or\s+", o))]
+                    if len(parts) == 1:
+                        return parts[0]
             return None
 
         # "Category (disability category)" when there is no disability: the list's own "not applicable".
@@ -1244,6 +1344,13 @@ class Resolver:
             return str(eeo.get("marital_status") or "").strip()
         if has("sexual orientation", "sexuality"):
             return str(eeo.get("sexual_orientation") or "").strip()
+        if has("lgbt", "2slgbt", "queer community"):
+            # "Do you identify as a member of the LGBTQ+ community?" with Yes defined by orientation (PSP,
+            # application 425). Read from the stated orientation only: heterosexual is a No, anything else is
+            # the candidate's to say, so it is asked.
+            if re.fullmatch(r"\s*(?:heterosexual|straight)\s*", str(eeo.get("sexual_orientation") or ""), re.I):
+                return "No"
+            return ""
         if has("household earner", "main earner", "highest earner"):
             return str(eeo.get("household_earner_at_14") or "").strip()
         if has("race", "ethnic", "hispanic", "latino"):
@@ -1419,10 +1526,13 @@ class Resolver:
         # Any minimum age up to 18 is the same fact: "Are you at least 16 years of age?" (Avanade, application
         # 377) stopped to ask. Above 18 over_18 proves nothing, so 21 is only answered when over_18 is false.
         age = re.search(r"\b(?:over|at least|older than)\s+(?:the\s+)?(?:age\s+of\s+)?(\d{2}|eighteen|sixteen|twenty one)\b"
-                        r"|\b(\d{2})\s+years?\s+(?:of\s+age|old)\s+or\s+older\b", key)
+                        r"|\b(\d{2})\s+years?\s+(?:of\s+age|old)\s+or\s+older\b"
+                        # "Positions ... require you to be 18 years of age. Do you meet this requirement?"
+                        # (Scientific Games, application 428)
+                        r"|\b(?:be|are|aged?)\s+(\d{2})\s*\+?\s+years?\s+(?:of\s+age|old)\b", key)
         if age or re.search(r"\blegal\s+(?:working\s+)?age\b", key):
             over = self.fact("identity.over_18", None)
-            word = (age.group(1) or age.group(2)) if age else "18"
+            word = (age.group(1) or age.group(2) or age.group(3)) if age else "18"
             n = {"eighteen": 18, "sixteen": 16, "twenty one": 21}.get(word) or int(word)
             if over is not None and (n <= 18 or not over):
                 return "Yes" if over else "No"

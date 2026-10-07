@@ -178,7 +178,7 @@ class WorkdayAdapter(Adapter):
             # A resume (or a sign-in) parked on Candidate Home: there is no Apply there, and judging it said
             # "the posting may be closed" about one Workday still reported open (Huron, application 343).
             ctx.step("Workday opened Candidate Home; going back to the job")
-            page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, ctx.job["url"], timeout=NAV_TIMEOUT)
             page.wait_for_timeout(STEP_WAIT)
 
         self._dismiss_legal(page)
@@ -405,7 +405,7 @@ class WorkdayAdapter(Adapter):
             log.info("workday: no reset mail for %s arrived", host)
             return False
         try:
-            page.goto(link, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, link, timeout=NAV_TIMEOUT)
             page.wait_for_timeout(STEP_WAIT)
             self._wait_for_render(page)
             self._fill_first(page, (PASSWORD,), password)
@@ -424,7 +424,7 @@ class WorkdayAdapter(Adapter):
                 log.warning("workday: the reset page refused jobbot's password: %s", "; ".join(errors[:3])[:300])
                 return False
             log.info("workday: password reset on %s; signing in with it", host)
-            page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, ctx.job["url"], timeout=NAV_TIMEOUT)
             page.wait_for_timeout(STEP_WAIT)
             self._dismiss_legal(page)
             self._start(ctx)
@@ -510,14 +510,15 @@ class WorkdayAdapter(Adapter):
             since = datetime.now(timezone.utc) - timedelta(seconds=MAIL_SKEW_S)
             page.wait_for_timeout(STEP_WAIT)
         ctx.step("Opening the verification link from your mailbox")
-        link = mail.fetch_link(since, hints=("workday", (ctx.job.get("company") or "").lower()))
+        link = mail.fetch_link(since, hints=("workday", (ctx.job.get("company") or "").lower()),
+                               label=mail.VERIFY_LABEL_RE)
         if not link:
             return False
         try:
-            page.goto(link, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, link, timeout=NAV_TIMEOUT)
             page.wait_for_timeout(STEP_WAIT)
             log.info("workday: followed the verification link")
-            page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            c.goto(page, ctx.job["url"], timeout=NAV_TIMEOUT)
             page.wait_for_timeout(STEP_WAIT)
             self._dismiss_legal(page)
             self._start(ctx)
@@ -607,7 +608,7 @@ class WorkdayAdapter(Adapter):
                     # to the posting and start from its Apply, once.
                     ctx.extra["wd_home_back"] = True
                     ctx.step("Workday opened Candidate Home; going back to the job")
-                    page.goto(ctx.job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                    c.goto(page, ctx.job["url"], timeout=NAV_TIMEOUT)
                     page.wait_for_timeout(STEP_WAIT)
                     self._dismiss_legal(page)
                     c.raise_if_already_applied(page)
@@ -749,6 +750,10 @@ class WorkdayAdapter(Adapter):
         walker._questions(ctx)              # the walker leaves prompts alone; _prompts owns them
         self._experience_dates(ctx)
         self._question_dates(ctx)
+        # A lone acknowledgement box under a step's own prose: Workday's "I acknowledge Workday's Recruitment
+        # Privacy Statement and VIBE Philosophy" (application 427) was left unticked, Save and Continue went
+        # nowhere and the run read it as an unconfirmed submit. Consent policy: such boxes are ticked.
+        c.tick_consent_boxes(page)
 
     def _question_dates(self, ctx: ApplyContext) -> None:
         """Any other empty Workday date field: asked by its label, typed in its own sections.
@@ -838,6 +843,22 @@ class WorkdayAdapter(Adapter):
                 title = c.clean(block.locator("input[id$='jobTitle'], input[name='jobTitle']").first.input_value())
             except Exception:  # noqa: BLE001
                 continue
+            if not company and i < len(history):
+                # The CV parse left the required Company empty and guessed a title of its own ("Senior AI
+                # Engineer" with no company, Element Fleet, application 454): the block in position i is
+                # history entry i, and facts.yaml's title and company are written over the guess.
+                entry_i = history[i]
+                for sel, value in (("input[id$='jobTitle'], input[name='jobTitle']", entry_i.get("title")),
+                                   ("input[id$='companyName'], input[name='companyName']", entry_i.get("company")),
+                                   ("input[id$='location'], input[name='location']", entry_i.get("location"))):
+                    box = block.locator(sel)
+                    try:
+                        if value and box.count():
+                            box.first.fill(str(value), timeout=c.MEDIUM)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("workday: experience row %d: %s", i, e)
+                company, title = str(entry_i.get("company") or ""), str(entry_i.get("title") or "")
+                log.info("workday: experience row %d had no company; wrote %r at %r from facts.yaml", i + 1, title, company)
             entry = next((h for h in history if company and str(h.get("company", "")).lower() in company.lower()), None) \
                 or next((h for h in history if title and str(h.get("title", "")).lower() == title.lower()), None)
             if not entry:
@@ -1130,6 +1151,10 @@ class WorkdayAdapter(Adapter):
                 options = self._search_prompt(ctx, page, box, label)
             except _SkillsAdded:
                 return
+            if answered(box):
+                # Enter on a query with one match picks it outright and closes the list: BDO's "School or
+                # University" took "Other" that way and the empty list read as a miss (application 420).
+                return
         seen: list[str] = []
         searched = False
         # The branch taken at the top of the tree, and the ones already found to hold nothing true. Autodesk's
@@ -1165,6 +1190,8 @@ class WorkdayAdapter(Adapter):
                     raise
                 searched = True
                 options = self._search_prompt(ctx, page, box, label)
+                if answered(box):
+                    return
                 if not options:
                     raise
                 continue
@@ -1477,7 +1504,11 @@ class WorkdayAdapter(Adapter):
         Both, because neither is reliable alone: tenants that put the job title where the step name should
         be leave the heading saying nothing about Review, and a step still rendering has no button yet.
         """
-        if re.search(r"\breview\b", self._heading(page), re.I):
+        # The step's NAME, not a word in it: Workday's own disclosures step is headed "Click on the link below
+        # to review the Non Disclosure Agreement", read as the review page, and "Submit" was pressed on a
+        # step whose acknowledgement box was still empty (application 427).
+        if re.match(r"^\s*(?:review(?:\s+(?:and|&)\s+submit)?|review your application|application review)\s*$",
+                    self._heading(page), re.I):
             return True
         for name in SUBMIT_NAMES:
             try:

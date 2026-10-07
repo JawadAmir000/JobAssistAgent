@@ -84,7 +84,7 @@ class LeverAdapter(Adapter):
         url = (page.url or "").split("?")[0].rstrip("/")
         if not url.endswith("/apply"):
             try:
-                page.goto(url + "/apply", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                c.goto(page, url + "/apply", timeout=NAV_TIMEOUT)
                 page.wait_for_timeout(800)
             except Exception as e:
                 raise ApplyError(f"Lever apply page did not load in {NAV_TIMEOUT // 1000}s: {e}"[:400]) from None

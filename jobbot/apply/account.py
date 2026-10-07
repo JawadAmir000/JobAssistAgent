@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 from jobbot import credentials
@@ -75,7 +76,10 @@ TO_CREATE_RE = re.compile(
     r"create\s+(?:an?\s+|a\s+new\s+|my\s+|your\s+)?(?:account|profile|log\s*in|login)"
     r"|^\s*register\b|register\s+(?:now|here|as)|sign\s*up|new\s+user|not\s+a\s+registered\s+user"
     r"|cr[ée]er\s+un\s+compte|s'inscrire|registrieren|konto\s+erstellen"
-    r"|crear\s+(?:una\s+)?cuenta|registrarse|registrati|registreren", re.I)
+    r"|crear\s+(?:una\s+)?cuenta|registrarse|registrati|registreren"
+    # Siemens' Avature board: "Create an account using any of the following options: Upload file | Self-complete"
+    # (application 438). Self-complete is the signup that does not need the CV parsed first.
+    r"|^\s*self[\s-]?complete\b|fill\s+(?:it\s+)?in\s+manually|enter\s+(?:details\s+)?manually", re.I)
 TO_SIGN_IN_RE = re.compile(
     r"(?:already|please)\s+sign\s+in|sign\s+in\s+(?:here|instead)|^\s*(?:please\s+)?sign\s+in\s*$"
     r"|^\s*log\s*in\s*$|existing\s+user|already\s+(?:have|a\s+registered|registered)"
@@ -90,7 +94,9 @@ THIRD_PARTY_RE = re.compile(r"linkedin|indeed|google|facebook|apple|seek\b|xing|
 # What a gate says when this address already has an account here. The password is reused across employers,
 # so an account on it is almost always one an earlier application created.
 ACCOUNT_EXISTS = re.compile(
-    r"already\s+(?:been\s+)?(?:registered|regist|in\s+use|exists?|taken)"
+    # Not as a question: "Already registered?" heads Siemens' sign-in panel (application 438) and is the same
+    # prompt as "Already have an account?", read as a refusal three sign-ins in a row.
+    r"already\s+(?:been\s+)?(?:registered|regist|in\s+use|exists?|taken)(?!\w*\s*\?)"
     # With a subject: "You already have an account" is the refusal, while a bare "Already have an account?"
     # is the log-in prompt every signup prints -- Meta's is a tab label, and matching it turned each signup
     # attempt into a sign-in with no account behind it (applications 213-214).
@@ -237,6 +243,30 @@ def at_gate(page: Any) -> str:
         return ""
 
 
+_SIGN_IN_NAMES = ("Sign In", "Sign in", "Log In", "Log in", "Login", "Sign in to your account")
+
+
+def _gate_frame(page: Any) -> Any:
+    """A view over the child frame that holds an email or password box, or None. Never looks inside a frame
+    from a frame, so a gate searched for there cannot recurse."""
+    if isinstance(page, c.FrameView):
+        return None
+    try:
+        for frame in list(page.frames)[1:]:
+            if not (frame.url or "").startswith("http"):
+                continue        # about:blank widgets (a newsletter box, a chat bubble) are never the gate
+            try:
+                boxes = frame.locator("input[type=email]:visible, input[type=password]:visible, "
+                                      "input[name*=email i]:visible, input[id*=email i]:visible")
+                if boxes.count():
+                    return c.FrameView(frame)
+            except Exception:  # noqa: BLE001 - a frame that detached mid-scan
+                continue
+    except Exception as e:  # noqa: BLE001
+        log.debug("account: gate frame: %s", e)
+    return None
+
+
 def _gate_button(page: Any, names: tuple[str, ...]) -> Any:
     """The control that sends this gate, or None.
 
@@ -272,6 +302,22 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
     # generated password typed there is a failed login on their real Google/Microsoft account (see
     # common.detect_sso, which pauses for it instead).
     c.detect_sso(page)
+    if _resume_signup(ctx):
+        return True
+    if not at_gate(page) and not _email_first(ctx):
+        frame = _gate_frame(page)
+        if frame is None:
+            return False
+        # The gate lives in a child frame: iCIMS draws "Enter Your Information" (one Email box) inside
+        # icims_content_iframe and frame-busts it opened on its own (AMD, application 421, seen 8 times).
+        # The same gate, run in place inside the frame; the walker then finds the form there (_form_root).
+        log.info("account: the sign-in is inside a frame (%s); passing it there", (frame.url or "")[:100])
+        ctx.page = frame
+        try:
+            return pass_gate(ctx, fill)
+        finally:
+            if ctx.page is frame:
+                ctx.page = page
     if not at_gate(page) and not _email_first(ctx):
         return False
     page = ctx.page
@@ -282,7 +328,8 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
         raise NeedsHuman("This employer wants an account before it will show the application form, and "
                          "facts.yaml has no email address to create one with.")
 
-    creating = True
+    # Sign in first where this run already learned the account exists (see "already has an account" below).
+    creating = not ctx.extra.get(f"account_exists:{urlparse(page.url or '').hostname or ''}")
     signed_up = False       # whether a signup form was ever actually submitted, for the message at the end
     # The short managed password, on the sign-in round after the primary was refused. A sign-in view prints
     # no length rule, so account_password() cannot know the account behind it was made on a form that capped
@@ -311,6 +358,22 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
             creating = not creating
             continue
 
+        if not at_gate(page) and kind == "create" and ACCOUNT_EXISTS.search(_text(page) or ""):
+            # Off the signup form, but onto "Account Already Exists ... Click Sign In" (EY's SuccessFactors,
+            # application 431), which was logged as a successful signup and looped back here. Sign in instead.
+            host = (urlparse(page.url or "").hostname or "")
+            ctx.extra[f"account_exists:{host}"] = True
+            log.info("account: %s already has an account on %s; signing in instead", email, host)
+            link = c.named_button(page, _SIGN_IN_NAMES) or _named_link(page, _SIGN_IN_NAMES)
+            if link is not None:
+                try:
+                    link.click(timeout=c.MEDIUM)
+                    page.wait_for_timeout(SETTLE_MS)
+                    _settle(page)
+                except Exception as e:  # noqa: BLE001
+                    log.info("account: pressing Sign In: %s", str(e)[:120])
+            creating = False
+            continue
         if not at_gate(page):
             log.info("account: %s succeeded on %s", "signup" if kind == "create" else "sign-in",
                      (page.url or "")[:100])
@@ -339,6 +402,84 @@ def pass_gate(ctx: ApplyContext, fill: Callable[[], None]) -> bool:
         "Finish it in the browser window — sign in, or create the account by hand — then click Continue.")
 
 
+# Avature's "Choose your application method": sign in on the left, or make the account on the right by
+# uploading a CV ("From Device"), which is the only signup the page offers. There is no file input until the
+# portal's script builds one, and that script is wired up on the window load event -- which Macquarie's
+# portal reaches after 15 to 130 seconds, and on some loads never wires the button at all.
+_RESUME_SIGNUP = 'a[data-registermethod="file"]'
+_RESUME_SIGNUP_READY_JS = r"""() => {
+    const e = document.querySelector('a[data-registermethod="file"]');
+    if (!e) return false;
+    if (!window.pjQuery || !pjQuery._data) return document.readyState === 'complete';
+    const d = pjQuery._data(e, 'events');
+    return !!(d && d.click);
+}"""
+RESUME_SIGNUP_LOAD_MS = 150000
+RESUME_SIGNUP_ATTEMPTS = 3
+
+
+def _resume_signup(ctx: ApplyContext) -> bool:
+    """Make the account on a gate whose only signup is "upload your CV". True when the upload went through
+    and the page has moved on to the signup form, which the walker then fills like any other page.
+
+    Macquarie (application 486/487): the run took the sign-in half for the whole gate, signed in with a
+    password no account held ("The email address or password may be incorrect"), found no create link and
+    stopped asking for the account to be made by hand. The create link is a CV upload button."""
+    page = ctx.page
+    try:
+        trigger = page.locator(_RESUME_SIGNUP).first
+        if not page.locator(_RESUME_SIGNUP).count() or not c.is_visible_now(trigger):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    host = urlparse(page.url or "").hostname or ""
+    if ctx.extra.get(f"account_exists:{host}") or not ctx.cv_path:
+        return False
+    ctx.step("Creating your account by uploading your CV")
+    for attempt in range(RESUME_SIGNUP_ATTEMPTS):
+        before = page.url
+        try:
+            page.wait_for_load_state("load", timeout=RESUME_SIGNUP_LOAD_MS)
+        except Exception:  # noqa: BLE001 - the readiness test below is the real gate
+            pass
+        try:
+            page.wait_for_function(_RESUME_SIGNUP_READY_JS, timeout=20000)
+            if c.dismiss_cookie_banner(page):
+                page.wait_for_timeout(1500)     # the banner animates away over the button
+            with page.expect_file_chooser(timeout=15000) as chooser:
+                page.locator(_RESUME_SIGNUP).first.click(timeout=10000)
+            chooser.value.set_files(str(ctx.cv_path))
+            page.wait_for_timeout(1000)
+            # No waiting on the click itself: it posts the CV, and the portal takes far longer than any click
+            # timeout to answer. Timing out there reloaded the page and threw away an upload in flight.
+            page.locator(_RESUME_SIGNUP_SEND).locator("visible=true").first.click(timeout=c.MEDIUM,
+                                                                                    no_wait_after=True)
+            page.wait_for_url(lambda u: u.split("#")[0] != before.split("#")[0], timeout=RESUME_SIGNUP_LOAD_MS)
+        except Exception as e:  # noqa: BLE001 - an unwired button: load the page again and retry
+            log.info("account: CV-upload signup attempt %d did not go through (%s); reloading",
+                     attempt + 1, str(e).splitlines()[0][:120])
+            try:
+                c.goto(page, before, timeout=60000)
+            except Exception as e2:  # noqa: BLE001
+                log.info("account: reloading the gate: %s", str(e2).splitlines()[0][:120])
+            continue
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+        except Exception:  # noqa: BLE001 - same slow portal; what is on screen is what gets filled
+            pass
+        page.wait_for_timeout(SETTLE_MS)
+        log.info("account: signup by CV upload went through, now on %s", (page.url or "")[:100])
+        ctx.step("Filling the signup form")
+        return True
+    raise ApplyError("This employer's portal would not take the CV upload that creates its account "
+                     f"(tried {RESUME_SIGNUP_ATTEMPTS} times — the site is very slow). Click Retry in a few minutes.")
+
+
+# The upload's own Continue, shown under the button once a file is chosen ("uploadFileResume" is the id the
+# portal script gives it; the class is the section it draws for that method).
+_RESUME_SIGNUP_SEND = "#uploadFileResume, .manualRegisterMethodExtra [type=submit]"
+
+
 _EMAIL_FIRST_JS = r"""() => {
     const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
         return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
@@ -351,7 +492,8 @@ _EMAIL_FIRST_JS = r"""() => {
         + ((i.labels && i.labels[0] && i.labels[0].innerText) || '')));
     if (!email) return false;
     const text = (document.body.innerText || '').toLowerCase();
-    return /\b(sign in|log in|login|create an account|create account|register)\b/.test(text);
+    // iCIMS words its email-first step "Enter Your Information" (AMD, application 421)
+    return /\b(sign in|log in|login|create an account|create account|register|enter your (?:information|email|details)|candidate profile|returning (?:user|candidate))\b/.test(text);
 }"""
 EMAIL_FIRST_NEXT = ("Continue", "Next", "Continue with email", "Sign in with email", "Submit", "Weiter", "Continuer")
 
@@ -365,7 +507,8 @@ def _email_first(ctx: ApplyContext) -> bool:
     try:
         if not page.evaluate(_EMAIL_FIRST_JS):
             return False
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.info("account: email-first test failed on %s: %s", (page.url or "")[:80], str(e)[:120])
         return False
     email = ctx.fact("identity.email")
     if not email:
@@ -374,13 +517,18 @@ def _email_first(ctx: ApplyContext) -> bool:
                        "input[id*=email i]:visible").first
     try:
         if not box.count():
+            log.info("account: email-first page, but no email box to fill")
             return False
         box.fill(email, timeout=c.MEDIUM)
     except Exception as e:  # noqa: BLE001
-        log.debug("account: email-first fill: %s", e)
+        log.info("account: email-first fill: %s", str(e)[:160])
         return False
+    # A consent box beside the address (iCIMS's "accept_gdpr", AMD application 421): Next is refused until
+    # it is ticked. Consent policy: such boxes are always ticked.
+    _tick_consent_boxes(page)
     button = c.named_button(page, EMAIL_FIRST_NEXT)
     if button is None:
+        log.info("account: email-first page, but none of %s to press", EMAIL_FIRST_NEXT)
         return False
     log.info("account: email-first sign-in; sending %s and reading the next step", email)
     try:
@@ -592,7 +740,10 @@ def _submit_credentials(ctx: ApplyContext, email: str, creating: bool, fill: Cal
     except Exception:  # noqa: BLE001
         pass
     try:
-        button.click(timeout=c.MEDIUM)
+        # No waiting after the click: the settle below does that. Macquarie's portal answers a sign-in slower
+        # than the click timeout, and a click that had gone through was logged as one that would not take
+        # (application 487) and then sent again.
+        button.click(timeout=c.MEDIUM, no_wait_after=True)
     except Exception as e:  # noqa: BLE001 - a click something else swallowed is a gate not passed, not a crash
         log.info("account: the %s button would not take a click (%s)", "create" if creating else "sign-in",
                  str(e).splitlines()[0][:120])
@@ -709,6 +860,17 @@ def _accept_terms(page: Any) -> bool:
     """
     accepted = _tick_consent_boxes(page)
     accepted = c.tick_consent_boxes(page) > 0 or accepted     # the boxes drawn in shapes the scan above skips
+    # A terms dialog still open from the last attempt (EY's SuccessFactors Privacy Notice, application 431)
+    # covers the link that opens it, so the click below failed and nothing was ever accepted.
+    open_now = _accept_by_pattern(page)
+    if open_now is not None:
+        try:
+            open_now.click(timeout=c.MEDIUM)
+            page.wait_for_timeout(800)
+            log.info("account: accepted the terms dialog that was already open")
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.info("account: the open terms dialog would not take the click: %s", str(e)[:120])
     try:
         # Not get_by_role("link"): an <a> with no href has no link role, and Taleo's "Read and accept the
         # data privacy statement." is exactly that -- a script-driven anchor -- so the signup went round
@@ -727,7 +889,10 @@ def _accept_terms(page: Any) -> bool:
             if href and not href.startswith("#") and "javascript" not in href.lower():
                 continue
             log.info("account: opening the terms with %r", name[:60])
-            el.click(timeout=c.MEDIUM)
+            try:
+                el.click(timeout=c.MEDIUM)
+            except Exception as e:  # noqa: BLE001 - covered by a dialog it already opened: accept that
+                log.info("account: the terms link would not take the click (%s); looking for its dialog", str(e)[:80])
             page.wait_for_timeout(1200)
             accepted = _accept_in_dialog(page) or accepted
             break
@@ -760,12 +925,30 @@ def _tick_consent_boxes(page: Any) -> bool:
     return ticked
 
 
+_ACCEPT_RE = re.compile(r"^\s*(?:i\s+)?(?:accept|agree|acknowledge|consent)\b", re.I)
+
+
+def _accept_by_pattern(page: Any) -> Any:
+    """An accept control inside an open dialog whose wording is not on ACCEPT_NAMES ("Acknowledge/Consent…")."""
+    try:
+        loc = page.locator("[role=dialog] button, [role=alertdialog] button, dialog button, [aria-modal=true] button, "
+                           "[role=dialog] [role=button], .ui-dialog button").filter(has_text=_ACCEPT_RE)
+        for i in range(min(loc.count(), 4)):
+            if c.is_visible_now(loc.nth(i)):
+                return loc.nth(i)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _accept_in_dialog(page: Any) -> bool:
     """Press Accept in the terms dialog that has just opened. False when no dialog appeared — which is what
     SuccessFactors does when the form behind it does not yet validate."""
     button = None
-    for _ in range(8):      # SuccessFactors draws its Privacy Notice dialog a second or two after the click (EY, 288)
-        button = c.named_button(page, ACCEPT_NAMES)
+    # SuccessFactors draws its Privacy Notice dialog a second or two after the click (EY, 288), and on a slow
+    # day well past four (EY again, application 431: the dialog was up by the time the run had given up).
+    for _ in range(24):
+        button = c.named_button(page, ACCEPT_NAMES) or _accept_by_pattern(page)
         if button is not None:
             break
         page.wait_for_timeout(500)

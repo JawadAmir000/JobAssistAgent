@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from jobbot.apply.base import AlreadyApplied, ApplyContext, ApplyError, NeedsHuman
 
@@ -62,6 +62,33 @@ UNCERTAIN_MSG = ("jobbot filled this form and pressed Submit, but the site showe
 UNCERTAIN_AGAIN_MSG = ("jobbot still cannot confirm this application went through, and it will not send the "
                        "form a second time by itself. Finish or check it in the open window, then click "
                        "'Mark applied' if it is in, or Retry to start the application over.")
+GOTO_MIN_TEXT = 200   # characters of body text that make a page "shown" though it never finished loading
+
+
+def goto(page: Any, url: str, *, timeout: int = 30000) -> None:
+    """page.goto(url, wait_until="domcontentloaded") that tolerates a page which renders but never fires
+    DOMContentLoaded. Macquarie's Avature portal shows the whole job within seconds, yet a handful of its
+    deferred script bundles hang for minutes, so the event never comes and goto() timed out on a page that
+    was on screen (application 486, 'Page.goto: Timeout 30000ms exceeded' four times). On a timeout, a page
+    that has reached the URL and has real text on it is used as it is; anything else is still a timeout."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        return
+    except Exception as e:  # noqa: BLE001
+        if "Timeout" not in str(e):
+            raise
+        try:
+            here = page.url or ""
+            text = len(page.evaluate("document.body ? document.body.innerText : ''") or "")
+        except Exception:  # noqa: BLE001
+            raise e from None
+        if here.startswith("http") and text >= GOTO_MIN_TEXT:
+            log.info("goto: %s never finished loading, but it is shown (%d chars); carrying on",
+                     here[:120], text)
+            return
+        raise
+
+
 CONFIRM_TEXTS = (
     "thank you for applying", "thanks for applying", "application has been submitted", "application submitted",
     "your application was submitted", "we have received your application", "we've received your application",
@@ -260,8 +287,12 @@ WIDGET_JS = r"""
         // the answer to Lenovo's currency question (application 336).
         return wClean(wClean(out).replace(/(^|\s)[×✕✖⨯](?=\s|$)/g, ' '));
     };
+    // Site chrome is never part of an application: AMD's iCIMS footer drew its social links and menus as lists
+    // that the walker "answered" and learned from ('Benefits' -> 'Job Categories', application 421).
+    const wChrome = el => !el.closest('form') && !!el.closest(
+        'nav, footer, header, [role=navigation], [role=contentinfo], [role=banner], [role=menubar], [role=menu], [class*=footer i], [id*=footer i], [class*=navbar i], [class*=site-header i], [class*=global-header i], [class*=social i], [class*=chat i], [id*=chat i], [aria-label*=chat i], [class*=concierge i], [class*=intercom i], [id*=intercom i], [class*=drift i], [id*=drift i], [class*=livechat i], [class*=messenger i], [role=log]');
     const wIsRoot = el => {
-        if (!wVis(el)) return false;
+        if (!wVis(el) || wChrome(el) || el.closest("[class*=chat i], [id*=chat i], [aria-label*=chat i], [class*=concierge i], [class*=intercom i], [id*=intercom i], [class*=drift i], [id*=drift i], [class*=livechat i], [class*=messenger i], [role=log]")) return false;
         const r = el.getBoundingClientRect();
         if (r.height > 120 || r.width < 40) return false;          // a control's size, never a section's
         if (el.querySelector(W_NATIVE)) return false;               // wraps something the walker already drives
@@ -699,7 +730,56 @@ def upload_resume(page: Any, cv_path: str, file_input: Any | None = None) -> boo
     return False
 
 
-def follow_control_href(page: Any, el: Any, url_before: str) -> bool:
+_JOB_ID_PARAMS = ("jobid", "job_id", "jobreqid", "reqid", "requisitionid", "record", "jid", "gh_jid")
+
+
+def other_job(job_url: str, url: str) -> bool:
+    """True when `url` is a different posting on the same site as `job_url`, told by a job-id query parameter
+    both carry with different values. Macquarie's Avature portal (application 487): a retry resumed on a
+    window the portal had moved to a page about other jobs, pressed the first 'Apply' there, and set out to
+    make the account and apply for "Employment Screening Administrator | Manila" (jobId=24498) instead of
+    the AI Engineer role (jobId=22923)."""
+    try:
+        a, b = urlparse(job_url or ""), urlparse(url or "")
+        if not a.netloc or a.netloc.lower() != b.netloc.lower():
+            return False
+        qa = {k.lower(): v for k, v in parse_qsl(a.query)}
+        qb = {k.lower(): v for k, v in parse_qsl(b.query)}
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k in qa and k in qb and qa[k] != qb[k] for k in _JOB_ID_PARAMS)
+
+
+_SESSION_EXPIRED_RE = re.compile(r"(?:your\s+)?session\s+(?:has\s+)?(?:expired|timed\s*out|ended)", re.I)
+
+
+def session_expired(page: Any) -> bool:
+    """True when a visible dialog says the site's session has ended (Avature: "Your session has expired")."""
+    try:
+        return bool(page.evaluate(r"""(src) => {
+            const re = new RegExp(src, 'i');
+            const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
+            // Any short visible heading or line saying it -- Avature draws its notice in a plain div overlay.
+            return [...document.querySelectorAll('h1, h2, h3, h4, p, strong, [role=dialog], [role=alertdialog], dialog')]
+                .some(d => (d.innerText || '').length < 200 && re.test(d.innerText || '') && vis(d));
+        }""", _SESSION_EXPIRED_RE.pattern))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def control_href(el: Any) -> str:
+    """The absolute URL a control carries (href or a data-* link), '' when none."""
+    try:
+        return el.evaluate("""e => { const v = e.getAttribute('href') || e.getAttribute('data-href')
+                                   || e.getAttribute('data-url') || e.getAttribute('data-link') || '';
+                                   if (!v || /^(#|javascript:)/i.test(v)) return '';
+                                   try { return new URL(v, location.href).href; } catch (_) { return ''; } }""") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def follow_control_href(page: Any, el: Any, url_before: str, job_url: str = "") -> bool:
     """Open the URL a non-link control carries when pressing it went nowhere.
 
     TalentMate's "Apply Job" is a <button href="…/candidate/job-applications/apply/…"> wired to a modal
@@ -707,18 +787,15 @@ def follow_control_href(page: Any, el: Any, url_before: str) -> bool:
     fourth all stayed on the posting (application 307, seen 12 times). The URL is the site's own, on
     the control the walk already chose to press, so following it is that press finished by hand.
     """
-    try:
-        href = el.evaluate("""e => { const v = e.getAttribute('href') || e.getAttribute('data-href')
-                                   || e.getAttribute('data-url') || e.getAttribute('data-link') || '';
-                                   if (!v || /^(#|javascript:)/i.test(v)) return '';
-                                   try { return new URL(v, location.href).href; } catch (_) { return ''; } }""")
-    except Exception:  # noqa: BLE001
-        return False
+    href = control_href(el)
     if not href or href == url_before or not href.startswith("http"):
+        return False
+    if other_job(job_url, href):
+        log.info("not opening %s: it is a different job from %s", href[:120], job_url[:120])
         return False
     log.info("the press went nowhere; opening the URL the control carries: %s", href[:120])
     try:
-        page.goto(href, wait_until="domcontentloaded", timeout=30000)
+        goto(page, href, timeout=30000)
         page.wait_for_timeout(1500)
     except Exception as e:  # noqa: BLE001
         log.info("that URL would not open: %s", str(e).splitlines()[0][:120])
@@ -763,9 +840,13 @@ def _upload_through_chooser(page: Any, cv_path: str) -> bool:
         zones = page.get_by_text(_DROPZONE_RE)
         for i in range(min(zones.count(), 6)):
             zone = zones.nth(i)
-            if not is_visible_now(zone) or re.match(r"^\s*(?:please\s+)?upload\s+your\s+(?:resume|cv)\b",
-                                                    zone.inner_text() or "", re.I):
-                continue    # the question above the zone ("Please upload your resume"), not the zone
+            # The question above the zone ("Please upload your resume") is skipped, not the zone — unless it
+            # is itself a button: Eightfold's profile builder offers exactly "Upload your resume" as one
+            # (GlobalFoundries, application 402), and skipping it left the step for the user.
+            if not is_visible_now(zone) or (
+                    re.match(r"^\s*(?:please\s+)?upload\s+your\s+(?:resume|cv)\b", zone.inner_text() or "", re.I)
+                    and not zone.evaluate("e => !!e.closest('button, a, [role=button]')")):
+                continue
             near = zone.evaluate("""e => { let p = e; for (let i = 0; i < 15 && p; i++, p = p.parentElement) {
                     const t = (p.innerText || '').slice(0, 400); if (/\\b(cv|resume|résumé|curriculum)\\b/i.test(t)) return t; }
                     return ''; }""")
@@ -1180,13 +1261,55 @@ def _button_named_visible(page: Any, names: tuple[str, ...]) -> bool:
             """ const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
                 const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                 const want = new Set(names.map(norm));
-                for (const b of deepAll('button, input[type=submit], input[type=button], [role=button]')) {
+                // Links too: Eightfold's "Apply Now" is an <a> drawn as a button, and with it unseen the form-gone
+                // rule took a profile builder closing over the job page for a sent application (402).
+                for (const b of deepAll('button, input[type=submit], input[type=button], [role=button], a[href], [role=link]')) {
                     if (!vis(b)) continue;
                     if (want.has(norm(deepText(b) || b.value)) || want.has(norm(deepAttr(b, 'aria-label')))) return true;
                 }
                 return false; }""", list(names)))
     except Exception:  # noqa: BLE001
         return True     # unknown: assume the form is still there
+
+
+# A question the site puts between Submit and the submission: Stikeman Elliott's "You've made changes to your
+# documents. Would you like to save these changes to your presence? Yes / No" (application 429) held the submit
+# open until the window closed on it. Answered with its affirmative, once per dialog, unless the dialog is about
+# leaving, discarding or withdrawing.
+_SUBMIT_DIALOG_JS = r"""() => {
+    const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const boxes = [...document.querySelectorAll('[role=dialog], [role=alertdialog], dialog[open], .modal.show, .modal.in, '
+        + '.ui-dialog, [class*=modal i][class*=open i], [class*=dialog i][class*=open i], [aria-modal=true]')].filter(vis);
+    for (const d of boxes) {
+        const text = (d.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 600) continue;
+        if (/\b(leave|discard|delete|withdraw|remove|lose|unsaved|cancel (?:your|this) application|sign out|log out)\b/i.test(text)) continue;
+        if (!/\b(sure|confirm|save (?:these |the |your )?changes|would you like|do you want|proceed|submit)\b/i.test(text)) continue;
+        const btns = [...d.querySelectorAll('button, input[type=button], input[type=submit], a[role=button]')].filter(vis);
+        const yes = btns.find(b => /^\s*(yes|ok|okay|confirm|submit|continue|proceed|save|yes, (?:submit|continue|save))\b/i
+            .test((b.innerText || b.value || '').trim()));
+        if (yes) { yes.setAttribute('data-jobbot-dialog-yes', '1'); return text.slice(0, 160); }
+    }
+    return '';
+}"""
+
+
+def answer_submit_dialog(page: Any, answered: set[str]) -> bool:
+    """Press the affirmative of a confirm/save dialog raised by a submit. True when one was pressed."""
+    try:
+        text = page.evaluate(_SUBMIT_DIALOG_JS) or ""
+        if not text or text in answered:
+            return False
+        answered.add(text)
+        btn = page.locator("[data-jobbot-dialog-yes]").first
+        label = clean(btn.inner_text() or btn.get_attribute("value") or "")
+        btn.click(timeout=MEDIUM)
+        log.info("submit raised a dialog (%r); pressed %r", text[:100], label)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("submit dialog: %s", e)
+        return False
 
 
 def wait_for_confirmation(page: Any, timeout_s: int = CONFIRM_TIMEOUT_S, names: tuple[str, ...] = ()) -> bool:
@@ -1225,11 +1348,15 @@ def wait_for_confirmation(page: Any, timeout_s: int = CONFIRM_TIMEOUT_S, names: 
     verify_since: float | None = None
     captcha_since: float | None = None
     inflight_deadline = time.time() + SUBMIT_INFLIGHT_MAX_S
+    answered_dialogs: set[str] = set()
     while time.time() < deadline:
         try:
             url = page.url.lower()
             if url != start_url.lower() and confirm_url(url):
                 return True
+            if answer_submit_dialog(page, answered_dialogs):
+                page.wait_for_timeout(SUBMIT_SETTLE_MS)
+                continue
             body = clean(page.evaluate("() => (document.body && document.body.innerText) || ''")).lower()
             if any(t in body for t in CONFIRM_TEXTS if t not in stale_phrases):
                 if not form_errors(page):
@@ -1638,6 +1765,11 @@ _FIELD_ERRORS_JS = """
     const CTRL = "input,select,textarea,[role=combobox],[contenteditable='true'],[data-jobbot-widget]";
     const fillable = e => {
         if (!e || !e.matches || !e.matches(CTRL)) return false;
+        // A chat widget is never the application, form of its own or not: Personio's "AI Chat Concierge"
+        // box was typed into as a question (application 460).
+        if (e.closest("[class*=chat i], [id*=chat i], [aria-label*=chat i], [class*=concierge i], [class*=intercom i], [id*=intercom i], [class*=drift i], [id*=drift i], [class*=livechat i], [class*=messenger i], [role=log]")) return false;
+        if (!e.closest('form') && e.closest('nav, footer, header, [role=navigation], [role=contentinfo], [role=banner], [role=menubar], [role=menu], [class*=footer i], [id*=footer i], [class*=navbar i], [class*=site-header i], [class*=global-header i], [class*=social i], [class*=chat i], [id*=chat i], [aria-label*=chat i], [class*=concierge i], [class*=intercom i], [id*=intercom i], [class*=drift i], [id*=drift i], [class*=livechat i], [class*=messenger i], [role=log]'))
+            return false;                                         // site chrome: a menu, a language picker, a footer
         if (e.hasAttribute('data-jobbot-widget')) return vis(e);
         if (e.closest('[data-jobbot-widget]')) return false;     // a widget's own search box: the widget is the control
         const t = (e.getAttribute('type') || '').toLowerCase();
@@ -1960,6 +2092,74 @@ def _clear_control(el: Any) -> None:
             continue
 
 
+def fit_phone_pattern(el: Any, phone: str, national: str = "") -> str:
+    """Write the number in the first shape the box's own validity accepts; '' when none does."""
+    digits = re.sub(r"\D", "", phone or "")
+    nat = re.sub(r"\D", "", national or "")
+    if not digits:
+        return ""
+    code = digits[: len(digits) - len(nat.lstrip("0"))] if nat and digits.endswith(nat.lstrip("0")) else ""
+    rest = nat.lstrip("0") if nat else digits
+    shapes = [f"+{digits}", digits, f"00{digits}", nat, rest,
+              f"+{code} {rest}" if code else "", f"+{code}-{rest}" if code else "",
+              f"+{code} {rest[:4]} {rest[4:]}" if code else "", f"({code}) {rest}" if code else ""]
+    for shape in dict.fromkeys(x for x in shapes if x):
+        try:
+            ok = el.evaluate("""(e, v) => { const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                set.call(e, v); e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true}));
+                return e.checkValidity(); }""", shape)
+        except Exception:  # noqa: BLE001
+            return ""
+        if ok:
+            return shape
+    return ""
+
+
+_EXPAND_GROUPS_JS = r"""(scope) => {
+    // A required question drawn as a bare header until clicked: Personio's "Preferred Work Location*" renders its
+    // Amsterdam ... Remote checkboxes only after a click on the header, with no ARIA saying so (application 460).
+    // The shape: a row whose text ends in the required "*", holding no control at all, among sibling rows that do.
+    const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const CTRL = 'input:not([type=hidden]), select, textarea, button, [role=combobox], [role=listbox], [contenteditable=true]';
+    const root = (scope && scope !== 'body' && document.querySelector(scope)) || document.body;
+    const marked = [];
+    for (const el of root.querySelectorAll('div, li')) {
+        if (!vis(el) || el.querySelector(CTRL) || el.hasAttribute('data-jobbot-expanded')) continue;
+        const full = (el.innerText || '').trim();
+        const t = full.split('\n')[0].trim();          // a validation line can sit under the header once refused
+        if (full.length > 220 || t.length < 3 || t.length > 120 || !/\*\s*$/.test(t)) continue;
+        if (/resume|\bcv\b|upload|attach|\bfile|document|photo|cover letter/i.test(t)) continue;   // a click there opens a file picker
+        const par = el.parentElement;
+        if (!par || ![...par.children].some(x => x !== el && x.querySelector(CTRL))) continue;
+        el.setAttribute('data-jobbot-expand', String(marked.length));
+        marked.push(t.slice(0, 60));
+    }
+    return marked;
+}"""
+
+
+def expand_hidden_choice_groups(page: Any, scope: str = "body") -> int:
+    """Click open every collapsed choice list on the page, so its boxes can be answered. Returns how many."""
+    try:
+        heads = page.evaluate(_EXPAND_GROUPS_JS, scope) or []
+    except Exception as e:  # noqa: BLE001
+        log.debug("expand groups: %s", e)
+        return 0
+    opened = 0
+    for i, name in enumerate(heads[:8]):
+        try:
+            h = page.locator(f"[data-jobbot-expand='{i}']").first
+            h.click(timeout=SHORT)
+            h.evaluate("e => e.setAttribute('data-jobbot-expanded', '1')")
+            page.wait_for_timeout(300)
+            opened += 1
+            log.info("opened the collapsed choice list %r", name)
+        except Exception as e:  # noqa: BLE001
+            log.debug("expand %r: %s", name, e)
+    return opened
+
+
 def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
     """Act on one field the form rejected. True when the control now holds something different.
 
@@ -1970,6 +2170,15 @@ def _repair_one(ctx: ApplyContext, el: Any, f: dict) -> bool:
     """
     page = ctx.page
     label, kind, before, msg = f["label"], f["kind"], f["value"], f["message"]
+
+    # A phone box with its own pattern: "Please match the requested format." (Personio, application 460)
+    # refused +8801771614053 twice. The same number in each common shape, keeping the one the box accepts.
+    if kind == "text" and re.search(r"phone|mobile|tel", label, re.I) and \
+            re.search(r"format|pattern|valid", msg, re.I):
+        shaped = fit_phone_pattern(el, ctx.fact("identity.phone"), ctx.fact("identity.phone_national"))
+        if shaped and shaped != before:
+            log.info("%r refused %r; its pattern takes %r", label[:60], before, shaped)
+            return True
 
     # "Enter a maximum of 50 characters." — the answer is right and too long (Nationwide's Oracle form held
     # "N/A - I have not worked at Nationwide or Virgin Money", application 314). Keep its first clause, and
@@ -2522,6 +2731,42 @@ def is_materialize_face(el: Any) -> bool:
         return False
 
 
+_BACKING_SELECT_JS = r"""(e) => {
+    // A dropdown drawn over a hidden native <select>: select2, chosen, bootstrap-select, nice-select, tom-select.
+    // The <select> is the real field the form submits; the facade is only how it is shown.
+    const hidden = s => s.tagName === 'SELECT' && (s.classList.contains('select2-hidden-accessible')
+        || s.getAttribute('aria-hidden') === 'true' || getComputedStyle(s).display === 'none'
+        || s.offsetWidth < 3 || s.offsetHeight < 3);
+    const ids = (e.getAttribute('aria-controls') || '') + ' ' + (e.getAttribute('aria-owns') || '') + ' '
+              + ((e.querySelector('[id^=select2-][id$=-container]') || {}).id || '') + ' ' + (e.id || '');
+    const m = ids.match(/select2-(.+?)-(?:container|results)/);
+    if (m) { const s = document.getElementById(m[1]); if (s && s.tagName === 'SELECT') { s.setAttribute('data-jobbot-native', '1'); return true; } }
+    const facade = e.closest('.select2-container, .chosen-container, .bootstrap-select, .nice-select, .ts-wrapper, .selectize-control') || e;
+    for (let n = facade, i = 0; n && i < 3; n = n.parentElement, i++) {
+        const sib = [n.previousElementSibling, n.nextElementSibling];
+        for (const c of sib) if (c && hidden(c)) { c.setAttribute('data-jobbot-native', '1'); return true; }
+        const inside = [...(n.parentElement ? n.parentElement.querySelectorAll(':scope > select') : [])].filter(hidden);
+        if (inside.length === 1) { inside[0].setAttribute('data-jobbot-native', '1'); return true; }
+    }
+    return false;
+}"""
+
+
+def backing_select(el: Any) -> Any:
+    """The hidden native <select> a drawn dropdown stands in for, or None. Amazon's select2 "How did you hear
+    about this role?" (application 414) would not open for the widget walker; its <select> takes the answer
+    directly, with the full list readable without opening anything."""
+    try:
+        el.page.evaluate("() => document.querySelectorAll('[data-jobbot-native]').forEach(s => s.removeAttribute('data-jobbot-native'))")
+        if not el.evaluate(_BACKING_SELECT_JS):
+            return None
+        nat = el.page.locator("select[data-jobbot-native]").first
+        return nat if nat.count() and len(select_options(nat)) >= 2 else None
+    except Exception as e:  # noqa: BLE001
+        log.debug("backing_select: %s", e)
+        return None
+
+
 def set_hidden_select(el: Any, label: str) -> bool:
     """Choose `label` in a hidden native <select> the page draws its own way (Materialize: Coveo's French form,
     application 378), firing the events its script listens for and updating the box it displays."""
@@ -2534,6 +2779,8 @@ def set_hidden_select(el: Any, label: str) -> bool:
             e.value = o.value; o.selected = true;
             e.dispatchEvent(new Event('input', {bubbles: true}));
             e.dispatchEvent(new Event('change', {bubbles: true}));
+            // select2 / chosen redraw on their own jQuery events
+            if (window.jQuery) { try { jQuery(e).trigger('change').trigger('chosen:updated'); } catch (err) {} }
             const face = e.closest('.select-wrapper') && e.closest('.select-wrapper').querySelector('input.select-dropdown');
             if (face) face.value = o.textContent.trim();
             return e.value === o.value; }""", label))
@@ -2990,6 +3237,49 @@ def combobox_all_options(page: Any, combo: Any, limit: int = 300) -> list[str]:
         return combobox_options(page, combo, limit=limit)
 
 
+def _grid_popup(combo: Any) -> str:
+    """The id of the grid a combobox opens, '' when it opens a listbox. Oracle Recruiting Cloud's cx-select
+    ("Country", WSP, application 433) says aria-haspopup="grid" and draws rows, not role=option items, so every
+    option reader came back empty and "Bangladesh" was "not an option"."""
+    try:
+        if (combo.get_attribute("aria-haspopup") or "").lower() != "grid":
+            return ""
+        return combo.get_attribute("aria-controls") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _choose_from_grid(page: Any, combo: Any, answer: str, alternatives, seen: list[str]) -> bool:
+    grid = _grid_popup(combo)
+    rows_sel = (f"[id='{grid}'] [role=row], [id='{grid}'] [role=gridcell], [id='{grid}'] [role=option], "
+                f"[id='{grid}'] li")
+    for term in dict.fromkeys([answer, *alternatives]):
+        if not term:
+            continue
+        try:
+            combo.click(timeout=SHORT)
+            combo.fill("", timeout=SHORT)
+            combo.press_sequentially(str(term)[:40], delay=40, timeout=MEDIUM)
+            page.wait_for_timeout(1200)
+            rows = page.locator(rows_sel)
+            texts = [clean(rows.nth(i).inner_text()) for i in range(min(rows.count(), 40))]
+            seen.extend(t for t in texts if t and t not in seen)
+            hit = next((i for i, t in enumerate(texts) if t and same_option(t, str(term))), None)
+            if hit is None:
+                starts = [i for i, t in enumerate(texts) if t.lower().startswith(str(term).lower())]
+                hit = starts[0] if len(starts) == 1 else None
+            if hit is None:
+                continue
+            rows.nth(hit).click(timeout=MEDIUM)
+            page.wait_for_timeout(400)
+            got = clean(current_value(combo))
+            log.info("grid combobox: chose %r (reads back %r)", texts[hit], got)
+            return bool(got)
+        except Exception as e:  # noqa: BLE001
+            log.debug("grid combobox %r: %s", term, e)
+    return False
+
+
 def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str, ...] | list[str] = (),
                     *, allow_other: bool = False, seen: list[str] | None = None) -> bool:
     """Click the combobox, type the answer, pick the matching option.
@@ -3011,6 +3301,8 @@ def choose_combobox(page: Any, combo: Any, answer: str, alternatives: tuple[str,
         seen = []
     if is_widget(combo):
         return choose_widget(page, combo, answer, alternatives, allow_other=allow_other, seen=seen)
+    if _grid_popup(combo):
+        return _choose_from_grid(page, combo, answer, alternatives, seen)
     try:
         _open_combobox(combo)
         page.wait_for_timeout(200)
@@ -3974,7 +4266,33 @@ def click_submit(page: Any, names: tuple[str, ...]) -> None:
                 return
         except Exception:
             continue
+    if spam_flagged(page):
+        raise NeedsHuman(SPAM_FLAG_MSG)
     raise ApplyError("Submit button not found")
+
+
+# A submit turned down by the board's own bot score, worded as a spam verdict: Ashby's "Your application
+# submission was flagged as possible spam. If you believe this was a mistake, please submit your application
+# again" (EvenUp, application 419). The form is filled and the Submit button gone, which used to read as
+# "Submit button not found" and a failed application. Nothing here tries to get round the check.
+_SPAM_FLAG_RE = re.compile(r"flagged as (?:possible |potential |likely )?spam|(?:suspected|possible) (?:spam|bot)\b"
+                           r"|automated (?:submission|traffic) (?:was )?detected|looks like (?:spam|a bot)", re.I)
+SPAM_FLAG_MSG = ("The site's bot check flagged the submission as spam (every field is filled). Press Submit "
+                 "yourself in the open window, then click 'Mark applied' once it confirms.")
+
+
+# Pages reached from a form's own links where nothing should ever be submitted: accommodation requests, contact
+# forms, privacy/terms/FAQ/help pages (Siemens, application 438, sent its accommodation form).
+NOT_APPLICATION_URL_RE = re.compile(r"accommodation|/contact(?:-us)?(?:/|\b|$)|/privacy|privacy-(?:policy|notice|statement)"
+                                    r"|/terms(?:-of|/|\b)|/faq|/help(?:/|\b)|/support/|/newsletter|/subscribe|preference",
+                                    re.I)
+
+
+def spam_flagged(page: Any) -> bool:
+    try:
+        return bool(_SPAM_FLAG_RE.search(clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # The emailed-code boxes live inside the same <form> as the screening questions, so every adapter's control
@@ -4104,13 +4422,27 @@ def _shows_dial_code(el: Any) -> bool:
         return False
 
 
+_TWO_DIGIT_DIAL = frozenset("20 27 30 31 32 33 34 36 39 40 41 43 44 45 46 47 48 49 51 52 53 54 55 56 57 58 "
+                            "60 61 62 63 64 65 66 81 82 84 86 90 91 92 93 94 95 98".split())
+
+
 def dial_in(text: str) -> str:
     """The dial code written into `text` ("Bangladesh (+880)" -> "880", "+ 880" -> "880"); '' when none.
 
     One place knows how a form writes a dial code, because three of them used to guess at it separately.
     """
     m = re.search(r"\+\s*(\d{1,4})", text or "")
-    return m.group(1) if m else ""
+    if not m:
+        return ""
+    code = m.group(1)
+    # Only a code some country really has. Employment Hero's Country box was left showing "+8" (the start of a
+    # number typed at it), read as a dial picker already on our +880, and the phone went out as "801771614053"
+    # (application 413). No country's code is 8, 2 or 3 alone; a one- or two-digit code must be a real one.
+    if len(code) == 1 and code not in "17":
+        return ""
+    if len(code) == 2 and code not in _TWO_DIGIT_DIAL:
+        return ""
+    return code
 
 
 def dial_code_on_page(page: Any) -> str:
@@ -4872,7 +5204,10 @@ def is_honeypot(el: Any, label: str = "") -> bool:
 # password jobbot uses for those lives in jobbot.credentials — so these are filled, never asked about.
 _PASSWORD_LABEL_RE = re.compile(r"pass\s*word|pass\s*phrase|pass\s*code", re.I)
 # ...except the kind that is a question: a one-time code mailed or texted to the candidate.
-_ONE_TIME_PASSWORD_RE = re.compile(r"one[\s-]*time|verification|security|confirmation|\botp\b|2fa", re.I)
+# "Confirmation" only as a code: "Password confirmation" is the retyped password, and taking it for a one-time
+# code left Macquarie's signup confirmation to be filled with something else (application 488).
+_ONE_TIME_PASSWORD_RE = re.compile(r"one[\s-]*time|verification|security|confirmation\s*(?:code|number|pin)\b"
+                                   r"|\botp\b|2fa", re.I)
 
 
 def is_password_control(el: Any, label: str = "") -> bool:
@@ -4981,6 +5316,21 @@ def fill_account_password(page: Any, password: str = "") -> bool:
                 filled = True
         except Exception as e:  # noqa: BLE001
             log.debug("password box %d: %s", i, e)
+    # A password and its confirmation must agree. Where one box already holds the managed password, a box
+    # beside it holding anything else is not the user's to keep: Macquarie's "Password confirmation" was
+    # taken for a one-time code, answered with an invented value cached from another signup, and left the
+    # account about to be created with a confirmation matching nothing (application 488).
+    try:
+        visible = [boxes.nth(i) for i in range(count) if is_visible_now(boxes.nth(i))]
+        values = [current_value(el) for el in visible]
+        if password in values:
+            for el, value in zip(visible, values):
+                if value and value != password and is_password_control(el, get_label_for(el)):
+                    log.info("a password box disagreed with the account password beside it; filling it again")
+                    _clear_control(el)
+                    filled = fill_verified(el, password) or filled
+    except Exception as e:  # noqa: BLE001
+        log.debug("password boxes re-check: %s", e)
     if filled:
         log.info("filled the account password from the keychain")
     return filled
@@ -5014,6 +5364,11 @@ def _other_ok(label: str) -> bool:
     return bool(_OTHER_OK_LABEL_RE.search(label or "") or _FIELD_OF_STUDY_RE.search(label or ""))
 
 
+_JUNK_CHOICE_RE = re.compile(r"^[\s+\-().\d]+$")
+_NUMERIC_LABEL_RE = re.compile(r"phone|mobile|code|dial|prefix|year|number|no\.|zip|post|age|salary|experience|"
+                               r"how many|count|amount|rate|gpa|score|grade|month|day|hour|notice|\bnum", re.I)
+
+
 def _choice_miss(el: Any, label: str, ans: str, options: list[str] | None, kind: str,
                  required_el: Any = None) -> None:
     """An answer the control would not take. Ask about it, or leave an optional field be — never fail.
@@ -5024,9 +5379,37 @@ def _choice_miss(el: Any, label: str, ans: str, options: list[str] | None, kind:
     goes to the card instead; the pick is learned as the candidate's answer to this label and the run carries
     on in the same window. Modelled on the Workday list pick (workday.py), the one place that already did it.
     """
+    try:
+        held = clean(el.evaluate("e => e.tagName === 'SELECT' && e.selectedIndex >= 0 ? "
+                                 "e.options[e.selectedIndex].textContent : ''") or "") or clean(current_value(el) or "")
+        if held and ans and (same_option(held, ans) or held.lower() == str(ans).lower()):
+            # The choice landed and the control re-rendered under the call that made it (GEI's MUI native
+            # select showed "Bangladesh" while the run asked which country, application 443).
+            log.info("%r already shows %r; not a miss", label[:60], held)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        gone = el.count() == 0 or not el.first.is_visible()
+    except Exception:  # noqa: BLE001 - a wrapper without count(): judged by is_required as before
+        gone = False
+    if gone:
+        # The control went away while it was being answered: Employment Hero re-draws its profile editor, and
+        # the stale "First Name" locator then read as a required list with no options (application 413).
+        # A question about a control that is not there cannot be answered; the next pass re-reads the page.
+        log.info("not asking about %r: its control is no longer on the page", label)
+        return
     if not is_required(required_el if required_el is not None else el):
         log.info("leaving the optional %r blank: the form's list has nothing matching %r", label, ans)
         return
+    try:
+        # What the walker took for this question's list, kept in the log: a label pinned on the wrong control
+        # ("First Name" on Employment Hero's Country dropdown, application 413) is only seen in the markup.
+        log.info("choice miss on %r: control %s", label[:60], clean(el.evaluate("e => e.outerHTML") or "")[:400])
+        (pathlib.Path(__file__).resolve().parents[2] / "data" / "screenshots" / "last-choice-miss.html").write_text(
+            el.page.content())
+    except Exception as e:  # noqa: BLE001
+        log.info("choice miss on %r: could not read the control (%s: %s)", label[:60], type(el).__name__, e)
     # The card draws these as a <select>, so a country list goes whole: cut at 25, Sea's "United Arab
     # Emirates" was never on offer and the only way to answer was the browser window (application 300).
     offered = [o for o in (options or []) if clean(o) and not is_prompt_value(o)][:300]
@@ -5105,6 +5488,11 @@ def is_required(el: Any) -> bool:
         verdict = el.evaluate("""e => {
             if (e.required || e.getAttribute('aria-required') === 'true') return true;
             if (e.getAttribute('aria-required') === 'false') return false;
+            // A radio/checkbox group judged by its container: the `required` is on the inputs inside it
+            // (Amazon's government-employment radios, application 414, read as optional and were left blank).
+            if (!/^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName) && e.querySelector
+                && e.querySelector('input[type=radio][required], input[type=checkbox][required], [role=radiogroup][aria-required=true], [role=radio][aria-required=true]'))
+                return true;
             const star = t => /\*|\brequired\b|\bobligatoire\b|\bpflichtfeld\b|\bobligatorio\b/i.test(t || '');
             // the control's own label first: Greenhouse and most React boards put the * there, and the
             // nearest <div> around a react-select input is a wrapper with no label in it at all
@@ -5274,6 +5662,17 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
         ans = _ask(ctx, el, label, None, kind)
         if ans is None:
             return
+        if ans == "" and kind in ("text", "textarea") and current_value(el):
+            from jobbot.apply.resolver import _CONDITIONAL_FOLLOWUP_RE, normalize_question as _nq
+            if _CONDITIONAL_FOLLOWUP_RE.match(_nq(label)):
+                # An "If yes, ..." box whose condition is not met, still holding what an earlier pass put
+                # there (GEI's non-compete terms read as a sponsorship paragraph, application 443).
+                try:
+                    el.fill("", timeout=SHORT)
+                    log.info("cleared %r: its 'if yes' condition is not met", label[:60])
+                except Exception as e:  # noqa: BLE001
+                    log.debug("clearing %r: %s", label[:60], e)
+                return
         if kind == "text" and (fmt := typed_date_format(el)):
             # A text box that is really a date picker (react-datepicker, a type=date input, a "MM/DD/YYYY"
             # placeholder) throws away anything it cannot parse on blur: "Immediately" typed into OpenAI's
@@ -5328,6 +5727,8 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             _choice_miss(el, label, ans, opts, kind)
         else:
             log.info("hidden select %r -> %r", label[:60], ans)
+    elif kind == "select" and re.fullmatch(r"\s*(?:day|month|year|dd|mm|yyyy)\s*\**\s*", label or "", re.I):
+        _fill_date_parts(ctx, el, label)
     elif kind == "select":
         opts = options or select_options(el)
         existing = clean(el.evaluate("e => e.selectedIndex > 0 ? e.options[e.selectedIndex].textContent : ''"))
@@ -5350,8 +5751,27 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
             return
         if not choose_select(el, ans, opts):
             _choice_miss(el, label, ans, opts, kind)
+    elif kind == "combobox" and (nat := backing_select(el)) is not None:
+        opts = [o for o in select_options(nat) if not is_prompt_value(o)]
+        held = clean(nat.evaluate("e => e.selectedIndex >= 0 && e.value ? e.options[e.selectedIndex].textContent : ''") or "")
+        if held and not is_prompt_value(held):
+            ctx.seen(held, label, kind="select", options=opts)
+            return
+        ans = _ask(ctx, el, label, opts, "select")
+        if ans is None:
+            return
+        want = next((o for o in opts if o.lower() == ans.lower() or same_option(o, ans)), ans)
+        if not set_hidden_select(nat, want):
+            _choice_miss(el, label, ans, opts, "select")
+        else:
+            log.info("native select behind %r -> %r", label[:60], want)
     elif kind == "combobox":
         existing = combobox_value(el)
+        if existing and _JUNK_CHOICE_RE.match(existing) and not _NUMERIC_LABEL_RE.search(label):
+            # Digits where a name belongs: Employment Hero's Country held "+8", the start of a phone number
+            # typed at it, and as "already answered" it was left that way (application 413). Chosen afresh.
+            log.info("combobox %r holds %r, which is no answer to it; choosing again", label[:60], existing)
+            existing = ""
         if existing:
             ctx.seen(existing, label, kind=kind, placeholder=combobox_is_placeholder(el),
                      default=_unchanged_identity(ctx, label, existing))
@@ -5372,6 +5792,26 @@ def answer_and_set(ctx: ApplyContext, el: Any, label: str, kind: str, options: l
                 # Typing the answer filtered the list to nothing, so `seen` is empty or a first page: the
                 # question would reach the card as a bare text box. The whole list, for the user to pick from.
                 seen = combobox_all_options(page, el) or seen
+            digits = re.sub(r"\D", "", str(ans))
+            if seen and len(digits) >= 8 and sum(1 for o in seen if dial_in(o)) >= max(3, len(seen) // 2):
+                # A country-code picker labelled "Phone" (Kingspan, application 461: "Ireland+353", "Albania+355"
+                # ...) was given the whole number and left on Ireland. Its options are dial codes: take the
+                # longest one our number starts with, and search the list for that country.
+                codes = sorted({dial_in(o) for o in seen if dial_in(o)} | {digits[:n] for n in (1, 2, 3)}, key=len, reverse=True)
+                code = next((k for k in codes if digits.startswith(k) and any(dial_in(o) == k for o in seen + combobox_all_options(page, el))), "")
+                pick = next((o for o in seen + combobox_all_options(page, el) if dial_in(o) == code), None) if code else None
+                if pick and choose_combobox(page, el, clean(re.sub(r"\+\s*\d+", "", pick)) or pick, (pick,), seen=[]):
+                    log.info("combobox %r is a dial-code list; chose %r for +%s", label[:60], pick, code)
+                    return
+            if seen and not opts and len(seen) < 60:
+                # Answered blind: the list only drew its options once opened (Amazon's select2 "How did you
+                # hear about this role?", application 414), so "LinkedIn" was given where the list says
+                # "Job Posting". Asked again with the options in hand, the resolver maps to one of them.
+                again = _ask(ctx, el, label, seen, kind)
+                if again and again != ans and choose_combobox(page, el, again, _answer_alternatives(ctx, label),
+                                                              allow_other=_other_ok(label), seen=[]):
+                    log.info("combobox %r: %r was not offered; chose %r from the list", label[:60], ans, again)
+                    return
             _choice_miss(el, label, ans, seen, kind)
     elif kind in ("radio", "checkbox"):
         cont = container if container is not None else el
@@ -5696,6 +6136,12 @@ def verification_prompt(page: Any) -> dict | None:
     m = _VERIFY_LEN_RE.search(text)
     length = int(m.group(1)) if m and 3 <= int(m.group(1)) <= 12 else 0
     if not length:
+        # The form's own example says how long: Amazon's "Enter verification code (e.g. 123456)" (application
+        # 414), whose single box otherwise read as an 8-character code.
+        ex = re.search(r"(?:e\.g\.?|for example|example|like)[:\s]*\(?\s*([A-Za-z0-9]{4,10})\b", text, re.I)
+        if ex and re.search(r"\d", ex.group(1)):
+            length = len(ex.group(1))
+    if not length:
         length = _code_length(boxes)
     to = ""
     m = _VERIFY_TO_RE.search(text)
@@ -5942,6 +6388,28 @@ RESEND_NAMES = ("resend email", "resend code", "resend", "send a new code", "sen
                 "send code again", "get a new code", "request a new code", "didn't get a code? resend")
 
 
+# "Resend", "Send me a new code" (Amazon, application 414), "Didn't get it? Send again", "Request a new link":
+# worded a dozen ways, so matched by shape rather than listed. Anchored to the start of the control's name so a
+# sentence that merely mentions sending is not pressed.
+RESEND_RE = re.compile(r"^\s*(?:didn'?t (?:get|receive) (?:it|a code|the (?:code|email|link))\??\s*)?"
+                       r"(?:re-?send|send (?:me )?(?:a |the )?(?:new |another )?(?:code|link|email|one)(?: again)?"
+                       r"|send (?:it )?again|(?:get|request) (?:a )?new (?:code|link)|send new (?:code|link))\b", re.I)
+
+
+def resend_control(page: Any) -> Any:
+    """The visible control that asks the site to mail the code or link again, or None."""
+    for role in ("button", "link"):
+        try:
+            loc = page.get_by_role(role, name=RESEND_RE)
+            for i in range(min(loc.count(), 4)):
+                el = loc.nth(i)
+                if is_visible_now(el) and el.is_enabled():
+                    return el
+        except Exception:  # noqa: BLE001
+            continue
+    return named_button(page, RESEND_NAMES) or _named_link_on(page, RESEND_NAMES)
+
+
 def _named_link_on(page: Any, names: tuple[str, ...]) -> Any:
     for name in names:
         try:
@@ -5966,12 +6434,18 @@ def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
     ctx.step("Waiting for the verification code by email")
     hints = (ctx.job.get("company", ""), ctx.job.get("ats", ""))
     code = mail.fetch_code(submitted_at, length=length, hints=hints)
+    used = ctx.extra.setdefault("codes_used", [])
+    if code and code in used:
+        # Typed already and the step is still here, so the form refused it — usually because it expired
+        # (Amazon's last 3 minutes, application 414). Reading the same mail again would loop; ask for a new one.
+        log.info("verification: the code in the mailbox was already tried; asking for a new one")
+        code = None
     if not code and mail.is_configured()[0] and not ctx.extra.get("code_resent"):
         # The code this step is waiting for was mailed before the wait began -- on a Retry, or after a code
         # that was typed wrong -- so no new mail is coming by itself. Lumen's step offers "resend email";
         # pressing it once, then reading only mail newer than the press, is what a person would do
         # (application 225). Once per application: every press restarts the sender's cooldown.
-        resend = named_button(ctx.page, RESEND_NAMES) or _named_link_on(ctx.page, RESEND_NAMES)
+        resend = resend_control(ctx.page)
         if resend is not None:
             from datetime import datetime, timezone
             ctx.extra["code_resent"] = True
@@ -5994,9 +6468,23 @@ def handle_verification(ctx: ApplyContext, prompt: dict, submitted_at) -> None:
         # Asked through the resolver so a resume can read the answer back; never written to answers.json
         # (see Resolver.learn) because a one-time code must not be replayed on the next application.
         code = ctx.answer(VERIFY_QUESTION, None, "text")
+    used.append(code)
     if not fill_verification_code(ctx.page, code):
         raise ApplyError("Could not type the verification code into the form")
     ctx.step("Verification code entered")
+
+
+# An optional account upsell between sign-in and the form: Employment Hero's "Transition your profile to
+# password login" offers "Set Up Password" or "Skip for now (3 logins remaining)" (application 413). Nothing on
+# it belongs to the application, so the skip is pressed; a cookie banner over it is never the way on.
+UPSELL_PAGE_RE = re.compile(
+    r"set ?up (?:a |your )?(?:password|passkey)|password login|passkeys?\b|two[- ]factor|multi[- ]factor|\bmfa\b"
+    r"|download (?:our|the) app|get the app|(?:enable|turn on) (?:push )?notifications|secure your account"
+    r"|security upgrade|add (?:a )?(?:phone|recovery) (?:number|email)", re.I)
+SKIP_CONTROL_RE = re.compile(r"^\s*(?:skip(?: for now| this step| this| it)?|not now|maybe later|remind me later"
+                             r"|no,? thanks|later|i'?ll do (?:it|this) later|do (?:it|this) later)\b", re.I)
+COOKIE_CONTROL_RE = re.compile(r"cookie|accept all|reject all|allow all|deny all|without accepting"
+                               r"|(?:only|strictly) necessary|necessary only|manage (?:preferences|consent)", re.I)
 
 
 # The sign-in-by-email step. JOIN asks for the candidate's email on its first page and then, instead of a
@@ -6024,34 +6512,99 @@ def login_link_prompt(page: Any) -> bool:
     return bool(text and _LOGIN_LINK_PROMPT_RE.search(text))
 
 
+# "Didn't get the email? Send again" -- the press that mails a fresh link once the old one has expired.
+LOGIN_RESEND_NAMES = RESEND_NAMES + ("send again", "resend link", "send link again", "send a new link",
+                                     "resend sign-in link", "resend login link", "send me a new link")
+_LINK_DEAD_RE = re.compile(r"link (?:has |is )?(?:expired|invalid|no longer valid|already (?:been )?used)"
+                           r"|(?:expired|invalid) (?:sign[- ]?in |log ?in |magic )?link", re.I)
+
+
+def _link_failed(page: Any) -> bool:
+    """True when following the link left the candidate where they were: the wait page, or an "expired" one."""
+    if login_link_prompt(page):
+        return True
+    try:
+        text = clean(page.evaluate("() => (document.body && document.body.innerText) || ''"))
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_LINK_DEAD_RE.search(text or ""))
+
+
 def follow_login_link(ctx: ApplyContext, sent_at) -> None:
     """Open the emailed sign-in link in the application's own window, which is what continues the form.
 
     Read from the mailbox like a code. When it cannot be, the user is asked to paste it once: opening it
     from the mail app would sign in their everyday browser, not the window jobbot is filling.
+
+    These links are one-time and short-lived (Employment Hero's last 15 minutes), so on a Retry the one in
+    the mailbox is usually spent. When the link does not sign in, the wait page is reopened, its "Send
+    again" is pressed once, and only mail newer than that press is read (application 413).
     """
+    from datetime import datetime, timezone
     from jobbot import mail
 
     page = ctx.page
+    wait_url = page.url
     ctx.step("Opening the sign-in link from your mailbox")
     host = (urlparse(page.url).hostname or "").removeprefix("www.").split(".")[0]
-    link = mail.fetch_link(sent_at, match=LOGIN_LINK_URL_RE,
-                           hints=(ctx.job.get("company", ""), ctx.job.get("ats", ""), host))
-    if not link:
-        link = (ctx.answer(LOGIN_LINK_QUESTION, None, "text") or "").strip()
-    # JOIN's plain-text part carries "&amp;" between the query parameters, and a link followed with those
-    # still in it drops the token and signs nobody in.
-    link = html.unescape(link)
-    if not link.lower().startswith("http"):
-        raise ApplyError("The sign-in link from the email is not a web address")
-    page.goto(link, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(LOGIN_LINK_WAIT_MS)
-    log.info("followed the emailed sign-in link; now on %s", page.url[:100])
-    if login_link_prompt(page):
-        # Expired, or already spent by an earlier attempt. Following it again would loop to MAX_PAGES.
-        raise NeedsHuman("The emailed sign-in link did not sign in (it may have expired). Press 'Resend link' "
-                         "in the open window, then click Retry.")
-    ctx.step("Signed in from the email link")
+    hints = (ctx.job.get("company", ""), ctx.job.get("ats", ""), host)
+    used = ctx.extra.setdefault("login_links_used", [])
+    link = mail.fetch_link(sent_at, match=LOGIN_LINK_URL_RE, label=mail.LOGIN_LABEL_RE, hints=hints)
+    if link in used:
+        link = None                     # spent by an earlier attempt; following it again only shows "expired"
+    for attempt in range(2):
+        if not link and attempt == 0 and used and mail.is_configured()[0]:
+            link = "resend"             # a Retry whose only mailed link is spent: go straight to "Send again"
+        if link and link != "resend":
+            # JOIN's plain-text part carries "&amp;" between the query parameters, and a link followed with
+            # those still in it drops the token and signs nobody in.
+            link = html.unescape(link)
+            if not link.lower().startswith("http"):
+                raise ApplyError("The sign-in link from the email is not a web address")
+            used.append(link)
+            goto(page, link, timeout=30000)
+            page.wait_for_timeout(LOGIN_LINK_WAIT_MS)
+            log.info("followed the emailed sign-in link; now on %s", page.url[:100])
+            if not _link_failed(page):
+                ctx.step("Signed in from the email link")
+                return
+        if attempt or ctx.extra.get("login_link_resent") or not mail.is_configured()[0]:
+            break
+        # Back to the wait page and ask for a new link, as a person would.
+        if page.url != wait_url:
+            try:
+                goto(page, wait_url, timeout=30000)
+                page.wait_for_timeout(LOGIN_LINK_WAIT_MS)
+            except Exception as e:  # noqa: BLE001
+                log.debug("login link: back to the wait page: %s", e)
+        resend = resend_control(page)
+        if resend is None:
+            log.info("login link: no 'Send again' on %s", page.url[:100])
+            break
+        ctx.extra["login_link_resent"] = True
+        sent = datetime.now(timezone.utc) - timedelta(seconds=VERIFY_CLOCK_SKEW_S)
+        try:
+            resend.click(timeout=MEDIUM)
+        except Exception as e:  # noqa: BLE001
+            log.debug("login link: resend: %s", e)
+            break
+        log.info("login link: the mailed link was spent; pressed 'Send again' and waiting for a new one")
+        ctx.step("Asked for a new sign-in link")
+        link = mail.fetch_link(sent, match=LOGIN_LINK_URL_RE, label=mail.LOGIN_LABEL_RE, hints=hints)
+    if not used:
+        # No link could be read from the mailbox at all: ask once for it to be pasted.
+        link = html.unescape((ctx.answer(LOGIN_LINK_QUESTION, None, "text") or "").strip())
+        if not link.lower().startswith("http"):
+            raise ApplyError("The sign-in link from the email is not a web address")
+        used.append(link)
+        goto(page, link, timeout=30000)
+        page.wait_for_timeout(LOGIN_LINK_WAIT_MS)
+        if not _link_failed(page):
+            ctx.step("Signed in from the email link")
+            return
+    # Expired, or already spent. Following it again would loop to MAX_PAGES.
+    raise NeedsHuman("The emailed sign-in link did not sign in (it may have expired). Press 'Resend link' "
+                     "in the open window, then click Retry.")
 
 
 # A date asked for with a calendar rather than a box. JOIN draws its "When are you available to start?" step as
@@ -6150,6 +6703,72 @@ def fill_typed_date(el: Any, answer: str, fmt: str) -> bool:
         log.debug("fill_typed_date: %s", e)
         return False
     return bool(clean(current_value(el)))
+
+
+_DATE_PARTS_JS = r"""(e) => {
+    // The three selects of one date (Talemetry's MonthYearDaySelect, GEI application 443), and the question
+    // they answer: the nearest text above the group that is not itself a part's label.
+    const part = t => { t = (t || '').replace(/[*\s]+/g, ' ').trim().toLowerCase();
+        return /^(day|dd)$/.test(t) ? 'day' : /^(month|mm)$/.test(t) ? 'month' : /^(year|yyyy)$/.test(t) ? 'year' : ''; };
+    const lab = s => { const l = s.labels && s.labels[0]; if (l) return l.innerText;
+        const f = s.closest('[class*=FormControl], .field, div'); const x = f && f.querySelector('label'); return x ? x.innerText : ''; };
+    let group = e.parentElement;
+    for (let i = 0; i < 6 && group; i++, group = group.parentElement) {
+        const sels = [...group.querySelectorAll('select')].filter(s => part(lab(s)));
+        if (sels.length >= 2) {
+            sels.forEach(s => s.setAttribute('data-jobbot-datepart', part(lab(s))));
+            let q = '';
+            for (let n = group; n && !q; n = n.parentElement) {
+                const cands = [...n.querySelectorAll('label, legend, p, h3, h4, span')]
+                    .filter(x => !group.contains(x) && (x.compareDocumentPosition(group) & Node.DOCUMENT_POSITION_FOLLOWING));
+                const t = cands.length ? (cands[cands.length - 1].innerText || '').trim() : '';
+                if (t && !part(t)) q = t;
+                if (n === document.body) break;
+            }
+            return q.slice(0, 200);
+        }
+    }
+    return null;
+}"""
+
+
+def _fill_date_parts(ctx: ApplyContext, el: Any, label: str) -> None:
+    """Answer a date drawn as Month / Day / Year selects as one question, and set each part."""
+    from datetime import date
+    page = ctx.page
+    try:
+        question = el.evaluate(_DATE_PARTS_JS)
+    except Exception as e:  # noqa: BLE001
+        log.debug("date parts: %s", e)
+        question = None
+    if question is None:
+        _ask(ctx, el, label, select_options(el), "select")      # a lone "Year" list: an ordinary question
+        return
+    question = strip_required(clean(question)) or "Date"
+    ans = _ask(ctx, el, question, None, "text")
+    if not ans:
+        return
+    target = _target_date(str(ans), date.today())
+    if target is None:
+        raise NeedsHuman(f"'{question[:80]}' wants a date and jobbot could not turn {ans!r} into one. Set it in "
+                         "the browser window, then click Continue.", question=question, kind="text")
+    import calendar
+    wants = {"day": [str(target.day), f"{target.day:02d}"],
+             "month": [calendar.month_name[target.month], calendar.month_abbr[target.month], str(target.month),
+                       f"{target.month:02d}"],
+             "year": [str(target.year)]}
+    for part, values in wants.items():
+        box = page.locator(f"select[data-jobbot-datepart={part}]").first
+        try:
+            if not box.count():
+                continue
+            opts = select_options(box)
+            hit = next((o for v in values for o in opts if clean(o).lower() == v.lower()), None)
+            if hit is not None:
+                box.select_option(label=hit, timeout=MEDIUM)
+        except Exception as e:  # noqa: BLE001
+            log.debug("date part %s: %s", part, e)
+    log.info("date %r -> %s (from %r)", question[:60], target.isoformat(), str(ans)[:40])
 
 
 def _target_date(answer: str, today):
@@ -6346,6 +6965,18 @@ def _submit_key(url: str) -> str:
         return url or ""
 
 
+def _step_name(page: Any) -> str:
+    """Which step of a wizard is showing: the active progress-bar step, else the main heading."""
+    try:
+        return clean(page.evaluate("""() => {
+            const a = document.querySelector("[data-automation-id='progressBarActiveStep'], [aria-current=step], "
+                + "[class*=step][class*=active i], [class*=Step][class*=current i]");
+            const h = document.querySelector('main h1, main h2, h1, h2');
+            return ((a && a.innerText) || (h && h.innerText) || '').slice(0, 120); }""") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _guard_uncertain_submit(ctx: ApplyContext, page: Any) -> bool:
     """Stand between a form jobbot already sent once and a second press of its Submit button.
 
@@ -6363,6 +6994,24 @@ def _guard_uncertain_submit(ctx: ApplyContext, page: Any) -> bool:
         # and BCG, applications 288 and 289) -- and this is the form it led to, which has not been sent.
         ctx.extra.pop("submit_uncertain", None)
         log.info("the uncertain submit was on %s, not this page; sending this form normally", pressed_on[:120])
+        return False
+    if answer_submit_dialog(page, set()):
+        # The first press is still in flight behind a dialog of its own ("save these changes? Yes / No",
+        # application 429). Answering it completes that submit; it does not send a second one.
+        try:
+            if wait_for_confirmation(page):
+                ctx.extra.pop("submit_uncertain", None)
+                log.info("the pending submit went through once its dialog was answered")
+                return True
+        except ApplyError as e:
+            log.info("after answering the submit's dialog: %s", str(e)[:160])
+    was_on = where.get("step", "") if isinstance(where, dict) else ""
+    now_on = _step_name(page)
+    if was_on and now_on and was_on != now_on and not confirmation_showing(page):
+        # The press moved a wizard on to another step (Workday's disclosures -> Review, application 427):
+        # it was a Next, not a submit, and this step's own Submit has never been pressed.
+        ctx.extra.pop("submit_uncertain", None)
+        log.info("the uncertain press was on step %r and the form is now on %r; it was not a submit", was_on, now_on)
         return False
     applied = already_applied_message(page)
     if applied:
@@ -6382,6 +7031,16 @@ def _guard_uncertain_submit(ctx: ApplyContext, page: Any) -> bool:
 
 
 SUBMIT_MAX_ATTEMPTS = 4
+
+
+def _filled_count(page: Any) -> int:
+    """How many visible text-like boxes hold a value: a before/after measure around a submit."""
+    try:
+        return int(page.evaluate("""() => [...document.querySelectorAll(
+            'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]):not([type=submit]):not([type=button]), textarea')]
+            .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (e.value || '').trim(); }).length"""))
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callable[[], None] | None = None,
@@ -6405,6 +7064,11 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
     """
     page = ctx.page
     click = click or (lambda: click_submit(page, names))
+    if NOT_APPLICATION_URL_RE.search(getattr(page, "url", "") or ""):
+        # Never a submit on a page that is not the application: a Siemens run wandered onto the "disability
+        # accommodation" contact form and sent it (application 438). Whatever led here, nothing is pressed.
+        raise NeedsHuman(f"jobbot ended up on {(page.url or '')[:120]}, which is not the application form, and "
+                         "will not submit anything there. Go back to the job in the open window, then click Continue.")
     if _guard_uncertain_submit(ctx, page):
         return
     submitted_at = datetime.now(timezone.utc)
@@ -6421,6 +7085,7 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
             submitted_at = datetime.now(timezone.utc)
         if _human_typing():
             time.sleep(random.uniform(1.2, 2.6))    # a person looks the form over before sending it
+        filled_before = _filled_count(page)
         click()
         ctx.step("Waiting for confirmation")
         try:
@@ -6435,13 +7100,38 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
             raise       # the application is in, or only the candidate can move this on
         except ApplyError as e:
             message = str(e)
+            if spam_flagged(page) or _SPAM_FLAG_RE.search(message):
+                # Ashby's "flagged as possible spam" after the press (GiGi, application 424): a verdict on the
+                # browser, not on the form. Parked for a person's own Submit; never re-sent from here.
+                raise NeedsHuman(SPAM_FLAG_MSG) from e
             if _confirmation_arrives(page):
                 # The page was still between the form and its thank-you when it was read: what looked
                 # like a complaint was the form being torn down (application 175, Rippling).
                 ctx.extra.pop("submit_uncertain", None)
                 return
+            filled_after = _filled_count(page)
+            if message.startswith("Form rejected") and filled_before >= 3 and filled_after <= 1:
+                # Every box that was filled is empty again: the form reset itself after taking the submission
+                # (Myticas' Scout Genius form, application 439), and its "Please fill out this field" is the
+                # empty form, not a refusal. Refilling and pressing again would send it twice.
+                log.warning("the form cleared itself after the submit (%d filled before, %d after); "
+                            "treating it as possibly sent", filled_before, filled_after)
+                message = "Submit not confirmed: the form reset itself after the press"
             if message.startswith("Submit not confirmed"):
-                ctx.extra["submit_uncertain"] = {"url": (getattr(page, "url", "") or "")[:300]}
+                try:
+                    from jobbot import mail
+                    ctx.step("Checking the mailbox for the employer's receipt")
+                    receipt = mail.fetch_application_receipt(
+                        submitted_at - timedelta(seconds=VERIFY_CLOCK_SKEW_S), ctx.job.get("company", ""))
+                except Exception as e2:  # noqa: BLE001
+                    receipt = None
+                    log.debug("receipt check: %s", e2)
+                if receipt:
+                    ctx.extra.pop("submit_uncertain", None)
+                    log.info("the page showed no confirmation, but the mailbox did: %r", receipt[:120])
+                    return
+                ctx.extra["submit_uncertain"] = {"url": (getattr(page, "url", "") or "")[:300],
+                                                 "step": _step_name(page)}
                 log.warning("submit could not be confirmed; not sending it again on our own")
                 raise NeedsHuman(UNCERTAIN_MSG)
             if not message.startswith("Form rejected") or attempt >= SUBMIT_MAX_ATTEMPTS:
@@ -6467,6 +7157,8 @@ def submit_and_confirm(ctx: ApplyContext, names: tuple[str, ...], refill: Callab
                                  f"Continue — what you type there is remembered for next time.")
             seen_rejections.add(signature)
             changed = repair_fields(ctx, fields)
+            if expand_hidden_choice_groups(page):
+                changed = list(changed) + ["opened a collapsed choice list"]
             if refill is not None:
                 refill()
             if not changed and (refill is None or attempt > 1):
